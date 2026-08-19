@@ -1,0 +1,24 @@
+{
+  "name": "lead-machine",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Find businesses without a website, auto-build a Site Flash preview, and email it after manual approval.",
+  "scripts": {
+    "scrape": "node scrapers/run.js",
+    "build-preview": "node builder/builder.js",
+    "dashboard": "node dashboard/server.js",
+    "auth": "node mailer/auth.js",
+    "deploy": "node host/cloudflare.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.102.0",
+    "apify-client": "^2.9.3",
+    "better-sqlite3": "^11.3.0",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "googleapis": "^144.0.0",
+    "playwright": "^1.48.0",
+    "wrangler": "^3.80.0"
+  }
+}
