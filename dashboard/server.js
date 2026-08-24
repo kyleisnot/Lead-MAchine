@@ -35,6 +35,19 @@ app.use(express.static(join(__dirname, "public"))); // serves /logo.png, /mark.p
 // 1. authRouter: /login, /signup, /logout must stay reachable while logged out.
 // 2. requireUser: everything below this line has req.userId / req.userEmail / req.isAdmin.
 // (adminRouter is mounted after the routes, near app.listen.)
+// Public config health check (booleans only — never values). Lets us see whether the
+// deployment actually received its Supabase env vars, under any of the common names.
+app.get("/healthz", (req, res) => {
+  const has = (k) => !!(process.env[k] && String(process.env[k]).trim());
+  res.json({
+    ok: true,
+    provider: (process.env.DATA_PROVIDER || "sqlite").toLowerCase(),
+    urlSet: has("SUPABASE_URL") || has("NEXT_PUBLIC_SUPABASE_URL"),
+    anonKeySet: has("SUPABASE_ANON_KEY") || has("NEXT_PUBLIC_SUPABASE_ANON_KEY") || has("SUPABASE_KEY") || has("SUPABASE_PUBLISHABLE_KEY"),
+    serviceKeySet: has("SUPABASE_SERVICE_ROLE_KEY") || has("SUPABASE_SERVICE_KEY") || has("SUPABASE_SECRET_KEY"),
+  });
+});
+
 app.use(authRouter);
 app.use(requireUser);
 
