@@ -1,43 +1,87 @@
-// server.js — local review dashboard. Lists built previews, lets you eyeball each one,
-// edit the email, and hit SEND (sends from your Gmail) or SKIP. Nothing sends without your click.
+// server.js — the Lead Machine dashboard: find local businesses with no website, track
+// the ones you want in the CRM, and browse everything the machine has ever scanned.
+//
+// Multi-user: ./auth.js resolves WHO is asking (req.userId / req.userEmail / req.isAdmin)
+// and every data call goes through ../data/store.js scoped to that user. In sqlite (local
+// dev) mode there is a single "local" user and no login at all.
 
 import express from "express";
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";
-import { readFileSync } from "fs";
-import {
-  listLeads, getLead, markSent, markSkipped, updateDraft, counts,
-  saveToCrm, removeFromCrm, updateCrm, listCrm, crmCounts,
-  dismissLead, getState, getLeadsByIds, checkedStats, usageSummary,
-  setActivityFeedback, activityFeedbackCounts,
-  addFollowup, listFollowups, updateFollowup, removeFollowup, sentInLast24h,
-  listCheckedBusinesses, listAllLeads,
-} from "../data/db.js";
-import { sendEmail } from "../mailer/mailer.js";
-import { discover, discoverMany, buildForLead, buildFromUrl, willSearchSpend } from "../lib/pipeline.js";
-import { scheduleDeploy, cloudflareConfigured } from "../host/cloudflare.js";
+import * as store from "../data/store.js";
+import { discover, discoverMany, willSearchSpend } from "../lib/pipeline.js";
 import { NICHES } from "../lib/niches.js";
 import { lastActiveLabel, activityStatus, activitySignal, cutoffLabel, freshnessConfig } from "../lib/freshness.js";
 import { spendCapState, RATE_PER_1K } from "../lib/spend.js";
 import { detectLicenseSignal, licenseSearchUrl } from "../lib/license.js";
+import { THEME_INIT_SCRIPT, SHELL_TAIL_SCRIPT, SHARED_CSS, sidebar } from "./shell.js";
+import { authRouter, requireUser } from "./auth.js";
+import { adminRouter } from "./admin.js";
+import { demoRouter } from "./demo.js";
 import "dotenv/config";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const app = express();
-app.use(express.json());
-app.use(express.static(join(__dirname, "public"))); // serves /logo.png, /mark.png
 const PORT = process.env.PORT || 4000;
 
+// Express 4 doesn't await handlers, so an async route that throws would become an
+// unhandled rejection. Wrap them so failures become normal 500s.
+const route = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
+
+app.use(express.json());
+app.use(express.static(join(__dirname, "public"))); // serves /logo.png, /mark.png
+
+// ── Wiring order matters ──
+// 1. authRouter: /login, /signup, /logout must stay reachable while logged out.
+// 2. requireUser: everything below this line has req.userId / req.userEmail / req.isAdmin.
+// (adminRouter is mounted after the routes, near app.listen.)
+app.use(authRouter);
+app.use(requireUser);
+
+// Cost is shown as "tokens" (a credit unit) instead of raw dollars. 1 USD = TOKENS_PER_USD tokens.
+const TOKENS_PER_USD = parseFloat(process.env.TOKENS_PER_USD || "100") || 100;
+const usdToTokens = (usd) => Math.max(0, Math.round((Number(usd) || 0) * TOKENS_PER_USD));
+
+function planResetLabel() {
+  const d = new Date();
+  const next = new Date(d.getFullYear(), d.getMonth() + 1, 1);
+  return next.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+}
+// Tokens THIS USER has spent this calendar month (their metered search/AI cost).
+async function monthTokensUsed(userId) {
+  const u = await store.usageSummary(userId);
+  return usdToTokens(u.aiUsd || 0);
+}
+// Block a live (credit-spending) search once this user's monthly allotment is used up.
+// Their allotment lives on their profile row (0 = unlimited); it refills on the 1st.
+async function blockedByAllotment(req, res, { live }) {
+  if (!live) return false;
+  const profile = await store.getProfile(req.userId);
+  const allotment = parseInt(profile?.monthly_token_allotment, 10) || 0;
+  if (!allotment) return false;
+  const used = await monthTokensUsed(req.userId);
+  if (used >= allotment) {
+    res.status(429).json({
+      ok: false,
+      error: `You've used all ${allotment.toLocaleString()} tokens in your plan this month. ` +
+             `They refill on ${planResetLabel()} — or add a token pack to keep searching now.`,
+    });
+    return true;
+  }
+  return false;
+}
+
 // Block a search if this month's Apify spend has hit the configured cap.
-// `forceRefresh`/batch runs spend credits; cached single searches don't, so we only
-// guard live calls. Returns an error response when blocked, or null when clear.
+// This is the OPERATOR's kill-switch (our real Apify bill), separate from a user's plan
+// allotment above. `forceRefresh`/batch runs spend credits; cached single searches don't,
+// so we only guard live calls. Returns true when it has already answered the request.
 async function blockedBySpendCap(res, { live }) {
   if (!live) return false;
   const cap = await spendCapState();
   if (cap.blocked) {
     res.status(429).json({
       ok: false,
-      error: `Spend cap reached: $${cap.spent.toFixed(2)} / $${cap.cap.toFixed(0)} of Apify this month. ` +
+      error: `Token cap reached: ${usdToTokens(cap.spent).toLocaleString()} / ${usdToTokens(cap.cap).toLocaleString()} tokens this month. ` +
              `Raise APIFY_MONTHLY_CAP in .env to keep scanning.`,
     });
     return true;
@@ -54,9 +98,11 @@ app.post("/api/search", async (req, res) => {
     // spends credits — guard ALL of those, not just forced re-scans. Cached searches are
     // free and stay allowed even when capped.
     const resolvedSources = sources?.length ? sources : ["google", "facebook"];
-    const willSpend = willSearchSpend({ niche, city, state, sources: resolvedSources, limit: limit || 30, forceRefresh: !!forceRefresh });
+    const willSpend = await willSearchSpend({ userId: req.userId, niche, city, state, sources: resolvedSources, limit: limit || 30, forceRefresh: !!forceRefresh });
     if (await blockedBySpendCap(res, { live: willSpend })) return;
+    if (await blockedByAllotment(req, res, { live: willSpend })) return;
     const { prospects, stats, cached, cachedAt } = await discover({
+      userId: req.userId,
       niche,
       city,
       state,
@@ -80,7 +126,9 @@ app.post("/api/search-batch", async (req, res) => {
   }
   try {
     if (await blockedBySpendCap(res, { live: true })) return;
+    if (await blockedByAllotment(req, res, { live: true })) return;
     const { prospects, stats } = await discoverMany({
+      userId: req.userId,
       niches: nicheList,
       cities: cityList,
       state,
@@ -94,113 +142,75 @@ app.post("/api/search-batch", async (req, res) => {
   }
 });
 
-// Build the preview + email for one found prospect, then publish it.
-app.post("/api/build/:id", async (req, res) => {
-  try {
-    const r = await buildForLead(req.params.id);
-    let publicUrl = `/preview/${r.id}`;
-    if (cloudflareConfigured()) {
-      // Background, debounced publish — coalesces rapid builds into one deploy. The public URL
-      // is deterministic, so we can hand it back now (it goes live within a few seconds).
-      scheduleDeploy();
-      if (process.env.PUBLIC_BASE_URL) publicUrl = `${process.env.PUBLIC_BASE_URL.replace(/\/$/, "")}/${r.id}`;
-    }
-    res.json({ ok: true, id: r.id, email: r.email, publicUrl });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
-// ── MANUAL API: paste a Facebook URL → scrape + build a preview for a lead you found yourself ──
-app.post("/api/manual", async (req, res) => {
-  const { url } = req.body;
-  if (!url) return res.status(400).json({ ok: false, error: "Paste a Facebook page URL." });
-  try {
-    const r = await buildFromUrl(url);
-    let publicUrl = `/preview/${r.id}`;
-    if (cloudflareConfigured()) {
-      scheduleDeploy();
-      if (process.env.PUBLIC_BASE_URL) publicUrl = `${process.env.PUBLIC_BASE_URL.replace(/\/$/, "")}/${r.id}`;
-    }
-    res.json({ ok: true, id: r.id, name: r.name, email: r.email, publicUrl });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
 // ── CRM API ──
-app.post("/api/crm/save/:id", (req, res) => {
-  saveToCrm(req.params.id);
+app.post("/api/crm/save/:id", route(async (req, res) => {
+  await store.saveToCrm(req.userId, req.params.id);
   res.json({ ok: true });
-});
-app.post("/api/crm/remove/:id", (req, res) => {
-  removeFromCrm(req.params.id);
+}));
+app.post("/api/crm/remove/:id", route(async (req, res) => {
+  await store.removeFromCrm(req.userId, req.params.id);
   res.json({ ok: true });
-});
+}));
 // Mark off a business so it won't show up in future searches.
-app.post("/api/dismiss/:id", (req, res) => {
-  dismissLead(req.params.id);
+app.post("/api/dismiss/:id", route(async (req, res) => {
+  await store.dismissLead(req.userId, req.params.id);
   res.json({ ok: true });
-});
+}));
 
 // Your ✓/✗ on whether our "last active" tag was right (trains/validates the dating).
-app.post("/api/activity-feedback/:id", (req, res) => {
+app.post("/api/activity-feedback/:id", route(async (req, res) => {
   const { verdict, seen } = req.body || {};
-  setActivityFeedback(req.params.id, verdict, seen || "");
-  res.json({ ok: true, counts: activityFeedbackCounts() });
-});
-app.post("/api/crm/update/:id", (req, res) => {
-  updateCrm(req.params.id, { stage: req.body.stage, notes: req.body.notes });
+  await store.setActivityFeedback(req.userId, req.params.id, verdict, seen || "");
+  res.json({ ok: true, counts: await store.activityFeedbackCounts(req.userId) });
+}));
+app.post("/api/crm/update/:id", route(async (req, res) => {
+  await store.updateCrm(req.userId, req.params.id, { stage: req.body.stage, notes: req.body.notes });
   res.json({ ok: true });
-});
+}));
 
-app.get("/crm", (req, res) => res.send(renderCrmPage(req.query.view)));
+app.get("/crm", route(async (req, res) => res.send(await renderCrmPage(req, req.query.view))));
 
 // The "brain" — browse every business the machine has ever scanned or surfaced.
-app.get("/brain", (req, res) => res.send(renderBrainPage(req.query.view)));
+app.get("/brain", route(async (req, res) => res.send(await renderBrainPage(req, req.query.view))));
 
 // ── Manual follow-ups (your own reminders) ──
-app.post("/api/followup/add", (req, res) => {
+app.post("/api/followup/add", route(async (req, res) => {
   const { title, note, due } = req.body || {};
   if (!title || !title.trim()) return res.status(400).json({ ok: false, error: "Add a name first." });
-  const id = addFollowup({ title: title.trim(), note, due });
+  const id = await store.addFollowup(req.userId, { title: title.trim(), note, due });
   res.json({ ok: true, id });
-});
-app.post("/api/followup/update/:id", (req, res) => {
-  updateFollowup(req.params.id, req.body || {});
+}));
+app.post("/api/followup/update/:id", route(async (req, res) => {
+  await store.updateFollowup(req.userId, req.params.id, req.body || {});
   res.json({ ok: true });
-});
-app.post("/api/followup/remove/:id", (req, res) => {
-  removeFollowup(req.params.id);
+}));
+app.post("/api/followup/remove/:id", route(async (req, res) => {
+  await store.removeFollowup(req.userId, req.params.id);
   res.json({ ok: true });
-});
+}));
 
-// Usage tracker: real Apify monthly spend + estimated AI spend + action counts.
-app.get("/api/usage", async (req, res) => {
-  const u = usageSummary();
-  let apify = null, apifyLimit = null;
-  try {
-    if (process.env.APIFY_TOKEN) {
-      const auth = { headers: { Authorization: `Bearer ${process.env.APIFY_TOKEN}` } }; // token in header, not URL
-      const [mu, me] = await Promise.all([
-        fetch("https://api.apify.com/v2/users/me/usage/monthly", auth).then((r) => r.json()),
-        fetch("https://api.apify.com/v2/users/me", auth).then((r) => r.json()),
-      ]);
-      const d = mu.data || {};
-      apify = d.totalUsageCreditsUsdAfterVolumeDiscount ?? d.totalUsageCreditsUsdBeforeVolumeDiscount ?? null;
-      apifyLimit = me.data?.plan?.monthlyUsageCreditsUsd ?? me.data?.plan?.maxMonthlyUsageUsd ?? null;
-    }
-  } catch {}
-  const total = (apify || 0) + (u.aiUsd || 0);
-  const remaining = apifyLimit != null ? Math.max(0, apifyLimit - (apify || 0)) : null;
-  res.json({ ok: true, apify, apifyLimit, remaining, aiUsd: u.aiUsd, total, searches: u.searches, builds: u.builds });
-});
+// Usage tracker — PER USER: the tokens they've spent this month against their plan.
+// (Our real operator cost, e.g. the Apify bill, lives in the admin panel instead.)
+app.get("/api/usage", route(async (req, res) => {
+  const [u, profile] = await Promise.all([store.usageSummary(req.userId), store.getProfile(req.userId)]);
+  const allotment = parseInt(profile?.monthly_token_allotment, 10) || 0; // 0 = unlimited
+  const tokens = usdToTokens(u.aiUsd || 0);
+  res.json({
+    ok: true,
+    tokens,
+    allotment: allotment || null,
+    planRemaining: allotment ? Math.max(0, allotment - tokens) : null,
+    resetsOn: planResetLabel(),
+    searches: u.searches,
+    builds: u.builds,
+  });
+}));
 
-// How many businesses the database has remembered (and how many had websites).
-app.get("/api/memory", (req, res) => {
-  const s = checkedStats();
+// How many businesses this user's brain has remembered (and how many had websites).
+app.get("/api/memory", route(async (req, res) => {
+  const s = await store.checkedStats(req.userId);
   res.json({ ok: true, total: s.total || 0, withSite: s.withSite || 0, noSite: (s.total || 0) - (s.withSite || 0) });
-});
+}));
 
 function slimProspect(l) {
   let lj = {};
@@ -224,120 +234,50 @@ function slimProspect(l) {
     license: detectLicenseSignal(lj), // { status, number, evidence } — best-effort license/registration signal
     licenseUrl: licenseSearchUrl(lj), // one-click official-search link to confirm
     saved: !!l.saved,
-    built: l.status === "preview_built" || l.status === "sent",
   };
 }
 
 // Restore the most recent search (so leaving for the CRM and coming back keeps results).
-app.get("/api/last-search", (req, res) => {
-  const ls = getState("last_search");
+app.get("/api/last-search", route(async (req, res) => {
+  const ls = await store.getState(req.userId, "last_search");
   if (!ls) return res.json({ ok: true, empty: true });
-  const rows = getLeadsByIds(ls.ids || []);
+  const rows = await store.getLeadsByIds(req.userId, ls.ids || []);
   res.json({
     ok: true,
     query: { niche: ls.niche, city: ls.city, state: ls.state, sources: ls.sources, limit: ls.limit },
     stats: ls.stats,
     prospects: rows.map(slimProspect),
   });
-});
-
-// Serve a lead's generated preview html (used in the iframe AND as the email link).
-app.get("/preview/:id", (req, res) => {
-  const lead = getLead(req.params.id);
-  if (!lead?.preview_path) return res.status(404).send("No preview for this lead.");
-  try {
-    res.set("Content-Type", "text/html").send(readFileSync(lead.preview_path, "utf8"));
-  } catch {
-    res.status(404).send("Preview file missing — re-run the scraper.");
-  }
-});
+}));
 
 // Landing page = the search/prospector UI.
-app.get("/", (req, res) => res.send(renderSearchPage()));
+app.get("/", route(async (req, res) => res.send(await renderSearchPage(req))));
 
-// Manual page = paste a Facebook URL → build a preview for a lead you found yourself.
-app.get("/manual", (req, res) => res.send(renderManualPage()));
+// Operator-only panel. Mounted LAST so it can't shadow a user route; its own
+// requireUser + requireAdmin guards live inside admin.js.
+app.use(adminRouter);
+// Live-meeting demo screen (admin only). Same deal: guards live inside demo.js.
+app.use(demoRouter);
 
-// Review & send page (the built previews).
-app.get("/review", (req, res) => {
-  const leads = listLeads("preview_built");
-  const stats = counts().map((c) => `${c.status}: ${c.n}`).join(" · ");
-  res.send(renderPage(leads, stats));
-});
-
-// Save edits to a draft
-app.post("/save/:id", (req, res) => {
-  const { email, subject, body } = req.body;
-  updateDraft(req.params.id, { email, emailSubject: subject, emailBody: body });
-  res.json({ ok: true });
-});
-
-// SEND — the only thing that emails. Requires your explicit click.
-// Daily send cap keeps cold outreach under Gmail's radar (blank/0 = no cap). 24h rolling window.
-const DAILY_SEND_CAP = parseInt(process.env.GMAIL_DAILY_CAP ?? "40", 10) || 0;
-const isEmail = (e) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(e || "").trim());
-
-app.post("/send/:id", async (req, res) => {
-  const lead = getLead(req.params.id);
-  if (!lead) return res.status(404).json({ ok: false, error: "Lead not found" });
-  const { email, subject, body } = req.body;
-  if (!isEmail(email)) return res.status(400).json({ ok: false, error: "Enter a valid recipient email first." });
-  if (!subject || !body) return res.status(400).json({ ok: false, error: "Subject and body can't be empty." });
-  // Throttle: don't let a session blast past a safe daily volume.
-  if (DAILY_SEND_CAP && sentInLast24h() >= DAILY_SEND_CAP) {
-    return res.status(429).json({
-      ok: false,
-      error: `Daily send cap reached (${DAILY_SEND_CAP}/24h). This protects your Gmail from spam throttling. ` +
-             `Raise GMAIL_DAILY_CAP in .env to send more.`,
-    });
-  }
-  try {
-    await sendEmail({ to: email.trim(), subject, text: body });
-    markSent(req.params.id);
-    res.json({ ok: true });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
-app.post("/skip/:id", (req, res) => {
-  markSkipped(req.params.id);
-  res.json({ ok: true });
-});
-
-// Bind to loopback only: this dashboard can scrape (spend $) and SEND email with no auth,
-// so it must never be reachable from other machines on the network.
-app.listen(PORT, "127.0.0.1", () => {
-  console.log(`\n🛰  Lead Machine dashboard → http://localhost:${PORT}\n`);
-});
-
-// Compact usage tracker that lives INSIDE the header (no longer a floating pill that
-// covered buttons). `style` lets a page nudge placement (e.g. margin-left:auto).
-function usageWidget(style = "") {
-  return `<div id="usagePill" title="Total spend this month — Apify + AI" style="display:flex;align-items:center;gap:12px;background:rgba(20,255,185,.06);border:1px solid rgba(20,255,185,.28);border-radius:10px;padding:6px 12px;font:600 12px/1 system-ui,sans-serif;color:#cfd6e2;white-space:nowrap;${style}">
-  <span style="color:#8b93a3;text-transform:uppercase;letter-spacing:.5px;font-size:10px">Used</span><b id="uTot" style="color:#14FFB9;font-size:13px">…</b>
-  <span style="width:1px;height:14px;background:rgba(255,255,255,.14)"></span>
-  <span style="color:#8b93a3">Apify</span><b id="uAp">…</b><span id="uApLim" style="color:#8b93a3;font-weight:500"></span>
-  <span style="color:#8b93a3">AI</span><b id="uAi">~$0.00</b>
-  <span style="width:1px;height:14px;background:rgba(255,255,255,.14)"></span>
-  <span style="color:#8b93a3">🔍 <b id="uS" style="color:#cfd6e2">0</b> · ⚡ <b id="uB" style="color:#cfd6e2">0</b></span>
-</div>
-<script>(function(){var g=function(id){return document.getElementById(id)};async function u(){try{var r=await(await fetch('/api/usage')).json();if(!r.ok)return;
-  g('uTot').textContent='$'+(r.total||0).toFixed(2);
-  g('uAp').textContent=r.apify!=null?'$'+r.apify.toFixed(2):'—';
-  g('uApLim').textContent=r.apifyLimit!=null?(' / $'+r.apifyLimit.toFixed(0)+(r.remaining!=null?' ('+'$'+r.remaining.toFixed(0)+' left)':'')):'';
-  if(r.apifyLimit){var p=(r.apify||0)/r.apifyLimit;g('uAp').style.color=p>.85?'#e0a93b':'#cfd6e2';}
-  g('uAi').textContent='~$'+(r.aiUsd||0).toFixed(2);
-  g('uS').textContent=r.searches;g('uB').textContent=r.builds;
-}catch(e){}}u();setInterval(u,30000);})();</script>`;
+// Default to loopback: this dashboard spends credits, so it should only be reachable
+// from other machines when you deliberately set BIND_HOST (e.g. 0.0.0.0 in a container).
+// On Vercel the platform owns the socket — api/index.js just exports this app, so we
+// must NOT bind a port there.
+if (!process.env.VERCEL) {
+  app.listen(PORT, process.env.BIND_HOST || "127.0.0.1", () => {
+    console.log(`\n🛰  Lead Machine dashboard → http://localhost:${PORT}\n`);
+  });
 }
+
+// Default export so a serverless host (api/index.js) can use the app as its handler.
+export default app;
 
 // ── HTML rendering (kept simple: server-rendered + a little fetch JS) ──
 function esc(s = "") {
   return String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 }
 
-// License/registration badge (server-rendered) for the Review & CRM pages. Best-effort signal
+// License/registration badge (server-rendered) for the CRM table. Best-effort signal
 // from the lead's own profile text + a one-click official-verify link. Inline-styled so it
 // works on every page with no extra CSS.
 function licenseBadgeHtml(l) {
@@ -352,88 +292,18 @@ function licenseBadgeHtml(l) {
   return `<span title="${on ? "What the business advertises — confirm with Verify" : "Nothing found in their profile — check the official search"}" style="display:inline-flex;align-items:center;gap:4px;font-size:12px;font-weight:600;padding:2px 8px;border-radius:6px;background:${bg};color:${color}">${label}</span> <a href="${url}" target="_blank" rel="noopener" style="color:#14FFB9;font-size:12px;text-decoration:none">verify ↗</a>`;
 }
 
-function renderCard(l) {
-  const noEmail = !l.email;
-  return `
-  <div class="card" id="card-${l.id}">
-    <div class="left">
-      <div class="biz">
-        <h2>${esc(l.name)} <span class="tag">#${l.id}</span></h2>
-        <p class="meta">${esc(l.category || "")} · ${esc(l.city || "")}, ${esc(l.state || "")} · ${esc(l.phone || "no phone")}</p>
-        <p class="meta ${l.website ? "warn" : "good"}">${l.website ? "⚠️ website on file: " + esc(l.website) : "✅ no website found"}</p>
-        <p class="meta">${licenseBadgeHtml(l)}</p>
-      </div>
-      <iframe src="/preview/${l.id}" loading="lazy"></iframe>
-    </div>
-    <div class="right">
-      <label>To ${noEmail ? '<span class="warn">(no email scraped — add one)</span>' : ""}</label>
-      <input id="to-${l.id}" value="${esc(l.email || "")}" placeholder="add recipient email">
-      <label>Subject</label>
-      <input id="subj-${l.id}" value="${esc(l.email_subject || "")}">
-      <label>Body</label>
-      <textarea id="body-${l.id}" rows="14">${esc(l.email_body || "")}</textarea>
-      <div class="actions">
-        <button class="send" onclick="send(${l.id})">✉️ SEND</button>
-        <button class="save" onclick="save(${l.id})">💾 Save</button>
-        <button class="rebuild" onclick="rebuild(${l.id})" title="Regenerate with the latest polished template + AI photos">🔄 Rebuild</button>
-        <button class="skip" onclick="skip(${l.id})">Skip</button>
-        <a class="open" href="/preview/${l.id}" target="_blank">Open preview ↗</a>
-      </div>
-      <div class="status" id="status-${l.id}"></div>
-    </div>
-  </div>`;
-}
-
-function renderPage(leads, stats) {
-  return `<!doctype html><html><head><meta charset="utf-8"><title>Lead Machine</title>
-<style>
-  :root{--gold:#14FFB9;--bg:#0a1124;--panel:#0f1a30;--border:rgba(20,255,185,.2);--text:#e8eaf0;--muted:#6b7280}
-  *{box-sizing:border-box;margin:0;padding:0}
-  .brandlogo{height:40px;width:auto;display:block}
-  body::before{content:"";position:fixed;inset:0;background:url(/mark.png) center 120px/360px no-repeat;opacity:.05;pointer-events:none;z-index:0}
-  body>*{position:relative;z-index:1}
-  body{font-family:system-ui,sans-serif;background:var(--bg);color:var(--text);padding:24px}
-  header{display:flex;align-items:center;gap:16px;margin-bottom:20px}
-  h1{color:var(--gold);font-size:24px;letter-spacing:1px}
-  .stats{color:var(--muted);font-size:13px}
-  .empty{color:var(--muted);margin-top:40px;text-align:center;font-size:15px}
-  .card{display:grid;grid-template-columns:1.1fr .9fr;gap:20px;background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:18px;margin-bottom:22px}
-  .biz h2{font-size:18px}.tag{color:var(--muted);font-size:13px}
-  .meta{color:var(--muted);font-size:13px;margin-top:3px}.good{color:#28c864}.warn{color:#e0a93b}
-  iframe{width:100%;height:520px;border:1px solid var(--border);border-radius:8px;margin-top:12px;background:#fff}
-  .right{display:flex;flex-direction:column;gap:6px}
-  label{font-size:11px;text-transform:uppercase;letter-spacing:.5px;color:var(--muted);margin-top:6px}
-  input,textarea{background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.12);border-radius:7px;padding:9px 11px;color:var(--text);font-family:inherit;font-size:13px;resize:vertical}
-  .actions{display:flex;gap:10px;align-items:center;margin-top:14px;flex-wrap:wrap}
-  button{border:none;border-radius:8px;padding:11px 18px;font-weight:700;cursor:pointer;font-size:14px}
-  .send{background:var(--gold);color:#000}.send:hover{background:#0fd49b}
-  .save{background:rgba(255,255,255,.1);color:var(--text)}
-  .rebuild{background:rgba(20,255,185,.14);color:var(--gold);border:1px solid var(--border)}
-  .rebuild:hover{background:rgba(20,255,185,.25)}
-  .skip{background:transparent;color:var(--muted);border:1px solid var(--border)}
-  .open{color:var(--gold);font-size:13px;text-decoration:none;margin-left:auto}
-  .status{font-size:13px;margin-top:8px;min-height:18px}
-  .fade{opacity:.35;transition:opacity .4s}
-</style></head><body>
-<header><img src="/logo.png" alt="Avanzta Contractor Marketing Group" class="brandlogo"><a href="/" style="color:var(--gold);text-decoration:none;font-weight:600">← Search</a><a href="/manual" style="color:var(--gold);text-decoration:none;font-weight:600">➕ Manual</a><a href="/crm" style="color:var(--gold);text-decoration:none;font-weight:600">CRM</a><a href="/brain" style="color:var(--gold);text-decoration:none;font-weight:600">🧠 Brain</a><span class="stats">${esc(stats)}</span>${usageWidget("margin-left:auto")}</header>
-${leads.length ? leads.map(renderCard).join("") : '<div class="empty">No previews built yet. Go to <a href="/" style="color:var(--gold)">Search</a>, find some leads, and click “Build preview”.</div>'}
-<script>
-async function post(url, data){const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data||{})});return r.json()}
-function vals(id){return {email:document.getElementById('to-'+id).value,subject:document.getElementById('subj-'+id).value,body:document.getElementById('body-'+id).value}}
-function setStatus(id,msg,color){const s=document.getElementById('status-'+id);s.textContent=msg;s.style.color=color||'#6b7280'}
-async function save(id){await post('/save/'+id,vals(id));setStatus(id,'Saved ✓','#28c864')}
-async function send(id){setStatus(id,'Sending…');const r=await post('/send/'+id,vals(id));if(r.ok){setStatus(id,'Sent ✅','#28c864');document.getElementById('card-'+id).classList.add('fade')}else{setStatus(id,'Error: '+r.error,'#e05b5b')}}
-async function skip(id){await post('/skip/'+id);document.getElementById('card-'+id).classList.add('fade');setStatus(id,'Skipped','#6b7280')}
-async function rebuild(id){setStatus(id,'⏳ Rebuilding (AI photos + before/after, ~30–45s)…','#e0a93b');const r=await post('/api/build/'+id,{});if(r.ok){var f=document.querySelector('#card-'+id+' iframe');if(f)f.src='/preview/'+id+'?t='+Date.now();setStatus(id,'✅ Rebuilt with the new template','#28c864')}else{setStatus(id,'Error: '+r.error,'#e05b5b')}}
-</script></body></html>`;
-}
-
 // ── SEARCH / PROSPECTOR PAGE ──
-function renderSearchPage() {
+async function renderSearchPage(req) {
   const nicheButtons = NICHES.map(
     (n) => `<button type="button" class="chip" onclick="setNiche('${n.key}')">${esc(n.key)}</button>`
   ).join("");
-  return `<!doctype html><html><head><meta charset="utf-8"><title>Lead Machine — Prospector</title>
+  // Plain-English explainer values (the tool's targeting rules, shown in the UI).
+  const explainNiches = NICHES.map((n) => esc(n.key)).join(" · ");
+  const fcfg = freshnessConfig();
+  const activeExplain = !fcfg.enabled
+    ? "This check is currently off, so businesses are kept no matter how long ago they were last active."
+    : `We look at each business's newest Facebook or Instagram post (or Google review). If the most recent one is older than <b>${esc(cutoffLabel())}</b>, we skip them &mdash; a business that's gone quiet probably isn't taking new customers.`;
+  return `<!doctype html><html><head>${THEME_INIT_SCRIPT}<meta charset="utf-8"><title>Lead Machine — Prospector</title>
 <style>
   :root{--gold:#14FFB9;--bg:#0a1124;--panel:#0f1a30;--border:rgba(20,255,185,.22);--text:#e8eaf0;--muted:#7b8499}
   *{box-sizing:border-box;margin:0;padding:0}
@@ -487,9 +357,24 @@ function renderSearchPage() {
   .lic-verify{color:var(--gold);font-size:12px;text-decoration:none;margin-left:6px}
   .spinner{display:inline-block;width:14px;height:14px;border:2px solid var(--gold);border-top-color:transparent;border-radius:50%;animation:spin .7s linear infinite;vertical-align:-2px;margin-right:6px}
   @keyframes spin{to{transform:rotate(360deg)}}
-</style></head><body>
-<header><img src="/logo.png" alt="Avanzta Contractor Marketing Group" class="brandlogo"><span class="muted" style="font-size:13px">Prospector</span>
-  <div class="nav"><a href="/">Search</a><a href="/manual">➕ Manual</a><a href="/crm">CRM</a><a href="/brain">🧠 Brain</a><a href="/review">Review &amp; Send →</a>${usageWidget()}</div></header>
+${SHARED_CSS}</style></head><body>
+${sidebar("search", { isAdmin: req.isAdmin })}<div class="pagehead"><div class="titlewrap"><h1>Prospector</h1><div class="pagesub">Find local businesses that don't have a website yet</div></div><div class="spacer"></div>
+  <div class="statbox">
+    <div class="cell"><span class="k">🧠 Remembered</span><span class="v" id="sbMem">—</span><span class="s2" id="sbMemSub"></span></div>
+    <div class="sep"></div>
+    <div class="cell"><span class="k">Tokens used</span><span class="v" id="sbTok">—</span><span class="s2" id="sbSearches"></span><div class="tokbar" id="sbBarWrap"><div class="tokbar-fill" id="sbBar"></div></div></div>
+  </div>
+</div>
+
+<details class="explain">
+  <summary><span class="ex-ttl">What counts as a lead?</span><span class="ex-sub">a business must pass all 3 checks to show up here</span></summary>
+  <div class="ex-body">
+    <div class="ex-item"><span class="ex-num">1</span><div><b>It's one of your trades</b><p>${explainNiches}</p></div></div>
+    <div class="ex-item"><span class="ex-num">2</span><div><b>It has no real website</b><p>A Facebook, Instagram, or Yelp page doesn't count &mdash; we're after businesses with no website of their own (so you can offer to build them one).</p></div></div>
+    <div class="ex-item"><span class="ex-num">3</span><div><b>It's still active</b><p>${activeExplain}</p></div></div>
+    <p class="ex-foot">Miss any one of these and the business is skipped. Everything we've ever scanned is remembered in the <b>Brain</b> so we never re-check it &mdash; but only the ones that pass all three become <b>your leads</b>.</p>
+  </div>
+</details>
 
 <div class="panel">
   <div class="row">
@@ -507,31 +392,27 @@ function renderSearchPage() {
       <button class="rescan" id="rescanBtn" onclick="runSearch(true)" title="Re-scan live with fresh data (uses Apify credits)">🔄</button>
     </div>
   </div>
+  <div class="chiplabel">Popular niches</div>
   <div class="chips">${nicheButtons}</div>
+  <div class="optslabel">Scan options</div>
   <div class="opts">
     <label class="opt"><input type="checkbox" id="allNiches" oninput="updateEstimate()"> <b>All trades</b> <span class="muted">(scan every niche)</span></label>
     <span class="optsep"></span>
-    <label style="display:inline">Depth (per source)</label>
+    <label style="display:inline">Scan depth <span class="muted" style="text-transform:none;letter-spacing:0">(more = more tokens)</span></label>
     <select id="limit" onchange="updateEstimate()" style="width:auto;display:inline-block;margin-left:6px">
       <option value="20">Quick (20)</option><option value="40">Standard (40)</option>
       <option value="60">Deep (60)</option><option value="100">Deeper (100)</option>
       <option value="150">Max (150)</option><option value="250">Firehose (250)</option>
     </select>
-    <span class="optsep"></span>
-    <span class="muted">${!freshnessConfig().enabled
-      ? "⚪ activity filter off"
-      : freshnessConfig().mode === "filter"
-        ? `🟢 keeps only leads active since <b>${esc(cutoffLabel())}</b>`
-        : `🏷️ tags activity since <b>${esc(cutoffLabel())}</b> <span style="opacity:.7">(label-only — not filtering yet; set FRESHNESS_MODE=filter to actually drop stale leads)</span>`}</span>
   </div>
   <div id="estimate" class="estimate"></div>
 </div>
 <script>
   var NICHE_KEYS = ${JSON.stringify(NICHES.map((n) => n.key))};
   var RATE_PER_1K = ${RATE_PER_1K};
+  var TOKENS_PER_USD = ${TOKENS_PER_USD};
 </script>
 
-<div id="memory" class="memline"></div>
 <div id="status"></div>
 <div id="statsWrap"></div>
 <div id="results"></div>
@@ -551,11 +432,12 @@ function updateEstimate(){
   const cities=parseCities().length||1, niches=chosenNiches().length||1, sources=chosenSources().length, depth=parseInt(document.getElementById('limit').value)||0;
   const places=cities*niches*sources*depth;
   const usd=(places/1000)*RATE_PER_1K;
+  const tokens=Math.round(usd*TOKENS_PER_USD);
   const el=document.getElementById('estimate');
   const big=places>1500;
   el.className='estimate'+(big?' big':'');
   el.innerHTML=(big?'⚠️ ':'')+'This scan ≈ <b>'+places.toLocaleString()+'</b> places'+
-    ' &nbsp;·&nbsp; rough cost <b>~$'+usd.toFixed(2)+'</b>'+
+    ' &nbsp;·&nbsp; est. <b>~'+tokens.toLocaleString()+' tokens</b>'+
     ' &nbsp;<span style="opacity:.7">('+cities+' city × '+niches+' niche × '+sources+' src × '+depth+' deep)</span>';
 }
 
@@ -570,7 +452,7 @@ async function runSearch(force){
   const places=cities.length*niches.length*sources.length*depth;
 
   // Confirm before a genuinely large (credit-spending) batch.
-  if(multi&&places>1500&&!confirm('This will scan ≈ '+places.toLocaleString()+' places across '+cities.length+' city × '+niches.length+' niche. Rough cost ~$'+((places/1000)*RATE_PER_1K).toFixed(2)+'. Continue?')) return;
+  if(multi&&places>1500&&!confirm('This will scan ≈ '+places.toLocaleString()+' places across '+cities.length+' city × '+niches.length+' niche. Est. ~'+Math.round((places/1000)*RATE_PER_1K*TOKENS_PER_USD).toLocaleString()+' tokens. Continue?')) return;
 
   const btn=document.getElementById('goBtn'),rb=document.getElementById('rescanBtn');btn.disabled=true;rb.disabled=true;
   document.getElementById('results').innerHTML='';document.getElementById('statsWrap').innerHTML='';
@@ -590,20 +472,22 @@ async function runSearch(force){
 }
 async function loadMemory(){
   try{const m=await (await fetch('/api/memory')).json();
-    if(m.ok&&m.total)document.getElementById('memory').innerHTML='🧠 <b>'+m.total+'</b> businesses remembered · <b>'+m.noSite+'</b> with no website · <b>'+m.withSite+'</b> already had one';
+    if(m.ok&&m.total){var mem=document.getElementById('sbMem'),sub=document.getElementById('sbMemSub');
+      if(mem)mem.textContent=Number(m.total).toLocaleString();
+      if(sub)sub.textContent=Number(m.noSite).toLocaleString()+' no site · '+Number(m.withSite).toLocaleString()+' had one';}
   }catch(e){}
 }
 loadMemory();
 function render(s,prospects,mode){
   document.getElementById('statsWrap').innerHTML=
-    '<div class="stats">'+
-    stat(s.scanned||'—','Scanned')+stat(s.qualified,'No Website ✅','good')+stat(s.hasWebsite!=null?s.hasWebsite:'—','Has Website')+stat((s.bySource.google||0)+'/'+(s.bySource.facebook||0)+'/'+(s.bySource.instagram||0),'G / FB / IG')+
+    '<div class="stats" style="grid-template-columns:repeat(3,1fr)">'+
+    stat(s.qualified,'No-website leads','good')+stat(s.scanned||'—','Scanned')+stat(s.hasWebsite!=null?s.hasWebsite:'—','Already had a site')+
     '</div>';
   if(!prospects.length){st(mode==='fresh'||mode==='batch'?'No qualified (no-website) leads found. Try a higher Depth, more cities, or All trades.':'No saved leads here yet — hit Search to find some.');return}
   var msg = mode==='cached' ? '💾 Saved results — <b>$0 credits used</b>. Hit 🔄 to re-scan for fresh data.'
           : mode==='restored' ? '↩️ Restored your last search (no credits used).'
           : mode==='batch' ? 'Batch scan done across <b>'+(s.cells||'?')+'</b> niche×city combos. Found <b>'+prospects.length+'</b> qualified leads.'
-          : 'Found <b>'+prospects.length+'</b> qualified leads. Save or Build the ones you want.';
+          : 'Found <b>'+prospects.length+'</b> qualified leads. Save the ones you want to track.';
   // Show WHY leads were dropped (transparency), with the real cutoff label.
   var since=s.sinceLabel?(' since '+s.sinceLabel):'';
   var parts=[];
@@ -621,9 +505,6 @@ function card(p){
   const saveBtn=p.saved
     ? '<button class="save saved-on" id="s-'+p.id+'" disabled>✅ Saved to CRM</button>'
     : '<button class="save" onclick="saveLead('+p.id+')" id="s-'+p.id+'">💾 Save</button>';
-  const buildBtn=p.built
-    ? '<a class="build" href="/preview/'+p.id+'" target="_blank">✅ Open preview ↗</a>'
-    : '<button class="build" onclick="build('+p.id+')" id="b-'+p.id+'">⚡ Build preview</button>';
   // Freshness badge: green when we have a dated signal, amber when we don't — shows the
   // user WHY a lead qualified (e.g. "🟢 Active · Mar 2025 · FB post").
   const fresh = p.lastActive
@@ -641,7 +522,7 @@ function card(p){
     '<div class="meta">'+esc(p.category||'')+' · '+esc(p.city||'')+', '+esc(p.state||'')+' · '+esc(p.phone||'no phone')+'</div>'+
     '<div class="meta"><span class="src">'+src+'</span> &nbsp; '+email+'</div>'+fresh+lic_line+'</div>'+
     '<div style="display:flex;gap:8px;align-items:center">'+
-      saveBtn+buildBtn+
+      saveBtn+
       '<button class="hide" onclick="hideLead('+p.id+')" title="Mark off — won&#39;t show in future searches">✕</button>'+
     '</div>'+
     '</div>';
@@ -673,111 +554,25 @@ async function hideLead(id){
   if(el){el.style.transition='opacity .3s';el.style.opacity='0';setTimeout(()=>el.remove(),300)}
 }
 function esc(s){return (s||'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
-async function build(id){
-  const b=document.getElementById('b-'+id);b.disabled=true;b.innerHTML='<span class="spinner"></span> Building…';
-  const r=await post('/api/build/'+id,{});
-  if(r.ok){b.outerHTML='<a class="build" href="'+r.publicUrl+'" target="_blank">✅ Open preview ↗</a>';}
-  else{b.disabled=false;b.textContent='⚠️ '+r.error}
-}
-</script></body></html>`;
-}
-
-// ── MANUAL PAGE: paste a Facebook URL → build a preview for a lead you found yourself ──
-function renderManualPage() {
-  return `<!doctype html><html><head><meta charset="utf-8"><title>Lead Machine — Manual</title>
-<style>
-  :root{--gold:#14FFB9;--bg:#0a1124;--panel:#0f1a30;--border:rgba(20,255,185,.22);--text:#e8eaf0;--muted:#7b8499}
-  *{box-sizing:border-box;margin:0;padding:0}
-  .brandlogo{height:40px;width:auto;display:block}
-  body::before{content:"";position:fixed;inset:0;background:url(/mark.png) center 120px/360px no-repeat;opacity:.05;pointer-events:none;z-index:0}
-  body>*{position:relative;z-index:1}
-  body{font-family:system-ui,sans-serif;background:var(--bg);color:var(--text);padding:24px;max-width:1000px;margin:auto}
-  header{display:flex;align-items:center;gap:16px;margin-bottom:20px}
-  .nav{margin-left:auto;display:flex;gap:16px;align-items:center;flex-wrap:wrap;row-gap:10px}.nav a{color:var(--gold);text-decoration:none;font-weight:600;font-size:14px}
-  .panel{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:22px;margin-bottom:18px}
-  h2{font-size:19px;margin-bottom:6px}
-  .muted{color:var(--muted);font-size:14px;line-height:1.5}
-  .urlrow{display:flex;gap:10px;margin-top:16px}
-  input{flex:1;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.12);border-radius:8px;padding:12px 14px;color:var(--text);font-size:14px}
-  .go{background:var(--gold);color:#000;border:none;border-radius:8px;padding:12px 22px;font-weight:700;cursor:pointer;font-size:15px;white-space:nowrap}
-  .go:disabled{opacity:.5;cursor:wait}
-  #mstatus{margin-top:14px;min-height:20px;font-size:14px}
-  .spinner{display:inline-block;width:14px;height:14px;border:2px solid var(--gold);border-top-color:transparent;border-radius:50%;animation:spin .7s linear infinite;vertical-align:-2px;margin-right:6px}
-  @keyframes spin{to{transform:rotate(360deg)}}
-  .result{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:18px;display:grid;grid-template-columns:1fr 1fr;gap:18px}
-  .result h3{font-size:17px}.result .meta{color:var(--muted);font-size:13px;margin:4px 0}
-  .result iframe{width:100%;height:480px;border:1px solid var(--border);border-radius:8px;background:#fff}
-  .actions{display:flex;flex-direction:column;gap:10px;margin-top:12px}
-  .actions a,.actions button{display:inline-block;text-align:center;border-radius:8px;padding:11px 16px;font-weight:700;font-size:14px;text-decoration:none;cursor:pointer;border:none}
-  .primary{background:var(--gold);color:#000}
-  .ghost{background:rgba(20,255,185,.14);color:var(--gold);border:1px solid var(--border)}
-  .email{color:#28c864}.noemail{color:#e0a93b}
-  .hint{color:var(--muted);font-size:12px;margin-top:10px}
-</style></head><body>
-<header><img src="/logo.png" alt="Avanzta Contractor Marketing Group" class="brandlogo"><span class="muted" style="font-size:13px">Manual</span>
-  <div class="nav"><a href="/">Search</a><a href="/manual">➕ Manual</a><a href="/crm">CRM</a><a href="/brain">🧠 Brain</a><a href="/review">Review &amp; Send →</a>${usageWidget()}</div></header>
-
-<div class="panel">
-  <h2>Build a preview from a Facebook page</h2>
-  <p class="muted">Found a business on your own? Paste their <b>Facebook page URL</b> and we'll scrape it, build a Site Flash preview, and write the cold email — no search needed. (Skips the no-website filter, so it works for any page.)</p>
-  <div class="urlrow">
-    <input id="fbUrl" placeholder="https://www.facebook.com/their-business-page" autofocus>
-    <button class="go" id="buildBtn" onclick="buildManual()">⚡ Build preview</button>
-  </div>
-  <div id="mstatus"></div>
-  <div class="hint">Takes ~30–90s (Facebook scrape + AI photo curation + before/after). Uses a little Apify + AI credit.</div>
-</div>
-
-<div id="mresult"></div>
-
-<script>
-function esc(s){return (s||'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
-async function post(url,data){const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data||{})});return r.json()}
-function mst(html){document.getElementById('mstatus').innerHTML=html}
-async function buildManual(){
-  const url=document.getElementById('fbUrl').value.trim();
-  if(!url){mst('<span style="color:#e0a93b">Paste a Facebook page URL first.</span>');return}
-  const b=document.getElementById('buildBtn');b.disabled=true;
-  document.getElementById('mresult').innerHTML='';
-  mst('<span class="spinner"></span> Scraping the page and building the preview… this can take up to ~90s.');
-  const r=await post('/api/manual',{url});
-  b.disabled=false;
-  if(!r.ok){mst('❌ '+esc(r.error));return}
-  mst('✅ Built! Review it below, then edit &amp; send it.');
-  const emailLine=r.email?'<span class="email">✉️ '+esc(r.email)+'</span>':'<span class="noemail">⚠️ no email found — add one in Review &amp; Send</span>';
-  document.getElementById('mresult').innerHTML=
-    '<div class="result">'+
-      '<div><h3>'+esc(r.name||'Your Business')+'</h3>'+
-        '<div class="meta">'+emailLine+'</div>'+
-        '<iframe src="/preview/'+r.id+'?t='+encodeURIComponent(url.length+''+r.id)+'"></iframe></div>'+
-      '<div><div class="meta">Preview is ready. Next:</div>'+
-        '<div class="actions">'+
-          '<a class="primary" href="/review">✏️ Edit email &amp; send →</a>'+
-          '<a class="ghost" href="'+esc(r.publicUrl)+'" target="_blank">Open full preview ↗</a>'+
-          '<button class="ghost" onclick="document.getElementById(\\'fbUrl\\').value=\\'\\';document.getElementById(\\'mresult\\').innerHTML=\\'\\';mst(\\'\\');document.getElementById(\\'fbUrl\\').focus()">➕ Build another</button>'+
-        '</div>'+
-        '<div class="hint">This lead is now in <b>Review &amp; Send</b> and your <b>CRM</b>-eligible list automatically.</div>'+
-      '</div>'+
-    '</div>';
-}
-document.getElementById('fbUrl').addEventListener('keydown',e=>{if(e.key==='Enter')buildManual()});
-</script></body></html>`;
+</script>${SHELL_TAIL_SCRIPT}</main></div></body></html>`;
 }
 
 // ── CRM PAGE ──
 const CRM_STAGES = ["New", "Contacted", "Interested", "Won", "Lost"];
 
-// Human "how long ago" from a SQLite UTC datetime string (e.g. "2026-06-09 14:03:00").
+// Human "how long ago" from either a SQLite UTC datetime ("2026-06-09 14:03:00") or a
+// Postgres timestamptz ("2026-06-09T14:03:00+00:00") — the two providers differ.
 function daysAgo(dt) {
   if (!dt) return "";
-  const then = new Date(dt.replace(" ", "T") + "Z").getTime();
+  const s = String(dt);
+  const iso = /[TZ+]|\d{2}:\d{2}:\d{2}\.\d+/.test(s.slice(10)) ? s.replace(" ", "T") : s.replace(" ", "T") + "Z";
+  const then = new Date(iso).getTime();
   if (isNaN(then)) return "";
   const days = Math.floor((Date.now() - then) / 86400000);
   return days <= 0 ? "today" : days === 1 ? "yesterday" : `${days} days ago`;
 }
 
 function renderCrmRow(l, followup = false) {
-  const built = l.status === "preview_built" || l.status === "sent";
   const opts = CRM_STAGES.map(
     (s) => `<option value="${s}"${l.crm_stage === s ? " selected" : ""}>${s}</option>`
   ).join("");
@@ -796,7 +591,6 @@ function renderCrmRow(l, followup = false) {
     <td><select class="stage" onchange="setStage(${l.id},this.value)">${opts}</select></td>
     <td><input class="notes" value="${esc(l.notes || "")}" placeholder="notes…" onchange="setNotes(${l.id},this.value)"></td>
     <td class="actions">
-      ${built ? `<a href="/preview/${l.id}" target="_blank">Preview ↗</a>` : `<span class="sub">not built</span>`}
       <button class="rm" onclick="removeCrm(${l.id})">Remove</button>
     </td>
   </tr>`;
@@ -855,43 +649,43 @@ function renderCheckedRow(b) {
   </tr>`;
 }
 function renderLeadRow(l) {
-  const built = l.status === "preview_built" || l.status === "sent";
   return `<tr>
     <td><b>${esc(l.name || "—")}</b><div class="sub">${esc(l.category || "")}</div></td>
     <td>${esc([l.city, l.state].filter(Boolean).join(", ") || "—")}</td>
     <td>${esc(l.phone || "—")}<div class="sub">${l.email ? esc(l.email) : '<span class="warn">no email</span>'}</div></td>
     <td><span class="src">${esc(srcLabel(l.source))}</span></td>
     <td><span class="tag ${l.saved ? "site" : ""}">${esc(l.crm_stage || "New")}</span></td>
-    <td class="actions">${built ? `<a href="/preview/${l.id}" target="_blank">Preview ↗</a>` : `<span class="sub">not built</span>`}</td>
   </tr>`;
 }
-function renderBrainPage(view = "nosite") {
+async function renderBrainPage(req, view = "nosite") {
   const tab = ["nosite", "all", "leads"].includes(view) ? view : "nosite";
-  const noSite = listCheckedBusinesses({ noSiteOnly: true });
-  const cs = checkedStats();
+  const [noSite, cs, leads] = await Promise.all([
+    store.listCheckedBusinesses(req.userId, { noSiteOnly: true }),
+    store.checkedStats(req.userId),
+    store.listAllLeads(req.userId),
+  ]);
   const totalScanned = cs.total || 0;
-  const leads = listAllLeads();
 
   let head, rowsHtml, count, hint;
   if (tab === "leads") {
-    head = `<tr><th>Business</th><th>Location</th><th>Contact</th><th>Source</th><th>Stage</th><th></th></tr>`;
+    head = `<tr><th>Business</th><th>Location</th><th>Contact</th><th>Source</th><th>Stage</th></tr>`;
     rowsHtml = leads.map(renderLeadRow).join("");
     count = leads.length;
-    hint = "Leads it actually surfaced to you — with contact details and previews.";
+    hint = "The businesses we handed you to contact — in your trades, no website, and still active. These are the ones to save to your CRM.";
   } else if (tab === "all") {
-    const all = listCheckedBusinesses();
+    const all = await store.listCheckedBusinesses(req.userId);
     head = `<tr><th>Business</th><th>Niche</th><th>Location</th><th>Source</th><th>Website</th><th>Checked</th></tr>`;
     rowsHtml = all.map(renderCheckedRow).join("");
     count = all.length;
-    hint = "Every business the brain has ever checked — including ones that already had a website.";
+    hint = "Every business we've ever scanned. Most get filtered out — we just remember them so we never waste time re-checking the same ones.";
   } else {
     head = `<tr><th>Business</th><th>Niche</th><th>Location</th><th>Source</th><th>Website</th><th>Checked</th></tr>`;
     rowsHtml = noSite.map(renderCheckedRow).join("");
     count = noSite.length;
-    hint = "Qualifying businesses with no website — the ones worth reaching out to.";
+    hint = "Businesses with no real website — the pool your leads are pulled from (before the niche and activity checks).";
   }
 
-  return `<!doctype html><html><head><meta charset="utf-8"><title>Lead Machine — Brain</title>
+  return `<!doctype html><html><head>${THEME_INIT_SCRIPT}<meta charset="utf-8"><title>Lead Machine — Brain</title>
 <style>
   :root{--gold:#14FFB9;--bg:#0a1124;--panel:#0f1a30;--border:rgba(20,255,185,.22);--text:#e8eaf0;--muted:#7b8499}
   *{box-sizing:border-box;margin:0;padding:0}
@@ -922,13 +716,12 @@ function renderBrainPage(view = "nosite") {
   .tag.site{background:rgba(224,169,59,.16);color:#e0a93b}
   .empty{color:var(--muted);text-align:center;margin-top:50px;font-size:15px}
   #noMatch{display:none;color:var(--muted);text-align:center;margin-top:30px;font-size:14px}
-</style></head><body>
-<header><img src="/logo.png" alt="Avanzta Contractor Marketing Group" class="brandlogo"><span style="color:var(--muted);font-size:13px">🧠 Brain</span>
-  <div class="nav"><a href="/">Search</a><a href="/manual">➕ Manual</a><a href="/crm">CRM</a><a href="/brain">🧠 Brain</a><a href="/review">Review &amp; Send →</a>${usageWidget()}</div></header>
+${SHARED_CSS}</style></head><body>
+${sidebar("brain", { isAdmin: req.isAdmin })}<div class="pagehead"><h1>Brain</h1><div class="spacer"></div></div>
 <div class="tabs">
   <a class="tab ${tab === "nosite" ? "active" : ""}" href="/brain">No website <span class="pill">${noSite.length}</span></a>
   <a class="tab ${tab === "all" ? "active" : ""}" href="/brain?view=all">All scanned <span class="pill">${totalScanned}</span></a>
-  <a class="tab ${tab === "leads" ? "active" : ""}" href="/brain?view=leads">Surfaced leads <span class="pill">${leads.length}</span></a>
+  <a class="tab ${tab === "leads" ? "active" : ""}" href="/brain?view=leads">Your leads <span class="pill">${leads.length}</span></a>
 </div>
 <div class="stats">${esc(hint)} &nbsp;·&nbsp; <b>${count}</b> shown</div>
 <input class="search" id="q" placeholder="🔍 Filter by name, niche, city, state…" oninput="filterRows()" autofocus>
@@ -946,20 +739,19 @@ function filterRows(){
   var nm=document.getElementById('noMatch');if(nm)nm.style.display=shown?'none':'block';
 }
 </script>
-</body></html>`;
+${SHELL_TAIL_SCRIPT}</main></div></body></html>`;
 }
 
-function renderCrmPage(view = "all") {
+async function renderCrmPage(req, view = "all") {
   const followup = view === "followup";
-  const allLeads = listCrm();
-  const counts = crmCounts();
+  const [allLeads, counts] = await Promise.all([store.listCrm(req.userId), store.crmCounts(req.userId)]);
   const contactedCount = counts.find((c) => c.crm_stage === "Contacted")?.n || 0;
   const leads = followup ? allLeads.filter((l) => l.crm_stage === "Contacted") : allLeads;
   const total = leads.length;
   const byStage = CRM_STAGES.map((s) => `${s}: ${counts.find((c) => c.crm_stage === s)?.n || 0}`).join(" · ");
-  const followups = followup ? listFollowups() : [];
+  const followups = followup ? await store.listFollowups(req.userId) : [];
   const openFollowups = followups.filter((f) => !f.done).length;
-  return `<!doctype html><html><head><meta charset="utf-8"><title>Lead Machine — CRM</title>
+  return `<!doctype html><html><head>${THEME_INIT_SCRIPT}<meta charset="utf-8"><title>Lead Machine — CRM</title>
 <style>
   :root{--gold:#14FFB9;--bg:#0a1124;--panel:#0f1a30;--border:rgba(20,255,185,.22);--text:#e8eaf0;--muted:#7b8499}
   *{box-sizing:border-box;margin:0;padding:0}
@@ -1008,9 +800,8 @@ function renderCrmPage(view = "all") {
   .fu-btn{background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.14);color:var(--text);border-radius:7px;padding:7px 12px;cursor:pointer;font-size:13px;font-weight:600}
   .fu-del{color:var(--muted)}.fu-del:hover{color:#e05b5b;border-color:#e05b5b}
   .sechead{font-size:13px;text-transform:uppercase;letter-spacing:.5px;color:var(--muted);margin:8px 0 10px;font-weight:700}
-</style></head><body>
-<header><img src="/logo.png" alt="Avanzta Contractor Marketing Group" class="brandlogo"><span style="color:var(--muted);font-size:13px">CRM</span>
-  <div class="nav"><a href="/">Search</a><a href="/manual">➕ Manual</a><a href="/crm">CRM</a><a href="/brain">🧠 Brain</a><a href="/review">Review &amp; Send →</a>${usageWidget()}</div></header>
+${SHARED_CSS}</style></head><body>
+${sidebar("crm", { isAdmin: req.isAdmin })}<div class="pagehead"><h1>CRM</h1><div class="spacer"></div></div>
 <div class="tabs">
   <a class="tab ${followup ? "" : "active"}" href="/crm">All leads <span class="pill">${allLeads.length}</span></a>
   <a class="tab ${followup ? "active" : ""}" href="/crm?view=followup">⏰ Follow-up <span class="pill">${contactedCount}</span></a>
@@ -1067,5 +858,5 @@ async function addFu(){
 }
 async function fuDone(id,done){await post('/api/followup/update/'+id,{done:!!done});location.reload()}
 async function fuDel(id){await post('/api/followup/remove/'+id,{});const r=document.getElementById('fu-'+id);if(r)r.remove()}
-</script></body></html>`;
+</script>${SHELL_TAIL_SCRIPT}</main></div></body></html>`;
 }

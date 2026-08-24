@@ -1,15 +1,11 @@
-// seed-demo.js — inserts ONE fake lead and builds its preview, so you can test the
-// dashboard without using any Apify/Gmail credits. Run: node scrapers/seed-demo.js
+// seed-demo.js — inserts ONE fake lead so you can click around the dashboard (Search
+// restore, CRM, Brain) without spending any Apify credits. Local/SQLite only: it writes
+// as the single "local" user. Run: node scrapers/seed-demo.js
 
-import { insertLead, listLeads, attachPreview } from "../data/db.js";
-import { mapLeadToSiteData } from "../builder/mapper.js";
-import { savePreview, closeBuilder } from "../builder/builder.js";
-import { draftEmail } from "../mailer/draft.js";
-import { publicPreviewUrl } from "../lib/publicUrl.js";
-import { fileURLToPath } from "url";
-import { dirname, join } from "path";
+import * as store from "../data/store.js";
+import { dataProvider } from "../lib/supabase.js";
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
+const USER = "local";
 
 const demo = {
   source: "demo",
@@ -19,7 +15,7 @@ const demo = {
   city: "Knoxville",
   state: "TN",
   phone: "(865) 555-0199",
-  email: "kylecantrell65@gmail.com", // sends to yourself when you test SEND
+  email: "kylecantrell65@gmail.com",
   website: "", // no website → qualifies
   about: "Hand-tossed, wood-fired pizza made fresh daily by a family that loves what they do. Serving Knoxville for 15 years.",
   images: [],
@@ -28,20 +24,23 @@ const demo = {
   serviceAreas: ["Knoxville", "Maryville", "Farragut"],
 };
 
-insertLead(demo);
-const row = listLeads().find((r) => r.external_id === demo.externalId);
-const siteData = mapLeadToSiteData(demo);
-const previewPath = join(__dirname, "..", "data", "previews", `${row.id}.html`);
+if (dataProvider() === "supabase") {
+  console.error("seed-demo is for local sqlite mode. Set DATA_PROVIDER=sqlite to use it.");
+  process.exit(1);
+}
 
-savePreview(siteData, previewPath)
-  .then(async () => {
-    const { subject, body } = draftEmail(demo, publicPreviewUrl(row.id));
-    attachPreview(row.id, { siteData, previewPath, emailSubject: subject, emailBody: body });
-    await closeBuilder();
-    console.log(`✅ Demo lead #${row.id} ready. Run:  npm run dashboard`);
-  })
-  .catch(async (e) => {
-    console.error(e);
-    await closeBuilder();
-    process.exit(1);
-  });
+const id = await store.upsertLeadReturningId(USER, demo);
+// Also remember it in the brain, so the Brain page isn't empty on a fresh install.
+await store.recordChecked(USER, [
+  {
+    source: demo.source,
+    external_id: demo.externalId,
+    name: demo.name,
+    has_website: 0,
+    niche: "pizzeria",
+    city: demo.city,
+    state: demo.state,
+  },
+]);
+
+console.log(`✅ Demo lead #${id} ready. Run:  npm run dashboard`);

@@ -1,6 +1,6 @@
 // run.js — CLI front-end for the SAME engine the dashboard uses (lib/pipeline.js).
-// Finds in-niche, no-website, recently-active leads and stores them. Previews are built
-// on demand in the dashboard, so this just fills the pipeline.
+// Finds in-niche, no-website, recently-active leads and stores them for the local user,
+// so they're waiting in the dashboard's Search / CRM / Brain when you open it.
 //
 // Usage:
 //   node scrapers/run.js --city "Knoxville" --state "TN" --all-niches              (every target trade)
@@ -87,6 +87,7 @@ async function main() {
   if (fc.enabled) console.log(`🟢 Keeping only leads active since ${cutoffLabel()} (${fc.mode} mode).`);
 
   const { prospects, stats } = await discoverMany({
+    userId: "local", // the CLI is single-user: it always works the local SQLite dataset
     niches,
     cities,
     state: args.state,
@@ -111,7 +112,7 @@ async function main() {
     return;
   }
 
-  console.log(`\n🎉 Done. Qualified leads are saved. Open the dashboard to review & build previews:`);
+  console.log(`\n🎉 Done. Qualified leads are saved. Open the dashboard to work them:`);
   console.log(`   npm run dashboard   →   http://localhost:${PORT}\n`);
 }
 

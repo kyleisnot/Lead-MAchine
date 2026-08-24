@@ -1,0 +1,20 @@
+# What never gets uploaded to Vercel.
+#
+# Production runs DATA_PROVIDER=supabase and reads its config from the Vercel project's
+# environment variables, so the local SQLite database and the local .env stay here.
+#
+# NOTE: `data/` itself is deliberately NOT ignored — data/store.js is the app's data
+# layer (and data/db.js is its lazily-imported SQLite half), so excluding the folder
+# would break the build. Only the database files and generated previews are dropped.
+*.db*
+data/previews/
+
+# Local-only tooling: nothing in the dashboard's import graph touches these.
+secrets/
+builder/
+mailer/
+host/
+
+*.tar.gz
+.env
+.env.*

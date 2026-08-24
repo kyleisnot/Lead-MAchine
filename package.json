@@ -12,13 +12,10 @@
     "deploy": "node host/cloudflare.js"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.102.0",
+    "@supabase/supabase-js": "^2.112.3",
     "apify-client": "^2.9.3",
-    "better-sqlite3": "^11.3.0",
+    "better-sqlite3": "^13.0.3",
     "dotenv": "^16.4.5",
-    "express": "^4.19.2",
-    "googleapis": "^144.0.0",
-    "playwright": "^1.48.0",
-    "wrangler": "^3.80.0"
+    "express": "^4.19.2"
   }
 }

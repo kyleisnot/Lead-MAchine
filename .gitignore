@@ -1,3 +1,10 @@
 node_modules/
 secrets/
 .env
+
+# never commit local data, previews, or backups
+data/*.db*
+data/previews/
+*.tar.gz
+nohup.out
+.DS_Store

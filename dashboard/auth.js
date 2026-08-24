@@ -1,0 +1,440 @@
+// auth.js — authentication for the dashboard: login/signup pages, session cookie,
+// and the middleware that resolves who is making each request.
+//
+// CONTRACT (server.js and admin.js build against exactly this):
+//   authRouter                    — express Router serving GET/POST /login, /signup, /logout
+//   requireUser(req, res, next)   — sets req.userId, req.userEmail, req.isAdmin.
+//                                   sqlite mode: local user, isAdmin=true, never redirects.
+//                                   supabase mode: verifies the session cookie; unauthenticated
+//                                   HTML requests redirect to /login, /api/* get 401 JSON.
+//   requireAdmin(req, res, next)  — after requireUser; 403 unless req.isAdmin.
+//
+// How the session works (supabase mode):
+//   Sign-in happens server-side (`signInWithPassword`) and the resulting Supabase
+//   session is stored in one httpOnly cookie, `lm_session`, holding
+//   {access_token, refresh_token} as JSON. Every request verifies the access token
+//   with `auth.getUser(token)`; verified tokens are cached in memory for 5 minutes so
+//   we don't make a network call per request. When the access token has expired we
+//   silently `refreshSession({refresh_token})` and re-write the cookie.
+//   Cookies are parsed/serialized by hand — no extra dependency.
+import express from "express";
+import { dataProvider, getSupabase } from "../lib/supabase.js";
+import { THEME_INIT_SCRIPT, SHARED_CSS } from "./shell.js";
+
+// ── config ──────────────────────────────────────────────────────────────────
+const COOKIE = "lm_session";
+const COOKIE_MAX_AGE = 60 * 60 * 24 * 30; // 30 days, matches Supabase refresh-token life
+const TOKEN_TTL_MS = 5 * 60 * 1000; // verified-token cache window
+const TOKEN_CACHE_MAX = 1000;
+const MIN_PASSWORD = 8;
+
+// Paths that must stay reachable without a session.
+const PUBLIC_PATHS = new Set(["/login", "/signup", "/logout", "/logo.png", "/mark.png"]);
+function isPublicPath(pathname) {
+  return PUBLIC_PATHS.has(pathname) || pathname.startsWith("/favicon");
+}
+
+const supabaseMode = () => dataProvider() === "supabase";
+
+// ── small helpers ───────────────────────────────────────────────────────────
+function esc(s) {
+  return String(s == null ? "" : s)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+}
+
+function pathOf(req) {
+  const url = req.originalUrl || req.url || "/";
+  const cut = url.indexOf("?");
+  return cut === -1 ? url : url.slice(0, cut);
+}
+
+// True when the caller wants JSON rather than a redirect (all /api/* plus explicit
+// JSON-only Accept headers, e.g. fetch() calls from the dashboard).
+function wantsJson(req) {
+  if (pathOf(req).startsWith("/api/")) return true;
+  const accept = String(req.headers?.accept || "");
+  return accept.includes("application/json") && !accept.includes("text/html");
+}
+
+// Cookie parsing by hand (no cookie-parser dependency).
+function readCookie(req, name) {
+  const header = req.headers?.cookie;
+  if (!header) return null;
+  for (const part of header.split(";")) {
+    const eq = part.indexOf("=");
+    if (eq === -1) continue;
+    if (part.slice(0, eq).trim() !== name) continue;
+    const raw = part.slice(eq + 1).trim();
+    try { return decodeURIComponent(raw); } catch { return raw; }
+  }
+  return null;
+}
+
+function isSecureRequest(req) {
+  if (req?.secure) return true;
+  const proto = String(req?.headers?.["x-forwarded-proto"] || "").split(",")[0].trim();
+  return proto === "https";
+}
+
+function appendCookie(res, value) {
+  const prev = res.getHeader("Set-Cookie");
+  if (!prev) res.setHeader("Set-Cookie", value);
+  else res.setHeader("Set-Cookie", (Array.isArray(prev) ? prev : [prev]).concat(value));
+}
+
+function writeSessionCookie(req, res, session) {
+  if (!session?.access_token || res.headersSent) return;
+  const payload = encodeURIComponent(JSON.stringify({
+    access_token: session.access_token,
+    refresh_token: session.refresh_token || "",
+  }));
+  const bits = [`${COOKIE}=${payload}`, "Path=/", "HttpOnly", "SameSite=Lax", `Max-Age=${COOKIE_MAX_AGE}`];
+  if (isSecureRequest(req)) bits.push("Secure");
+  appendCookie(res, bits.join("; "));
+}
+
+function clearSessionCookie(req, res) {
+  if (res.headersSent) return;
+  const bits = [`${COOKIE}=`, "Path=/", "HttpOnly", "SameSite=Lax", "Max-Age=0",
+    "Expires=Thu, 01 Jan 1970 00:00:00 GMT"];
+  if (isSecureRequest(req)) bits.push("Secure");
+  appendCookie(res, bits.join("; "));
+}
+
+// ── admin list ──────────────────────────────────────────────────────────────
+// Read from the env on every call so a process-level override always wins.
+function isAdminEmail(email) {
+  if (!email) return false;
+  const list = String(process.env.ADMIN_EMAILS || "")
+    .split(",").map((e) => e.trim().toLowerCase()).filter(Boolean);
+  return list.includes(String(email).trim().toLowerCase());
+}
+
+// ── verified-token cache ────────────────────────────────────────────────────
+const tokenCache = new Map(); // access_token -> { userId, userEmail, isAdmin, expires }
+
+function cacheGet(token) {
+  const hit = tokenCache.get(token);
+  if (!hit) return null;
+  if (hit.expires <= Date.now()) { tokenCache.delete(token); return null; }
+  // isAdmin is recomputed: ADMIN_EMAILS can change without a restart.
+  return { userId: hit.userId, userEmail: hit.userEmail, isAdmin: isAdminEmail(hit.userEmail) };
+}
+
+function cachePut(token, user) {
+  if (!token || !user?.userId) return;
+  if (tokenCache.size >= TOKEN_CACHE_MAX) {
+    const now = Date.now();
+    for (const [k, v] of tokenCache) if (v.expires <= now) tokenCache.delete(k);
+    if (tokenCache.size >= TOKEN_CACHE_MAX) tokenCache.delete(tokenCache.keys().next().value);
+  }
+  tokenCache.set(token, { ...user, expires: Date.now() + TOKEN_TTL_MS });
+}
+
+function userFrom(u) {
+  if (!u?.id) return null;
+  const userEmail = u.email || "";
+  return { userId: u.id, userEmail, isAdmin: isAdminEmail(userEmail) };
+}
+
+// ── session resolution ──────────────────────────────────────────────────────
+// One in-flight refresh per refresh_token, so parallel requests from the same
+// browser don't race each other into rotating the token several times over.
+const refreshing = new Map();
+
+async function refreshOnce(sb, refresh_token) {
+  if (refreshing.has(refresh_token)) return refreshing.get(refresh_token);
+  const p = sb.auth.refreshSession({ refresh_token })
+    .then((r) => (r?.error ? null : r?.data || null))
+    .catch(() => null)
+    .finally(() => { setTimeout(() => refreshing.delete(refresh_token), 1000).unref?.(); });
+  refreshing.set(refresh_token, p);
+  return p;
+}
+
+// Returns {userId, userEmail, isAdmin} or null. Re-writes the cookie when the
+// session had to be refreshed.
+async function resolveSession(req, res) {
+  const raw = readCookie(req, COOKIE);
+  if (!raw) return null;
+
+  let session = null;
+  try { session = JSON.parse(raw); } catch { return null; }
+  const access = session?.access_token || "";
+  const refresh = session?.refresh_token || "";
+  if (!access && !refresh) return null;
+
+  const cached = access ? cacheGet(access) : null;
+  if (cached) return cached;
+
+  let sb;
+  try { sb = await getSupabase(); } catch { return null; }
+
+  if (access) {
+    try {
+      const { data, error } = await sb.auth.getUser(access);
+      const user = error ? null : userFrom(data?.user);
+      if (user) { cachePut(access, user); return user; }
+    } catch { /* fall through to refresh */ }
+  }
+
+  if (!refresh) return null;
+  const data = await refreshOnce(sb, refresh);
+  const newSession = data?.session;
+  const user = userFrom(data?.user || newSession?.user);
+  if (!newSession?.access_token || !user) return null;
+  if (access) tokenCache.delete(access);
+  cachePut(newSession.access_token, user);
+  writeSessionCookie(req, res, newSession);
+  return user;
+}
+
+// ── pages ───────────────────────────────────────────────────────────────────
+// Auth-specific styling. Appended AFTER SHARED_CSS so it wins; every colour is a
+// shell CSS variable, so both themes are handled for free. The one literal colour
+// is the logo chip, which matches `.side .brand` in shell.js (the mark needs a dark
+// backing in light mode too).
+const AUTH_CSS = `
+.authwrap{min-height:100vh;display:flex;justify-content:center;padding:40px 20px;box-sizing:border-box}
+/* margin:auto (not align-items:center) so a short viewport scrolls instead of clipping the card. */
+.authcard{margin:auto;width:100%;max-width:392px;background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:32px 30px 28px;box-sizing:border-box}
+.authcard .brand{display:inline-flex;align-items:center;background:#10151d;border-radius:9px;padding:9px 12px;margin:0 0 22px}
+.authcard .brand img{height:24px;width:auto;display:block}
+.authcard h1{font-size:21px;font-weight:800;letter-spacing:.2px;color:var(--text);margin:0 0 6px}
+.authcard .sub{font-size:13px;color:var(--muted);line-height:1.55;margin:0 0 22px}
+.authcard .err{font-size:13px;color:var(--danger);line-height:1.5;margin:0 0 16px}
+.authcard form{display:block;margin:0}
+.authcard .field{margin:0 0 16px}
+.authcard label{display:block;font-size:11px;text-transform:uppercase;letter-spacing:.6px;font-weight:600;color:var(--muted);margin:0 0 7px}
+.authcard input{width:100%;box-sizing:border-box;border-radius:9px;padding:11px 13px;font-size:14px;font-family:inherit}
+.authcard .hint{font-size:12px;color:var(--faint);margin:7px 0 0}
+.authcard .go{width:100%;border-radius:9px;font-weight:700;font-family:inherit;cursor:pointer;margin-top:4px}
+.authcard .alt{font-size:13px;color:var(--muted);text-align:center;margin:20px 0 0}
+.authcard .alt a{color:var(--accent);font-weight:600;text-decoration:none}
+.authcard .alt a:hover{text-decoration:underline}
+`;
+
+// One template for both pages — `mode` is "login" or "signup".
+function authPage({ mode, email = "", error = "" }) {
+  const signup = mode === "signup";
+  const title = signup ? "Create account" : "Sign in";
+  const sub = signup
+    ? "Set up an account to start finding and tracking leads."
+    : "Enter your email and password to open your dashboard.";
+  const action = signup ? "/signup" : "/login";
+  const button = signup ? "Create account" : "Sign in";
+  const alt = signup
+    ? 'Already have an account? <a href="/login">Sign in</a>'
+    : 'No account? <a href="/signup">Create one</a>';
+  return `<!doctype html><html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${title} · Lead Machine</title>
+<link rel="icon" href="/mark.png">
+${THEME_INIT_SCRIPT}
+<style>${SHARED_CSS}${AUTH_CSS}</style>
+</head><body>
+<div class="authwrap"><div class="authcard">
+  <div class="brand"><img src="/logo.png" alt="Avanzta"></div>
+  <h1>${title}</h1>
+  <p class="sub">${sub}</p>
+  ${error ? `<p class="err" role="alert">${esc(error)}</p>` : ""}
+  <form method="post" action="${action}" novalidate>
+    <div class="field">
+      <label for="email">Email</label>
+      <input id="email" name="email" type="email" autocomplete="email" spellcheck="false"
+             autocapitalize="off" value="${esc(email)}" ${email ? "" : "autofocus"} required>
+    </div>
+    <div class="field">
+      <label for="password">Password</label>
+      <input id="password" name="password" type="password"
+             autocomplete="${signup ? "new-password" : "current-password"}" ${email ? "autofocus" : ""} required>
+      ${signup ? `<p class="hint">At least ${MIN_PASSWORD} characters.</p>` : ""}
+    </div>
+    <button class="go" type="submit">${button}</button>
+  </form>
+  <p class="alt">${alt}</p>
+</div></div>
+</body></html>`;
+}
+
+function sendPage(res, status, opts) {
+  res.status(status).type("html").send(authPage(opts));
+}
+
+// ── routes ──────────────────────────────────────────────────────────────────
+export const authRouter = express.Router();
+
+// Body parsers are per-route: authRouter is mounted app-wide, so a router-level
+// .use() would parse bodies for every request in the app.
+const formBody = [express.urlencoded({ extended: false }), express.json()];
+
+const readField = (body, key) => String(body?.[key] ?? "").trim();
+const looksLikeEmail = (e) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e);
+
+const ERR_GENERIC = "Something went wrong. Try again.";
+const ERR_UNAVAILABLE = "Sign-in is not available right now. Check the Supabase configuration.";
+const ERR_CREDENTIALS = "That email and password do not match.";
+
+// GET /login — redirect away in sqlite mode (dev is login-free) and for users
+// who already hold a valid session.
+authRouter.get("/login", async (req, res) => {
+  if (!supabaseMode()) return res.redirect("/");
+  const user = await resolveSession(req, res).catch(() => null);
+  if (user) return res.redirect("/");
+  sendPage(res, 200, { mode: "login" });
+});
+
+authRouter.get("/signup", async (req, res) => {
+  if (!supabaseMode()) return res.redirect("/");
+  const user = await resolveSession(req, res).catch(() => null);
+  if (user) return res.redirect("/");
+  sendPage(res, 200, { mode: "signup" });
+});
+
+authRouter.post("/login", formBody, async (req, res) => {
+  if (!supabaseMode()) return res.redirect("/");
+  const email = readField(req.body, "email");
+  const password = String(req.body?.password ?? "");
+  if (!email || !password) {
+    return sendPage(res, 400, { mode: "login", email, error: "Enter your email and password." });
+  }
+
+  let sb;
+  try { sb = await getSupabase(); }
+  catch { return sendPage(res, 503, { mode: "login", email, error: ERR_UNAVAILABLE }); }
+
+  try {
+    const { data, error } = await sb.auth.signInWithPassword({ email, password });
+    if (error || !data?.session) {
+      return sendPage(res, 401, { mode: "login", email, error: ERR_CREDENTIALS });
+    }
+    writeSessionCookie(req, res, data.session);
+    const user = userFrom(data.user || data.session.user);
+    if (user) cachePut(data.session.access_token, user);
+    return res.redirect("/");
+  } catch {
+    return sendPage(res, 500, { mode: "login", email, error: ERR_GENERIC });
+  }
+});
+
+// Does this Supabase error mean "that email is already taken"?
+function isEmailTaken(error) {
+  if (!error) return false;
+  const code = String(error.code || "").toLowerCase();
+  const msg = String(error.message || "").toLowerCase();
+  return code === "email_exists" || code === "user_already_exists" ||
+    (msg.includes("already") && (msg.includes("registered") || msg.includes("exists")));
+}
+
+// POST /signup — creates the user server-side with email_confirm:true (no SMTP
+// needed), then signs them in. The profiles row is created by a DB trigger.
+authRouter.post("/signup", formBody, async (req, res) => {
+  if (!supabaseMode()) return res.redirect("/");
+  const email = readField(req.body, "email");
+  const password = String(req.body?.password ?? "");
+  const fail = (status, error) => sendPage(res, status, { mode: "signup", email, error });
+
+  if (!email || !password) return fail(400, "Enter an email address and a password.");
+  if (!looksLikeEmail(email)) return fail(400, "Enter a valid email address.");
+  if (password.length < MIN_PASSWORD) {
+    return fail(400, `Use a password with at least ${MIN_PASSWORD} characters.`);
+  }
+
+  let sb;
+  try { sb = await getSupabase(); } catch { return fail(503, ERR_UNAVAILABLE); }
+
+  try {
+    const { error } = await sb.auth.admin.createUser({ email, password, email_confirm: true });
+    if (error) {
+      if (isEmailTaken(error)) {
+        return fail(409, "That email already has an account. Sign in instead.");
+      }
+      const msg = String(error.message || "").toLowerCase();
+      if (msg.includes("password")) {
+        return fail(400, `Use a password with at least ${MIN_PASSWORD} characters.`);
+      }
+      if (msg.includes("email")) return fail(400, "Enter a valid email address.");
+      return fail(400, ERR_GENERIC);
+    }
+
+    const { data, error: signInError } = await sb.auth.signInWithPassword({ email, password });
+    if (signInError || !data?.session) {
+      // Account exists but the sign-in leg failed — send them to the login page.
+      return sendPage(res, 200, {
+        mode: "login", email, error: "Your account is ready. Sign in to continue.",
+      });
+    }
+    writeSessionCookie(req, res, data.session);
+    const user = userFrom(data.user || data.session.user);
+    if (user) cachePut(data.session.access_token, user);
+    return res.redirect("/");
+  } catch {
+    return fail(500, ERR_GENERIC);
+  }
+});
+
+async function logout(req, res) {
+  if (!supabaseMode()) return res.redirect("/");
+  const raw = readCookie(req, COOKIE);
+  let access = "";
+  if (raw) { try { access = JSON.parse(raw)?.access_token || ""; } catch { /* ignore */ } }
+  if (access) {
+    tokenCache.delete(access);
+    // Best effort: revoke this session's refresh token server-side too. Scope
+    // "local" so signing out in one browser doesn't sign the user out everywhere.
+    try { const sb = await getSupabase(); await sb.auth.admin.signOut(access, "local"); } catch { /* ignore */ }
+  }
+  clearSessionCookie(req, res);
+  return res.redirect("/login");
+}
+
+authRouter.post("/logout", logout);
+authRouter.get("/logout", logout);
+
+// ── middleware ──────────────────────────────────────────────────────────────
+function denyUnauthenticated(req, res) {
+  if (wantsJson(req)) return res.status(401).json({ ok: false, error: "Sign in required" });
+  return res.redirect(302, "/login");
+}
+
+export function requireUser(req, res, next) {
+  // Local dev stays single-user and login-free.
+  if (!supabaseMode()) {
+    req.userId = "local";
+    req.userEmail = "local@dev";
+    req.isAdmin = true;
+    return next();
+  }
+
+  const pathname = pathOf(req);
+  resolveSession(req, res).then(
+    (user) => {
+      if (user) {
+        req.userId = user.userId;
+        req.userEmail = user.userEmail;
+        req.isAdmin = user.isAdmin;
+        return next();
+      }
+      if (isPublicPath(pathname)) return next();
+      return denyUnauthenticated(req, res);
+    },
+    () => (isPublicPath(pathname) ? next() : denyUnauthenticated(req, res))
+  );
+}
+
+export function requireAdmin(req, res, next) {
+  if (req.isAdmin) return next();
+  if (wantsJson(req)) return res.status(403).json({ ok: false, error: "Admins only" });
+  return res.status(403).type("html").send(`<!doctype html><html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Admins only · Lead Machine</title>${THEME_INIT_SCRIPT}
+<style>${SHARED_CSS}${AUTH_CSS}</style></head><body>
+<div class="authwrap"><div class="authcard">
+  <div class="brand"><img src="/logo.png" alt="Avanzta"></div>
+  <h1>Admins only</h1>
+  <p class="sub">This account does not have access to the admin area.</p>
+  <p class="alt"><a href="/">Back to search</a></p>
+</div></div></body></html>`);
+}
