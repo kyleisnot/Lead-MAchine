@@ -6,5 +6,5 @@
 // ||= keeps real project env vars winning when they exist.
 process.env.DATA_PROVIDER ||= "supabase";
 process.env.SUPABASE_URL ||= "https://rhlecrahjwxfqewpzecp.supabase.co";
-process.env.ADMIN_EMAILS ||= "jtrump1348@gmail.com";
+process.env.ADMIN_EMAILS ||= "jtrump1348@gmail.com,kylecantrell65@gmail.com";
 process.env.TOKENS_PER_USD ||= "100";
