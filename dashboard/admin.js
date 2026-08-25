@@ -18,7 +18,7 @@ import express from "express";
 import { requireUser, requireAdmin } from "./auth.js";
 import { dataProvider, getSupabase } from "../lib/supabase.js";
 import { apifySpend } from "../lib/spend.js";
-import { THEME_INIT_SCRIPT, SHELL_TAIL_SCRIPT, SHARED_CSS, sidebar } from "./shell.js";
+import { THEME_INIT_SCRIPT, SHELL_TAIL_SCRIPT, SHARED_CSS, sidebar, FAVICON } from "./shell.js";
 
 export const adminRouter = express.Router();
 
@@ -244,7 +244,7 @@ async function loadOverview() {
 // ── render ───────────────────────────────────────────────────────────────────
 
 function page(body, extraScript = "", demo = false) {
-  return `<!doctype html><html><head>${THEME_INIT_SCRIPT}<meta charset="utf-8"><title>Lead Machine — Admin</title>
+  return `<!doctype html><html><head>${THEME_INIT_SCRIPT}<meta charset="utf-8">${FAVICON}<title>Prospector — Admin</title>
 <style>
   *{box-sizing:border-box;margin:0;padding:0}
   body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}

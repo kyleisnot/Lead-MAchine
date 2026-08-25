@@ -21,7 +21,7 @@
 import express from "express";
 import crypto from "node:crypto";
 import { dataProvider, getSupabase, getAuthSupabase, supabaseUrl } from "../lib/supabase.js";
-import { THEME_INIT_SCRIPT, SHARED_CSS } from "./shell.js";
+import { THEME_INIT_SCRIPT, SHARED_CSS, FAVICON } from "./shell.js";
 
 // ── config ──────────────────────────────────────────────────────────────────
 const COOKIE = "lm_session";
@@ -376,14 +376,16 @@ async function resolveSession(req, res) {
 // ── pages ───────────────────────────────────────────────────────────────────
 // Auth-specific styling. Appended AFTER SHARED_CSS so it wins; every colour is a
 // shell CSS variable, so both themes are handled for free. The one literal colour
-// is the logo chip, which matches `.side .brand` in shell.js (the mark needs a dark
+// is the wordmark, which matches `.side .brand` in shell.js (same mark and
 // backing in light mode too).
 const AUTH_CSS = `
 .authwrap{min-height:100vh;display:flex;justify-content:center;padding:40px 20px;box-sizing:border-box}
 /* margin:auto (not align-items:center) so a short viewport scrolls instead of clipping the card. */
 .authcard{margin:auto;width:100%;max-width:392px;background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:32px 30px 28px;box-sizing:border-box}
-.authcard .brand{display:inline-flex;align-items:center;background:#10151d;border-radius:9px;padding:9px 12px;margin:0 0 22px}
-.authcard .brand img{height:24px;width:auto;display:block}
+.authcard .brand{display:flex;align-items:center;gap:10px;margin:0 0 22px}
+.authcard .bmark{display:inline-flex;color:var(--accent);flex:none}
+.authcard .bname{font-size:18px;font-weight:700;letter-spacing:-.2px;color:var(--text)}
+.authcard .btag{font-size:12px;color:var(--faint);margin:-14px 0 22px;letter-spacing:.1px}
 .authcard h1{font-size:21px;font-weight:800;letter-spacing:.2px;color:var(--text);margin:0 0 6px}
 .authcard .sub{font-size:13px;color:var(--muted);line-height:1.55;margin:0 0 22px}
 .authcard .err{font-size:13px;color:var(--danger);line-height:1.5;margin:0 0 16px}
@@ -431,15 +433,16 @@ function authPage({ mode, email = "", error = "" }) {
     ? 'Already have an account? <a href="/login">Sign in</a>'
     : 'No account? <a href="/signup">Create one</a>';
   return `<!doctype html><html lang="en"><head>
-<meta charset="utf-8">
+<meta charset="utf-8">${FAVICON}
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>${title} · Lead Machine</title>
-<link rel="icon" href="/mark.png">
+<title>${title} · Prospector</title>
+${FAVICON}
 ${THEME_INIT_SCRIPT}
 <style>${SHARED_CSS}${AUTH_CSS}</style>
 </head><body>
 <div class="authwrap"><div class="authcard">
-  <div class="brand"><img src="/logo.png" alt="Avanzta"></div>
+  <div class="brand"><span class="bmark"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linejoin="round" aria-hidden="true"><path d="M6 3h12l3 6-9 12L3 9z"/><path d="M3 9h18M9 3l-2 6 5 12 5-12-2-6"/></svg></span><span class="bname">Prospector</span></div>
+  <div class="btag">Agency lead finder</div>
   <h1>${title}</h1>
   <p class="sub">${sub}</p>
   ${error ? `<p class="err" role="alert">${esc(error)}</p>` : ""}
@@ -594,16 +597,16 @@ const ERR_GOOGLE = "Google sign-in did not complete. Try again.";
 // The handoff page. No external scripts; error text is set with textContent, never HTML.
 function callbackPage() {
   return `<!doctype html><html lang="en"><head>
-<meta charset="utf-8">
+<meta charset="utf-8">${FAVICON}
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex">
-<title>Signing you in · Lead Machine</title>
-<link rel="icon" href="/mark.png">
+<title>Signing you in · Prospector</title>
+${FAVICON}
 ${THEME_INIT_SCRIPT}
 <style>${SHARED_CSS}${AUTH_CSS}</style>
 </head><body>
 <div class="authwrap"><div class="authcard">
-  <div class="brand"><img src="/logo.png" alt="Avanzta"></div>
+  <div class="brand"><span class="bmark"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linejoin="round" aria-hidden="true"><path d="M6 3h12l3 6-9 12L3 9z"/><path d="M3 9h18M9 3l-2 6 5 12 5-12-2-6"/></svg></span><span class="bname">Prospector</span></div>
   <h1 id="hd">Signing you in…</h1>
   <p class="sub" id="sb">Finishing your Google sign-in. This only takes a moment.</p>
   <p class="err" role="alert" id="er" hidden></p>
@@ -771,11 +774,11 @@ export function requireAdmin(req, res, next) {
   if (req.isAdmin) return next();
   if (wantsJson(req)) return res.status(403).json({ ok: false, error: "Admins only" });
   return res.status(403).type("html").send(`<!doctype html><html lang="en"><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Admins only · Lead Machine</title>${THEME_INIT_SCRIPT}
+<meta charset="utf-8">${FAVICON}<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Admins only · Prospector</title>${THEME_INIT_SCRIPT}
 <style>${SHARED_CSS}${AUTH_CSS}</style></head><body>
 <div class="authwrap"><div class="authcard">
-  <div class="brand"><img src="/logo.png" alt="Avanzta"></div>
+  <div class="brand"><span class="bmark"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linejoin="round" aria-hidden="true"><path d="M6 3h12l3 6-9 12L3 9z"/><path d="M3 9h18M9 3l-2 6 5 12 5-12-2-6"/></svg></span><span class="bname">Prospector</span></div>
   <h1>Admins only</h1>
   <p class="sub">This account does not have access to the admin area.</p>
   <p class="alt"><a href="/">Back to search</a></p>

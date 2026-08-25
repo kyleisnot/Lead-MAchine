@@ -1,4 +1,4 @@
-// server.js — the Lead Machine dashboard: find local businesses with no website (Search)
+// server.js — the Prospector dashboard: find local businesses with no website (Search)
 // and work them on one Leads page (found · tracked · follow-up).
 //
 // Multi-user: ./auth.js resolves WHO is asking (req.userId / req.userEmail / req.isAdmin)
@@ -14,7 +14,7 @@ import { NICHES } from "../lib/niches.js";
 import { lastActiveLabel, activityStatus, activitySignal, cutoffLabel, freshnessConfig } from "../lib/freshness.js";
 import { spendCapState, RATE_PER_1K } from "../lib/spend.js";
 import { detectLicenseSignal, licenseSearchUrl } from "../lib/license.js";
-import { THEME_INIT_SCRIPT, SHELL_TAIL_SCRIPT, SHARED_CSS, sidebar } from "./shell.js";
+import { THEME_INIT_SCRIPT, SHELL_TAIL_SCRIPT, SHARED_CSS, sidebar, FAVICON } from "./shell.js";
 import { authRouter, requireUser } from "./auth.js";
 import { adminRouter } from "./admin.js";
 import { demoRouter } from "./demo.js";
@@ -289,7 +289,7 @@ app.use(demoRouter);
 // must NOT bind a port there.
 if (!process.env.VERCEL) {
   app.listen(PORT, process.env.BIND_HOST || "127.0.0.1", () => {
-    console.log(`\n🛰  Lead Machine dashboard → http://localhost:${PORT}\n`);
+    console.log(`\n🛰  Prospector → http://localhost:${PORT}\n`);
   });
 }
 
@@ -327,12 +327,11 @@ async function renderSearchPage(req) {
   const activeExplain = !fcfg.enabled
     ? "This check is currently off, so businesses are kept no matter how long ago they were last active."
     : `We look at each business's newest Facebook or Instagram post (or Google review). If the most recent one is older than <b>${esc(cutoffLabel())}</b>, we skip them &mdash; a business that's gone quiet probably isn't taking new customers.`;
-  return `<!doctype html><html><head>${THEME_INIT_SCRIPT}<meta charset="utf-8"><title>Lead Machine — Prospector</title>
+  return `<!doctype html><html><head>${THEME_INIT_SCRIPT}<meta charset="utf-8">${FAVICON}<title>Prospector — Search</title>
 <style>
   :root{--gold:#14FFB9;--bg:#0a1124;--panel:#0f1a30;--border:rgba(20,255,185,.22);--text:#e8eaf0;--muted:#7b8499}
   *{box-sizing:border-box;margin:0;padding:0}
   .brandlogo{height:40px;width:auto;display:block}
-  body::before{content:"";position:fixed;inset:0;background:url(/mark.png) center 120px/360px no-repeat;opacity:.05;pointer-events:none;z-index:0}
   body>*{position:relative;z-index:1}
   body{font-family:system-ui,sans-serif;background:var(--bg);color:var(--text);padding:24px;max-width:1100px;margin:auto}
   header{display:flex;align-items:center;gap:16px;margin-bottom:20px}
@@ -382,7 +381,7 @@ async function renderSearchPage(req) {
   .spinner{display:inline-block;width:14px;height:14px;border:2px solid var(--gold);border-top-color:transparent;border-radius:50%;animation:spin .7s linear infinite;vertical-align:-2px;margin-right:6px}
   @keyframes spin{to{transform:rotate(360deg)}}
 ${SHARED_CSS}</style></head><body>
-${sidebar("search", { isAdmin: req.isAdmin, demo: req.isDemo })}<div class="pagehead"><div class="titlewrap"><h1>Prospector</h1><div class="pagesub">Find local businesses that don't have a website yet</div></div><div class="spacer"></div>
+${sidebar("search", { isAdmin: req.isAdmin, demo: req.isDemo })}<div class="pagehead"><div class="titlewrap"><h1>Search</h1><div class="pagesub">Find local businesses that don't have a website yet</div></div><div class="spacer"></div>
   <div class="statbox">
     <div class="cell"><span class="k">🧠 Remembered</span><span class="v" id="sbMem">—</span><span class="s2" id="sbMemSub"></span></div>
     <div class="sep"></div>
@@ -742,12 +741,11 @@ async function renderLeadsPage(req, view = "tracked") {
     ? '<div class="empty" style="margin-top:20px">No contacted leads yet.<br>Set a lead\'s stage to <b>Contacted</b> in <b>Tracked</b> and it\'ll show here.</div>'
     : '<div class="empty">No saved leads yet.<br>Open the <a href="/leads?view=found">Found</a> tab and click <b>💾 Save</b> on the ones you want to track.</div>';
 
-  return `<!doctype html><html><head>${THEME_INIT_SCRIPT}<meta charset="utf-8"><title>Lead Machine — Leads</title>
+  return `<!doctype html><html><head>${THEME_INIT_SCRIPT}<meta charset="utf-8">${FAVICON}<title>Prospector — Leads</title>
 <style>
   :root{--gold:#14FFB9;--bg:#0a1124;--panel:#0f1a30;--border:rgba(20,255,185,.22);--text:#e8eaf0;--muted:#7b8499}
   *{box-sizing:border-box;margin:0;padding:0}
   .brandlogo{height:40px;width:auto;display:block}
-  body::before{content:"";position:fixed;inset:0;background:url(/mark.png) center 120px/360px no-repeat;opacity:.05;pointer-events:none;z-index:0}
   body>*{position:relative;z-index:1}
   body{font-family:system-ui,sans-serif;background:var(--bg);color:var(--text);padding:24px;max-width:1200px;margin:auto}
   header{display:flex;align-items:center;gap:16px;margin-bottom:8px}

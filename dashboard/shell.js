@@ -21,6 +21,9 @@ if(r.allotment){if(t)t.textContent=(Number(r.tokens)||0).toLocaleString()+' / '+
 else{if(t)t.textContent=(Number(r.tokens)||0).toLocaleString()+' tokens';if(s)s.textContent=(r.searches||0)+' searches';if(w)w.style.display='none';}}catch(e){}}u();setInterval(u,30000);})();
 </script>`;
 
+// Favicon: the wordmark's gem, inlined as SVG so there is no image file to keep in sync.
+export const FAVICON = `<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%230f6e56' stroke-width='2' stroke-linejoin='round'><path d='M6 3h12l3 6-9 12L3 9z'/><path d='M3 9h18M9 3l-2 6 5 12 5-12-2-6'/></svg>">`;
+
 function navIcon(key) {
   const s = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="18" height="18" aria-hidden="true">';
   if (key === "search") return s + '<circle cx="11" cy="11" r="7"></circle><path d="M21 21l-4.2-4.2"></path></svg>';
@@ -45,7 +48,7 @@ export function sidebar(active, { isAdmin = false, demo = false } = {}) {
   const link = (href, key, label) =>
     `<a class="navlink${active === key ? " active" : ""}" href="${href}"><span class="ic">${navIcon(key)}</span><span class="lbl">${label}</span></a>`;
   return `<div class="app"><nav class="side">
-  <div class="brand"><img src="/logo.png" alt="Avanzta"></div>
+  <div class="brand"><span class="bmark"><svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linejoin="round" aria-hidden="true"><path d="M6 3h12l3 6-9 12L3 9z"/><path d="M3 9h18M9 3l-2 6 5 12 5-12-2-6"/></svg></span><span class="bname">Prospector</span></div>
   ${link("/", "search", "Search")}
   ${link("/leads", "leads", "Leads")}
   ${isAdmin ? link("/demo", "demo", "Demo") : ""}
@@ -62,15 +65,15 @@ export function sidebar(active, { isAdmin = false, demo = false } = {}) {
 // variable names (--bg, --panel, --border, --text, --muted, --gold) so every
 // existing `var(--…)` reference is re-themed at once.
 export const SHARED_CSS = `
-:root{--bg:#f6f7f9;--panel:#ffffff;--surface:#ffffff;--surface2:#f9fafb;--text:#1a1d24;--muted:#5b6472;--faint:#98a0ab;--border:#e6e8ec;--border-strong:#d6dae0;--gold:#0c8f50;--accent:#0c8f50;--accent-ink:#0a7a44;--accent-weak:#e7f5ee;--on-accent:#ffffff;--danger:#d92d20;--warn:#b25e09;--warn-weak:#f8efe2;--sidebar:#ffffff;--sidebar-border:#e6e8ec}
-:root[data-theme="dark"]{--bg:#0d1117;--panel:#161b22;--surface:#161b22;--surface2:#1b212b;--text:#e6edf3;--muted:#8b949e;--faint:#6e7681;--border:#262c36;--border-strong:#333b45;--gold:#2ee6a6;--accent:#2ee6a6;--accent-ink:#2ee6a6;--accent-weak:rgba(46,230,166,.12);--on-accent:#04241a;--danger:#f85149;--warn:#e0a93b;--warn-weak:rgba(224,169,59,.14);--sidebar:#0f141b;--sidebar-border:#20262f}
+:root{--bg:#f7f8fa;--panel:#ffffff;--surface:#ffffff;--surface2:#f5f7f8;--text:#15181d;--muted:#5a626e;--faint:#98a0aa;--border:#e5e8ec;--border-strong:#d4d9df;--gold:#0f6e56;--accent:#0f6e56;--accent-ink:#0c5c48;--accent-weak:#e8f4f0;--on-accent:#ffffff;--danger:#d92d20;--warn:#b25e09;--warn-weak:#f8efe2;--sidebar:#ffffff;--sidebar-border:#e6e8ec}
+:root[data-theme="dark"]{--bg:#0d0f13;--panel:#15181d;--surface:#15181d;--surface2:#1a1e24;--text:#e8ebef;--muted:#8b939e;--faint:#6b7280;--border:#242930;--border-strong:#333a43;--gold:#3fcf96;--accent:#3fcf96;--accent-ink:#3fcf96;--accent-weak:rgba(63,207,150,.12);--on-accent:#04241a;--danger:#f85149;--warn:#e0a93b;--warn-weak:rgba(224,169,59,.14);--sidebar:#0f141b;--sidebar-border:#20262f}
 html,body{background:var(--bg);color:var(--text)}
 body{margin:0!important;padding:0!important;max-width:none!important;font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
 body::before{display:none!important;content:none!important}
 a{color:var(--accent)}
 .app{display:flex;min-height:100vh;align-items:stretch}
 .side{width:212px;flex:none;background:var(--sidebar);border-right:1px solid var(--sidebar-border);position:sticky;top:0;height:100vh;display:flex;flex-direction:column;padding:16px 12px;gap:4px}
-.side .brand{display:inline-flex;align-items:center;background:#10151d;border-radius:9px;padding:9px 12px;margin:2px 2px 14px}.side .brand img{height:24px;width:auto;display:block}
+.side .brand{display:flex;align-items:center;gap:9px;padding:6px 10px;margin:2px 0 16px}.side .bmark{display:inline-flex;color:var(--accent);flex:none}.side .bname{font-size:16px;font-weight:700;letter-spacing:-.2px;color:var(--text)}
 .navlink{display:flex;align-items:center;gap:11px;padding:9px 11px;border-radius:9px;color:var(--muted);font-weight:600;font-size:14px;text-decoration:none}
 .navlink .ic{display:inline-flex;color:currentColor}
 .navlink:hover{background:var(--surface2);color:var(--text)}
@@ -175,7 +178,7 @@ input,select{padding:11px 13px}
 .demobar form{margin:0;display:flex}
 .demobar-btn{font-family:inherit;font-size:12px;font-weight:700;color:var(--warn);background:transparent;border:1px solid var(--warn);border-radius:7px;padding:5px 12px;cursor:pointer;white-space:nowrap}
 .demobar-btn:hover{background:var(--warn);color:var(--panel)}
-@media(max-width:860px){.side{width:60px;padding:14px 8px}.side .brand{display:none}.navlink .lbl,.themebtn .tl{display:none}.themebtn{justify-content:center}.main{padding:18px 16px}}
+@media(max-width:860px){.side{width:60px;padding:14px 8px}.side .brand{justify-content:center;padding:6px 0}.side .bname{display:none}.navlink .lbl,.themebtn .tl{display:none}.themebtn{justify-content:center}.main{padding:18px 16px}}
 @media(max-width:700px){.row{grid-template-columns:1fr 1fr}.statbox{width:100%}}
 `;
 

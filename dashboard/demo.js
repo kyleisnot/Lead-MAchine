@@ -51,7 +51,7 @@ import {
 import * as store from "../data/store.js";
 import { dataProvider, getSupabase } from "../lib/supabase.js";
 import { RATE_PER_1K } from "../lib/spend.js";
-import { THEME_INIT_SCRIPT, SHELL_TAIL_SCRIPT, SHARED_CSS, sidebar } from "./shell.js";
+import { THEME_INIT_SCRIPT, SHELL_TAIL_SCRIPT, SHARED_CSS, sidebar, FAVICON } from "./shell.js";
 
 export const demoRouter = express.Router();
 
@@ -811,9 +811,9 @@ function workspacePanel(req, target) {
 }
 
 function renderDemoPage(req, target) {
-  return `<!doctype html><html lang="en"><head>${THEME_INIT_SCRIPT}<meta charset="utf-8">
+  return `<!doctype html><html lang="en"><head>${THEME_INIT_SCRIPT}<meta charset="utf-8">${FAVICON}
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Lead Machine — Demo</title><link rel="icon" href="/mark.png">
+<title>Prospector — Demo</title>${FAVICON}
 <style>
   *{box-sizing:border-box;margin:0;padding:0}
   body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
