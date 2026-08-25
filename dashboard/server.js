@@ -71,6 +71,9 @@ async function monthTokensUsed(userId) {
 // Their allotment lives on their profile row (0 = unlimited); it refills on the 1st.
 async function blockedByAllotment(req, res, { live }) {
   if (!live) return false;
+  // An admin presenting a demo (staged or prospect) must never be stalled mid-meeting
+  // by the TARGET account's plan — the gate applies to real customers only.
+  if (req.isDemo) return false;
   const profile = await store.getProfile(req.userId);
   const allotment = parseInt(profile?.monthly_token_allotment, 10) || 0;
   if (!allotment) return false;

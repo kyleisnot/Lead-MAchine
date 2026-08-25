@@ -23,19 +23,30 @@
 // the prospect sees IS the shipping product. Impersonation lives in auth.js (the
 // lm_demo cookie, honoured only for an authenticated admin).
 //
+// ── LIVE demos: presenting as the PROSPECT ───────────────────────────────────
+// The staged workspace above rehearses; this sells. The operator types the prospect's
+// email, the app quietly creates (or adopts) that person's REAL account, and the
+// meeting runs inside it — so every search saves REAL leads into the prospect's own
+// dashboard. Nothing is seeded: the meeting's own searches are the data. At the end
+// "Get their sign-in link" mints a Supabase recovery link that drops them straight
+// into the account they just watched fill up.
+//
 // Contract:
 //   export const demoRouter — express Router, every route guarded by
 //                             requireUser + requireAdmin (same as admin.js).
-//   GET  /demo              — the presentation page (+ the Client demo panel)
-//   GET  /demo/api/saved    — { ok, saved:[{key,niche,city,state,sources,limit,…}], keys:[…] }
-//   POST /demo/enter        — ensure the demo account + its data, set cookie → /
-//   POST /demo/exit         — clear cookie → /demo
-//   POST /demo/api/reset    — wipe and reseed the demo account's rows
+//   GET  /demo               — the presentation page (+ the demo panels)
+//   GET  /demo/api/saved     — { ok, saved:[{key,niche,city,state,sources,limit,…}], keys:[…] }
+//   POST /demo/enter         — ensure the staged account + its data, set cookie → /
+//   POST /demo/prospect      — find-or-create the prospect's account (form: email),
+//                              set cookie to its uuid → /
+//   POST /demo/exit          — clear cookie → /demo
+//   POST /demo/api/reset     — wipe and reseed the staged account's rows
+//   POST /demo/api/claim-link— { ok, link, email }: the prospect's sign-in link
 import express from "express";
 import crypto from "node:crypto";
 import {
   requireUser, requireAdmin, demoEmail, demoUserId, rememberDemoUserId, forgetDemoUserId,
-  writeDemoCookie, clearDemoCookie,
+  writeDemoCookie, clearDemoCookie, isAdminEmail, originOf,
 } from "./auth.js";
 import * as store from "../data/store.js";
 import { dataProvider, getSupabase } from "../lib/supabase.js";
@@ -110,8 +121,12 @@ demoRouter.get("/demo/api/saved", requireUser, requireAdmin, async (req, res) =>
   }
 });
 
-demoRouter.get("/demo", requireUser, requireAdmin, (req, res) => {
-  res.type("html").send(renderDemoPage(req));
+demoRouter.get("/demo", requireUser, requireAdmin, async (req, res) => {
+  // Which account are we presenting as? The panel below has to say the prospect's
+  // email out loud, so it is resolved server-side from req.userId rather than
+  // trusted from the cookie.
+  const target = await impersonationTarget(req).catch(() => null);
+  res.type("html").send(renderDemoPage(req, target));
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -525,6 +540,67 @@ async function ensureDemoAccount(sb) {
   return id;
 }
 
+// ── the prospect's account ───────────────────────────────────────────────────
+// Same create-or-adopt dance as ensureDemoAccount, with two differences: nothing is
+// seeded (the meeting's real searches ARE the data) and the profile is left on the
+// trigger's defaults — trial / 500 tokens — because this is a genuine new signup that
+// the prospect will keep. Returns the account's uuid.
+async function ensureProspectAccount(sb, email) {
+  const existing = await sb.from("profiles").select("id").eq("email", email).limit(1);
+  if (!existing.error && existing.data && existing.data[0] && existing.data[0].id) {
+    return String(existing.data[0].id); // they already signed up — present as them
+  }
+
+  let id = null;
+  const { data, error } = await sb.auth.admin.createUser({
+    email,
+    password: crypto.randomBytes(24).toString("base64url").slice(0, 32),
+    email_confirm: true,
+  });
+  if (error) {
+    id = await findAuthUserId(sb, email); // auth user exists but has no profile row → adopt
+    if (!id) throw new Error(error.message || "Could not create that account.");
+  } else {
+    id = String((data && data.user && data.user.id) || "");
+    if (!id) throw new Error("Supabase created the account but returned no id.");
+  }
+
+  // Impersonation resolves the target BY its profile row, so a missing one would
+  // silently refuse the cookie. Wait for the signup trigger, then write it ourselves.
+  let hasProfile = false;
+  for (let n = 0; n < 10 && !hasProfile; n++) {
+    const r = await sb.from("profiles").select("id").eq("id", id).maybeSingle();
+    if (r.data && r.data.id) hasProfile = true;
+    else await sleep(300);
+  }
+  if (!hasProfile) {
+    // No tier/allotment here — the column defaults (trial / 500) are what the trigger
+    // would have written, and this account belongs to the prospect, not to the demo.
+    const up = await sb.from("profiles").upsert({ id, email }, { onConflict: "id" });
+    if (up.error) throw new Error(`profile: ${up.error.message}`);
+  }
+  return id;
+}
+
+// Who req.userId currently belongs to, when it isn't the operator's own account:
+// { id, email, staged }. `staged` separates the rehearsal workspace from a live
+// prospect — the two panels, and the claim-link route, hinge on it.
+async function impersonationTarget(req) {
+  if (!req.isDemo || dataProvider() !== "supabase") return null;
+  try {
+    const sb = await getSupabase();
+    const { data, error } = await sb.from("profiles").select("id,email").eq("id", req.userId).maybeSingle();
+    if (error || !data || !data.id) return null;
+    const email = String(data.email || "").trim().toLowerCase();
+    // Belt and braces: an id match covers a staged profile whose email column is blank,
+    // which would otherwise read as a prospect and expose a claim link for it.
+    const staged = email === demoEmail() || String(data.id) === String(await demoUserId());
+    return { id: String(data.id), email, staged };
+  } catch {
+    return null;
+  }
+}
+
 // ── workspace routes ─────────────────────────────────────────────────────────
 
 const SQLITE_NOTE = "The demo workspace needs Supabase mode.";
@@ -556,6 +632,67 @@ demoRouter.post("/demo/enter", requireUser, requireAdmin, async (req, res) => {
   }
 });
 
+// Start a LIVE demo: the operator types the prospect's email, we make sure that real
+// account exists, and the cookie points at it for the rest of the meeting. Nothing is
+// seeded — the searches run in front of the prospect are what fills their dashboard.
+const looksLikeEmail = (e) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e);
+const prospectBody = [express.urlencoded({ extended: false }), express.json()];
+
+demoRouter.post("/demo/prospect", requireUser, requireAdmin, prospectBody, async (req, res) => {
+  const bail = (msg) => res.redirect(303, "/demo?err=" + encodeURIComponent(msg));
+  if (dataProvider() !== "supabase") return bail(SQLITE_NOTE);
+
+  const email = String((req.body && req.body.email) || "").trim().toLowerCase();
+  if (!email) return bail("Enter the prospect's email address.");
+  if (!looksLikeEmail(email)) return bail("That doesn't look like an email address.");
+  // Two accounts we must never hand an operator a live session for: a colleague's
+  // (one typo and you're presenting from inside their real dashboard) and the staged
+  // demo account (that's the Practice demo, and it would hand out a sign-in link for it).
+  if (isAdminEmail(email)) return bail("That's an operator account — use a prospect's own email.");
+  if (email === demoEmail()) return bail("That's the staged demo account — use the Practice demo instead.");
+
+  try {
+    const sb = await getSupabase();
+    const userId = await ensureProspectAccount(sb, email);
+    writeDemoCookie(req, res, userId);
+    return res.redirect(303, "/");
+  } catch (e) {
+    return bail(e && e.message ? e.message : "Could not start the prospect demo.");
+  }
+});
+
+// The handoff at the end of the meeting: a Supabase recovery link for the account the
+// room just watched fill up. It lands on /auth/callback, which already knows how to
+// turn the fragment it carries into this app's session cookie — so the prospect clicks
+// once and is inside their own dashboard, leads and all. Prospect demos only: the
+// staged account's link would be a credential for the rehearsal workspace.
+demoRouter.post("/demo/api/claim-link", requireUser, requireAdmin, async (req, res) => {
+  if (dataProvider() !== "supabase") {
+    return res.status(400).json({ ok: false, error: SQLITE_NOTE });
+  }
+  try {
+    const target = await impersonationTarget(req);
+    if (!target || target.staged || !target.email) {
+      return res.status(400).json({ ok: false, error: "Start a prospect demo first — there's no account to hand over." });
+    }
+    const sb = await getSupabase();
+    const { data, error } = await sb.auth.admin.generateLink({
+      type: "recovery",
+      email: target.email,
+      options: { redirectTo: `${originOf(req)}/auth/callback` },
+    });
+    if (error) throw new Error(error.message || "Supabase would not mint a link.");
+    const link = String((data && data.properties && data.properties.action_link) || "");
+    if (!link) throw new Error("Supabase returned no link.");
+    return res.json({ ok: true, link, email: target.email });
+  } catch (e) {
+    return res.status(500).json({
+      ok: false,
+      error: e && e.message ? e.message : "Could not create the sign-in link.",
+    });
+  }
+});
+
 // Exit: drop the cookie. Works in every mode — clearing a cookie that isn't there
 // is a no-op, so this can never leave the operator stuck in the demo.
 demoRouter.post("/demo/exit", requireUser, requireAdmin, (req, res) => {
@@ -583,10 +720,15 @@ demoRouter.post("/demo/api/reset", requireUser, requireAdmin, async (req, res) =
 
 // ── page ─────────────────────────────────────────────────────────────────────
 
-// The "Client demo" panel under the saved-demos strip: enter, reset, or (once you're
-// in) get back out. Server-rendered from req.isDemo so it can never disagree with the
-// cookie the browser is actually carrying.
-function workspacePanel(req) {
+// The demo panels under the saved-demos strip. Two modes sit side by side when the
+// operator is signed in as themselves — the rehearsal workspace (staged data) and the
+// live prospect demo (their real account) — and whichever one is running replaces both
+// while it's running. Server-rendered from req.isDemo + the resolved target, so the
+// page can never disagree with the cookie the browser is actually carrying.
+//
+// `err` (from ?err=…) is rendered into the FIRST card only, so a redirect back here
+// never shows the same message twice.
+function workspacePanel(req, target) {
   const raw = String((req.query && req.query.err) || "").slice(0, 300);
   const err = raw ? `<div class="dwork-err">⚠️ ${escHtml(raw)}</div>` : "";
 
@@ -594,15 +736,39 @@ function workspacePanel(req) {
     return `<div class="dwork">
   <div class="dwork-ttl">Client demo</div>
   <h2>The demo workspace needs Supabase mode</h2>
-  <p>This app is running on local SQLite, which is single-user — there is no second account to present as, so there is nothing to stage or reset.</p>
+  <p>This app is running on local SQLite, which is single-user — there is no second account to present as, so there is nothing to stage, reset or hand over.</p>
   <div class="dwork-note">Set <code>DATA_PROVIDER=supabase</code> in <code>.env</code> (with the project URL and service-role key) and restart to use the demo workspace.</div>
   ${err}
 </div>`;
   }
 
+  // Live demo in progress — presenting as the prospect's own account.
+  if (req.isDemo && target && !target.staged) {
+    const who = escHtml(target.email);
+    return `<div class="dwork">
+  <div class="dwork-ttl">Live demo for a prospect</div>
+  <h2>You're presenting as <span class="dwork-who">${who}</span></h2>
+  <p>This is their real account. Every search you run in the meeting saves real leads into it — so when you hand it over, the pipeline they just watched you build is already theirs. Nothing here touches your own leads.</p>
+  <div class="dwork-act">
+    <form method="post" action="/demo/exit"><button class="dwork-go" type="submit">Exit demo</button></form>
+    <button class="dwork-reset" type="button" onclick="getClaimLink(this)">Get their sign-in link</button>
+    <span class="dwork-flag" id="clFlag"></span>
+  </div>
+  <div class="dwork-claim" id="clWrap" hidden>
+    <div class="dwork-claimrow">
+      <input id="clLink" type="text" readonly spellcheck="false" onclick="this.select()">
+      <button class="dwork-copy" type="button" onclick="copyClaimLink(this)">Copy</button>
+    </div>
+    <div class="dwork-note">Send this to the prospect — it signs them straight into their account (Google sign-in also works if it's a Gmail).</div>
+  </div>
+  ${err}
+</div>`;
+  }
+
+  // Practice demo in progress (or a target we couldn't resolve — the safe default).
   if (req.isDemo) {
     return `<div class="dwork">
-  <div class="dwork-ttl">Client demo</div>
+  <div class="dwork-ttl">Practice demo — staged data</div>
   <h2>You're presenting in the demo workspace</h2>
   <p>Every page you open is the real product, reading the demo account's staged data — nothing you click touches your own leads. Exit when the meeting ends, then reset from this panel before the next one.</p>
   <div class="dwork-act">
@@ -613,7 +779,7 @@ function workspacePanel(req) {
   }
 
   return `<div class="dwork">
-  <div class="dwork-ttl">Client demo</div>
+  <div class="dwork-ttl">Practice demo — staged data</div>
   <h2>Enter the demo workspace</h2>
   <p>Opens the real app as a dedicated demo account: 36 leads across Knoxville, Chattanooga and Nashville, a 12-lead pipeline mid-flight, follow-ups coming due, and half a plan of tokens spent. Nothing in there touches your own account — and Reset puts it back exactly as it started.</p>
   <div class="dwork-act">
@@ -622,10 +788,21 @@ function workspacePanel(req) {
     <span class="dwork-flag" id="dwFlag"></span>
   </div>
   ${err}
+</div>
+<div class="dwork">
+  <div class="dwork-ttl">Live demo for a prospect</div>
+  <h2>Present as the prospect, in their own account</h2>
+  <p>Type their email and run the meeting from inside their dashboard. At the end, one button hands them a sign-in link — the leads you just found are already in their account.</p>
+  <form class="dwork-act" method="post" action="/demo/prospect">
+    <input class="dwork-email" type="email" name="email" placeholder="prospect@theircompany.com"
+           autocomplete="off" spellcheck="false" autocapitalize="off" required>
+    <button class="dwork-go" type="submit">Start prospect demo</button>
+  </form>
+  <div class="dwork-note">Creates their real account behind the scenes — searches you run will save leads into it. Live scans need the Apify key (<code>APIFY_TOKEN</code>).</div>
 </div>`;
 }
 
-function renderDemoPage(req) {
+function renderDemoPage(req, target) {
   return `<!doctype html><html lang="en"><head>${THEME_INIT_SCRIPT}<meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Lead Machine — Demo</title><link rel="icon" href="/mark.png">
@@ -712,6 +889,18 @@ function renderDemoPage(req) {
   .dwork-note{margin-top:16px;font-size:13px;line-height:1.6;color:var(--muted);background:var(--surface2);
               border:1px solid var(--border);border-radius:10px;padding:14px 16px}
   .dwork-note code{background:var(--panel);border:1px solid var(--border);border-radius:5px;padding:1px 6px;font-size:12px;color:var(--text)}
+  .dwork-who{color:var(--accent-ink);word-break:break-all}
+  .dwork-email{flex:1 1 300px;min-width:0;font-family:inherit;font-size:15px;font-weight:600;
+               padding:12px 14px;border-radius:11px}
+  .dwork-claim{margin-top:18px}
+  .dwork-claim[hidden]{display:none} /* explicit: never let a future SHARED_CSS div rule out-specify the UA sheet */
+  .dwork-claimrow{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+  .dwork-claimrow input{flex:1 1 340px;min-width:0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+                        font-size:12px;padding:11px 13px;border-radius:10px}
+  .dwork-copy{font-family:inherit;font-size:14px;font-weight:700;padding:11px 18px;border-radius:10px;
+              border:1px solid var(--border-strong);background:var(--surface2);color:var(--text);cursor:pointer}
+  .dwork-copy:hover{border-color:var(--accent);color:var(--accent-ink)}
+  .dwork-claim .dwork-note{margin-top:12px}
   @media(max-width:820px){
     .dform{grid-template-columns:1fr 1fr;gap:12px}
     .dgo{grid-column:1/-1;width:100%}
@@ -740,7 +929,7 @@ ${sidebar("demo", { isAdmin: true, demo: !!req.isDemo })}
     <div class="dchips" id="savedChips"></div>
   </div>
 
-${workspacePanel(req)}
+${workspacePanel(req, target)}
 
   <div class="dmsg" id="msg" style="display:none"></div>
   <div class="dstages" id="stages" style="display:none"></div>
@@ -1001,6 +1190,52 @@ async function resetDemoData(btn){
     flag.textContent = '\\u2715 Reset failed \\u2014 the server did not answer.';
   }
   btn.disabled = false;
+}
+
+// ── prospect demo: the handoff link ────────────────────────────────────────
+// Minted on demand rather than on page load: it is a one-shot credential for the
+// prospect's account, so it only exists once the operator has asked for it.
+async function getClaimLink(btn){
+  var flag = $('clFlag'), wrap = $('clWrap');
+  btn.disabled = true;
+  flag.className = 'dwork-flag';
+  flag.innerHTML = '<span class="dwork-spin"></span> Creating the link\\u2026';
+  try{
+    var resp = await fetch('/demo/api/claim-link',{method:'POST',headers:{'Accept':'application/json'}});
+    var j = await resp.json().catch(function(){return null});
+    if(j && j.ok && j.link){
+      $('clLink').value = j.link;
+      wrap.hidden = false;
+      flag.className = 'dwork-flag ok';
+      flag.textContent = '\\u2713 Link ready for ' + (j.email || 'the prospect');
+      $('clLink').focus(); $('clLink').select();
+    }else{
+      flag.className = 'dwork-flag err';
+      flag.textContent = '\\u2715 ' + ((j && j.error) || 'Could not create the link');
+    }
+  }catch(e){
+    flag.className = 'dwork-flag err';
+    flag.textContent = '\\u2715 Could not create the link \\u2014 the server did not answer.';
+  }
+  btn.disabled = false;
+}
+
+function copyClaimLink(btn){
+  var input = $('clLink');
+  input.focus(); input.select(); input.setSelectionRange(0, 99999);
+  var done = false;
+  // execCommand first: navigator.clipboard needs a secure context, which a demo
+  // running over plain http on a laptop or a projector box will not have.
+  try{ done = document.execCommand('copy') }catch(e){}
+  var finish = function(ok){
+    var was = btn.textContent;
+    btn.textContent = ok ? '\\u2713 Copied' : 'Press \\u2318C';
+    setTimeout(function(){ btn.textContent = was }, 1600);
+  };
+  if(done){ finish(true); return }
+  if(navigator.clipboard && navigator.clipboard.writeText){
+    navigator.clipboard.writeText(input.value).then(function(){finish(true)},function(){finish(false)});
+  }else finish(false);
 }
 
 ['city','state','niche'].forEach(function(id){

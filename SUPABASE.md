@@ -68,24 +68,34 @@ are never trusted just because they were posted.
 
 ## Demo workspace
 
-For client meetings, `/demo` has a **Client demo** panel that drops the operator into the *real* app
-signed in as a dedicated, fully staged account — and puts it back afterwards. Supabase mode only
-(SQLite is single-user, so there is no second account to present as).
+For client meetings, `/demo` carries two panels that drop the operator into the *real* app signed in as
+another account. Supabase mode only (SQLite is single-user, so there is no second account to present as;
+every route below degrades to the same friendly notice there).
+
+- **Practice demo — staged data.** A dedicated account preloaded with a believable pipeline, reset to
+  identical state before every meeting. Rehearsal.
+- **Live demo for a prospect.** The prospect's *own real account*, created on the spot. Every search run
+  in the meeting saves real leads into it, and the operator hands over a sign-in link at the end.
 
 | Route | Does |
 |---|---|
 | `POST /demo/enter` | Creates the demo account if it's missing, seeds it if it's empty, sets the `lm_demo` cookie, redirects to `/` |
+| `POST /demo/prospect` | Form field `email`: finds-or-creates *that* account, sets `lm_demo` to its uuid, redirects to `/` |
 | `POST /demo/exit` | Clears the cookie |
-| `POST /demo/api/reset` | Deletes every demo row and lays the seed down again → `{ok, seeded:{…}}` (or `{ok:false, step, error}`) |
+| `POST /demo/api/reset` | Deletes every staged demo row and lays the seed down again → `{ok, seeded:{…}}` (or `{ok:false, step, error}`) |
+| `POST /demo/api/claim-link` | Prospect demos only → `{ok, link, email}`: a sign-in link for the account being presented |
 
 - **The account.** `DEMO_EMAIL` (default `demo-workspace@leadmachine.internal`), created server-side with
   a random 32-char password that is thrown away — it is only ever reached by impersonation, never by
   signing in. Its profile is set to `starter` / 2,500 tokens. Reset never deletes the auth user or its
   profile row, only its data.
-- **Impersonation.** `lm_demo=1` is a marker cookie with no authority of its own: `requireUser` swaps
-  `req.userId` to the demo account **only** for an already-authenticated admin (`ADMIN_EMAILS`), and only
-  once that account exists. Non-admins holding the cookie are unaffected, `req.realUserId` keeps the real
-  admin's id, and `req.isDemo` puts an amber "Demo workspace" banner with an Exit button on every page.
+- **Impersonation.** `lm_demo` is a marker cookie with no authority of its own: `requireUser` swaps
+  `req.userId` to the target account **only** for an already-authenticated admin (`ADMIN_EMAILS`), and only
+  once that account exists. The value is either `1` (the staged demo account) or a **uuid** (a prospect's
+  account); anything else is ignored, as is a uuid with no `profiles` row and — deliberately — any uuid
+  whose `profiles.email` is on `ADMIN_EMAILS`, so a typo can never put an operator inside a colleague's
+  dashboard. Verified uuids are cached ~5 minutes. Non-admins holding the cookie are unaffected,
+  `req.realUserId` keeps the real admin's id, and `req.isDemo` marks the request as impersonated.
 - **The seed** (deterministic; only dates are relative): 36 no-website leads across Knoxville /
   Chattanooga / Nashville TN in landscaping, roofing and pressure washing · 12 saved into the CRM across
   all five stages · 3 manual follow-ups (one overdue, one due today, one in 3 days) · 14 metered searches
@@ -95,3 +105,26 @@ signed in as a dedicated, fully staged account — and puts it back afterwards. 
 - **Adding to it.** The seed lives in `dashboard/demo.js` (`DEMO_BUSINESSES`, `SAVED_PLAN`, `FOLLOWUPS`,
   `USAGE_COSTS`). Keep it free of `Math.random`/`Date.now` for identity — same data every reset is the
   point.
+
+### Prospect demos
+
+The pitch is "the leads we just found are already in your account". The operator types the prospect's
+email into the **Live demo for a prospect** card and presents from inside that person's real dashboard.
+
+1. **`POST /demo/prospect`** validates the address and refuses two of them outright: anything on
+   `ADMIN_EMAILS` (a typo would otherwise hand the operator a live session in a colleague's account) and
+   `DEMO_EMAIL` (that's the Practice demo). Then it finds-or-creates the account — `profiles`-by-email
+   first, else `auth.admin.createUser` with a random 32-char password and `email_confirm: true`, adopting
+   an existing auth user if the email is already taken — waits for the signup trigger to write the
+   profile, and points `lm_demo` at the new uuid.
+2. **Nothing is seeded.** The account starts empty on the trigger's defaults (`trial` / 500 tokens); the
+   searches run live in the meeting are the data. Live scans therefore need `APIFY_TOKEN` — without it
+   the search page shows its usual "needs an Apify key" notice, so rehearse on the Practice demo.
+3. **`POST /demo/api/claim-link`** (the "Get their sign-in link" button) calls
+   `auth.admin.generateLink({type:"recovery"})` with `redirectTo` = this request's origin + `/auth/callback`,
+   and returns `properties.action_link`. That is the same fragment handoff Google sign-in uses, so one
+   click puts the prospect in their own dashboard with the meeting's leads already there. It is refused
+   unless the request is actually impersonating a prospect — the staged account never mints one, because
+   that link would be a standing credential for the rehearsal workspace.
+4. **Ending the meeting.** `POST /demo/exit` clears the cookie, exactly as for the staged demo. The
+   prospect's account is left alone: it is a genuine signup they keep, and it is never reset or wiped.

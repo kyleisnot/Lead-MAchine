@@ -85,7 +85,8 @@ function isSecureRequest(req) {
 
 // Public origin of THIS request ("https://host"), so the OAuth redirect comes back to
 // whichever host the user is actually on (localhost in dev, the Vercel domain in prod).
-function originOf(req) {
+// Exported: demo.js builds the prospect's sign-in link against the same origin.
+export function originOf(req) {
   const host = String(req?.headers?.host || "").split(",")[0].trim();
   return `${isSecureRequest(req) ? "https" : "http"}://${host}`;
 }
@@ -116,14 +117,22 @@ function clearSessionCookie(req, res) {
 }
 
 // ── demo workspace (admin-only impersonation) ───────────────────────────────
-// The operator demos the REAL product against a dedicated, fully seeded account.
-// `lm_demo` is a marker cookie ONLY — it grants nothing by itself. requireUser
-// swaps in the demo account's user id exclusively for an ALREADY-AUTHENTICATED
-// ADMIN, so a non-admin holding the cookie is completely unaffected, and the
-// cookie is ignored entirely until the demo account actually exists.
+// The operator demos the REAL product against another account. `lm_demo` is a
+// marker cookie ONLY — it grants nothing by itself. requireUser swaps in the
+// target account's user id exclusively for an ALREADY-AUTHENTICATED ADMIN, so a
+// non-admin holding the cookie is completely unaffected, and the cookie is
+// ignored entirely unless the target account actually exists.
+//
+// Two shapes of cookie value:
+//   "1"    — the staged demo account (DEMO_EMAIL), preloaded with fake data.
+//   <uuid> — a LIVE prospect demo: the prospect's own real account, so every
+//            search run in the meeting saves real leads into it.
 const DEMO_COOKIE = "lm_demo";
 const DEMO_COOKIE_MAX_AGE = 60 * 60 * 12; // 12h — a meeting, not a residence
 const DEMO_ID_TTL_MS = 10 * 60 * 1000; // how long we trust the cached demo user id
+const DEMO_TARGET_TTL_MS = 5 * 60 * 1000; // how long we trust a verified prospect uuid
+const DEMO_TARGET_CACHE_MAX = 200;
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export function demoEmail() {
   const e = String(process.env.DEMO_EMAIL || "").trim();
@@ -158,9 +167,13 @@ export async function demoUserId() {
   return id;
 }
 
-export function writeDemoCookie(req, res) {
+// value: omitted/"1" → the staged demo account; a uuid → that account (prospect demo).
+// Anything else is refused rather than written, so we never emit a header we didn't shape.
+export function writeDemoCookie(req, res, value) {
   if (res.headersSent) return;
-  const bits = [`${DEMO_COOKIE}=1`, "Path=/", "HttpOnly", "SameSite=Lax", `Max-Age=${DEMO_COOKIE_MAX_AGE}`];
+  const v = value == null || value === "" ? "1" : String(value).trim().toLowerCase();
+  if (v !== "1" && !UUID_RE.test(v)) return;
+  const bits = [`${DEMO_COOKIE}=${v}`, "Path=/", "HttpOnly", "SameSite=Lax", `Max-Age=${DEMO_COOKIE_MAX_AGE}`];
   if (isSecureRequest(req)) bits.push("Secure");
   appendCookie(res, bits.join("; "));
 }
@@ -173,9 +186,58 @@ export function clearDemoCookie(req, res) {
   appendCookie(res, bits.join("; "));
 }
 
+// Prospect targets we've already verified: uuid -> { email, expires }. The email is
+// kept (not just a boolean) so the ADMIN_EMAILS guard below is re-evaluated on every
+// hit — that list can change without a restart, exactly like cacheGet() does.
+const demoTargetCache = new Map();
+
+function demoTargetCachePut(id, email) {
+  const now = Date.now();
+  if (demoTargetCache.size >= DEMO_TARGET_CACHE_MAX) {
+    for (const [k, v] of demoTargetCache) if (v.expires <= now) demoTargetCache.delete(k);
+    if (demoTargetCache.size >= DEMO_TARGET_CACHE_MAX) {
+      demoTargetCache.delete(demoTargetCache.keys().next().value);
+    }
+  }
+  demoTargetCache.set(id, { email, expires: now + DEMO_TARGET_TTL_MS });
+}
+
+// Is this uuid an account an admin is allowed to present as? It must have a profiles
+// row (so we never impersonate a phantom id), and it must NOT be an operator account:
+// one typo'd prospect email that happens to be on ADMIN_EMAILS would otherwise put the
+// operator inside a real colleague's dashboard. Returns the id, or null.
+async function impersonableUserId(id) {
+  const now = Date.now();
+  const hit = demoTargetCache.get(id);
+  if (hit && hit.expires > now) return isAdminEmail(hit.email) ? null : id;
+  if (hit) demoTargetCache.delete(id);
+  try {
+    const sb = await getSupabase();
+    const { data, error } = await sb.from("profiles").select("id,email").eq("id", id).maybeSingle();
+    if (error || !data?.id) return null;
+    const email = String(data.email || "");
+    if (isAdminEmail(email)) return null;
+    demoTargetCachePut(id, email);
+    return id;
+  } catch {
+    return null; // no Supabase / bad keys → behave as "no such account"
+  }
+}
+
+// The account this lm_demo cookie value names, or null when the cookie is meaningless
+// (unknown uuid, protected account, malformed value, staged account not built yet).
+async function demoTargetUserId(value) {
+  const v = String(value || "").trim().toLowerCase();
+  if (!v) return null;
+  if (v === "1") return demoUserId(); // back-compat: the staged demo workspace
+  if (!UUID_RE.test(v)) return null;
+  return impersonableUserId(v);
+}
+
 // ── admin list ──────────────────────────────────────────────────────────────
 // Read from the env on every call so a process-level override always wins.
-function isAdminEmail(email) {
+// Exported so demo.js can refuse to start a prospect demo for an operator address.
+export function isAdminEmail(email) {
   if (!email) return false;
   const list = String(process.env.ADMIN_EMAILS || "")
     .split(",").map((e) => e.trim().toLowerCase()).filter(Boolean);
@@ -684,13 +746,16 @@ export function requireUser(req, res, next) {
       req.isDemo = false;
 
       // Demo workspace: an admin carrying the lm_demo cookie reads and writes the
-      // demo account's data instead of their own. isAdmin stays true so they can
-      // still reach /demo and exit. Anyone else's cookie is simply ignored.
-      if (!user.isAdmin || readCookie(req, DEMO_COOKIE) !== "1") return next();
-      return demoUserId().then(
-        (demoId) => {
-          if (demoId) {
-            req.userId = demoId;
+      // TARGET account's data instead of their own — the staged demo account ("1")
+      // or, for a live prospect demo, that prospect's own account (a uuid). isAdmin
+      // stays true so they can still reach /demo and exit. Anyone else's cookie is
+      // simply ignored, as is a value that names no impersonable account.
+      const demoCookie = user.isAdmin ? readCookie(req, DEMO_COOKIE) : "";
+      if (!demoCookie) return next();
+      return demoTargetUserId(demoCookie).then(
+        (targetId) => {
+          if (targetId) {
+            req.userId = targetId;
             req.isDemo = true;
           }
           next();
