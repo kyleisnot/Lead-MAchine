@@ -115,6 +115,64 @@ function clearSessionCookie(req, res) {
   appendCookie(res, bits.join("; "));
 }
 
+// ── demo workspace (admin-only impersonation) ───────────────────────────────
+// The operator demos the REAL product against a dedicated, fully seeded account.
+// `lm_demo` is a marker cookie ONLY — it grants nothing by itself. requireUser
+// swaps in the demo account's user id exclusively for an ALREADY-AUTHENTICATED
+// ADMIN, so a non-admin holding the cookie is completely unaffected, and the
+// cookie is ignored entirely until the demo account actually exists.
+const DEMO_COOKIE = "lm_demo";
+const DEMO_COOKIE_MAX_AGE = 60 * 60 * 12; // 12h — a meeting, not a residence
+const DEMO_ID_TTL_MS = 10 * 60 * 1000; // how long we trust the cached demo user id
+
+export function demoEmail() {
+  const e = String(process.env.DEMO_EMAIL || "").trim();
+  return (e || "demo-workspace@leadmachine.internal").toLowerCase();
+}
+
+// id lookup is one query per 10 minutes, not one per request.
+let demoIdCache = { email: "", id: null, expires: 0 };
+
+export function rememberDemoUserId(id) {
+  demoIdCache = { email: demoEmail(), id: id ? String(id) : null, expires: Date.now() + DEMO_ID_TTL_MS };
+}
+
+export function forgetDemoUserId() {
+  demoIdCache = { email: "", id: null, expires: 0 };
+}
+
+// The demo account's user id, or null when that account doesn't exist yet.
+export async function demoUserId() {
+  const email = demoEmail();
+  const now = Date.now();
+  if (demoIdCache.email === email && demoIdCache.expires > now) return demoIdCache.id;
+  let id = null;
+  try {
+    const sb = await getSupabase();
+    const { data, error } = await sb.from("profiles").select("id,email").eq("email", email).limit(1);
+    if (!error && data && data[0] && data[0].id) id = String(data[0].id);
+  } catch {
+    id = null; // no Supabase / bad keys → behave as "no demo account"
+  }
+  demoIdCache = { email, id, expires: now + DEMO_ID_TTL_MS };
+  return id;
+}
+
+export function writeDemoCookie(req, res) {
+  if (res.headersSent) return;
+  const bits = [`${DEMO_COOKIE}=1`, "Path=/", "HttpOnly", "SameSite=Lax", `Max-Age=${DEMO_COOKIE_MAX_AGE}`];
+  if (isSecureRequest(req)) bits.push("Secure");
+  appendCookie(res, bits.join("; "));
+}
+
+export function clearDemoCookie(req, res) {
+  if (res.headersSent) return;
+  const bits = [`${DEMO_COOKIE}=`, "Path=/", "HttpOnly", "SameSite=Lax", "Max-Age=0",
+    "Expires=Thu, 01 Jan 1970 00:00:00 GMT"];
+  if (isSecureRequest(req)) bits.push("Secure");
+  appendCookie(res, bits.join("; "));
+}
+
 // ── admin list ──────────────────────────────────────────────────────────────
 // Read from the env on every call so a process-level override always wins.
 function isAdminEmail(email) {
@@ -605,20 +663,36 @@ export function requireUser(req, res, next) {
     req.userId = "local";
     req.userEmail = "local@dev";
     req.isAdmin = true;
+    req.realUserId = "local";
+    req.isDemo = false;
     return next();
   }
 
   const pathname = pathOf(req);
   resolveSession(req, res).then(
     (user) => {
-      if (user) {
-        req.userId = user.userId;
-        req.userEmail = user.userEmail;
-        req.isAdmin = user.isAdmin;
-        return next();
-      }
-      if (isPublicPath(pathname)) return next();
-      return denyUnauthenticated(req, res);
+      if (!user) return isPublicPath(pathname) ? next() : denyUnauthenticated(req, res);
+
+      req.userId = user.userId;
+      req.userEmail = user.userEmail;
+      req.isAdmin = user.isAdmin;
+      req.realUserId = user.userId;
+      req.isDemo = false;
+
+      // Demo workspace: an admin carrying the lm_demo cookie reads and writes the
+      // demo account's data instead of their own. isAdmin stays true so they can
+      // still reach /demo and exit. Anyone else's cookie is simply ignored.
+      if (!user.isAdmin || readCookie(req, DEMO_COOKIE) !== "1") return next();
+      return demoUserId().then(
+        (demoId) => {
+          if (demoId) {
+            req.userId = demoId;
+            req.isDemo = true;
+          }
+          next();
+        },
+        () => next() // lookup failed → carry on as the real user, never a dead page
+      );
     },
     () => (isPublicPath(pathname) ? next() : denyUnauthenticated(req, res))
   );

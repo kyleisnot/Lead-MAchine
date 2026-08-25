@@ -13,14 +13,32 @@
 // a chip fills the inputs and re-runs it; the search cache answers for free, so a
 // demo never depends on live Apify credits (and there is no APIFY_TOKEN in dev).
 //
+// ── The demo WORKSPACE (the second half of this file) ────────────────────────
+// The page above sells the *search*. The workspace sells the *product*: one click
+// drops the operator into the real app — every page, every feature — signed in as a
+// dedicated demo account preloaded with a believable 36-lead pipeline, and one click
+// puts it back exactly as it was for the next meeting.
+//
+// Nothing here is a mock: the seed writes ordinary rows for an ordinary user, so what
+// the prospect sees IS the shipping product. Impersonation lives in auth.js (the
+// lm_demo cookie, honoured only for an authenticated admin).
+//
 // Contract:
 //   export const demoRouter — express Router, every route guarded by
 //                             requireUser + requireAdmin (same as admin.js).
-//   GET /demo               — the presentation page
-//   GET /demo/api/saved     — { ok, saved:[{key,niche,city,state,sources,limit,…}], keys:[…] }
+//   GET  /demo              — the presentation page (+ the Client demo panel)
+//   GET  /demo/api/saved    — { ok, saved:[{key,niche,city,state,sources,limit,…}], keys:[…] }
+//   POST /demo/enter        — ensure the demo account + its data, set cookie → /
+//   POST /demo/exit         — clear cookie → /demo
+//   POST /demo/api/reset    — wipe and reseed the demo account's rows
 import express from "express";
-import { requireUser, requireAdmin } from "./auth.js";
+import crypto from "node:crypto";
+import {
+  requireUser, requireAdmin, demoEmail, demoUserId, rememberDemoUserId, forgetDemoUserId,
+  writeDemoCookie, clearDemoCookie,
+} from "./auth.js";
 import * as store from "../data/store.js";
+import { dataProvider, getSupabase } from "../lib/supabase.js";
 import { RATE_PER_1K } from "../lib/spend.js";
 import { THEME_INIT_SCRIPT, SHELL_TAIL_SCRIPT, SHARED_CSS, sidebar } from "./shell.js";
 
@@ -53,6 +71,12 @@ function parseKey(key) {
 // Cache keys are stored lowercased; title-case them again so a chip reads well on a
 // projector ("Landscaping · Chattanooga TN", not "landscaping · chattanooga tn").
 const titleCase = (s) => String(s || "").replace(/\b[a-z]/g, (c) => c.toUpperCase());
+
+function escHtml(s) {
+  return String(s == null ? "" : s)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+}
 
 function labelFor(p) {
   const where = [titleCase(p.city), (p.state || "").toUpperCase()].filter(Boolean).join(" ");
@@ -90,7 +114,516 @@ demoRouter.get("/demo", requireUser, requireAdmin, (req, res) => {
   res.type("html").send(renderDemoPage(req));
 });
 
+// ═════════════════════════════════════════════════════════════════════════════
+// DEMO WORKSPACE — seed data
+// ═════════════════════════════════════════════════════════════════════════════
+// Deterministic on purpose: the same 36 businesses, the same pipeline and the same
+// numbers after every reset, so a rehearsed meeting runs exactly as rehearsed. Only
+// the DATES are relative (daysAgo), so "contacted 3 days ago" is still true a year
+// from now — a demo full of 2026 timestamps is the fastest way to look abandoned.
+
+const DAY_MS = 86400000;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const daysAgo = (n) => new Date(Date.now() - n * DAY_MS);
+const isoDaysAgo = (n) => daysAgo(n).toISOString();
+const pad2 = (n) => String(n).padStart(2, "0");
+// manual_followups.due is a plain date and the UI reads it back as LOCAL midnight,
+// so "due today" has to mean the operator's today, not UTC's.
+function dueDate(offsetDays) {
+  const d = new Date(Date.now() + offsetDays * DAY_MS);
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+}
+const slug = (s) => String(s).toLowerCase().replace(/[^a-z0-9]+/g, "");
+
+const DEMO_STATE = "TN";
+const SEED_SOURCES = ["google", "facebook", "instagram"]; // the depth the demo searches ran at
+const SEED_LIMIT = 20;
+const SOURCE_CYCLE = ["google_maps", "facebook", "instagram"];
+
+// Each city has a headline trade — the cached search for that city returns those 8,
+// while the other 4 keep the city's lead list looking like real mixed prospecting.
+const DEMO_CITIES = [
+  { city: "Knoxville", area: "865", niche: "landscaping" },
+  { city: "Chattanooga", area: "423", niche: "roofing" },
+  { city: "Nashville", area: "615", niche: "pressure washing" },
+];
+
+const CATEGORY = {
+  landscaping: ["Landscaper", "Lawn care service"],
+  roofing: ["Roofing contractor", "Roofer"],
+  "pressure washing": ["Pressure washing service", "Power washing service"],
+};
+
+// Half of these carry "Licensed & insured" or "LLC" so the license badge on the lead
+// cards has something real to read — that badge is part of the pitch.
+const ABOUT = {
+  landscaping: [
+    "Family-run lawn and landscape crew serving {city} since 2014. Licensed & insured.",
+    "Weekly mowing, mulch and spring cleanups across {city}. Free estimates.",
+    "{name} LLC — full-service landscaping, sod and retaining walls.",
+    "Small crew, big yards. Mowing, hedges and leaf removal around {city}.",
+  ],
+  roofing: [
+    "Roof repair, replacement and storm damage in {city}. Licensed & insured.",
+    "Shingle and metal roofing. Free inspections across the {city} area.",
+    "{name} LLC — residential roofing, gutters and skylights.",
+    "Third-generation roofers covering {city} and the surrounding counties.",
+  ],
+  "pressure washing": [
+    "Soft wash, driveways and decks in {city}. Licensed & insured.",
+    "House washing, gutter brightening and concrete cleaning. Same-week booking.",
+    "{name} LLC — commercial and residential pressure washing.",
+    "Driveways, patios and fences cleaned across greater {city}.",
+  ],
+};
+
+// 36 businesses: 12 per city, 8 of them in that city's headline trade.
+const DEMO_BUSINESSES = [
+  // Knoxville — landscaping ×8
+  ["Iron Oak Landscaping", "landscaping"],
+  ["Cedar Bluff Lawn & Landscape", "landscaping"],
+  ["Tennessee Valley Landscaping", "landscaping"],
+  ["Third Creek Lawn Care", "landscaping"],
+  ["Bearden Yard Works", "landscaping"],
+  ["Smoky Ridge Landscaping", "landscaping"],
+  ["Powell Green Lawn Care", "landscaping"],
+  ["Hardin Valley Landscape Co.", "landscaping"],
+  ["Summit Ridge Roofing", "roofing"],
+  ["Volunteer State Roofing", "roofing"],
+  ["Clear Creek Pressure Washing", "pressure washing"],
+  ["Riverbend Power Wash", "pressure washing"],
+  // Chattanooga — roofing ×8
+  ["Lookout Mountain Roofing", "roofing"],
+  ["Signal Point Roofing", "roofing"],
+  ["Scenic City Roof Works", "roofing"],
+  ["Ridgeline Roofing & Repair", "roofing"],
+  ["Chickamauga Roofing Co.", "roofing"],
+  ["Red Bank Roofing", "roofing"],
+  ["Tennessee River Roofing", "roofing"],
+  ["Hixson Roof Pros", "roofing"],
+  ["Moccasin Bend Landscaping", "landscaping"],
+  ["Southside Lawn & Landscape", "landscaping"],
+  ["Bluff View Pressure Washing", "pressure washing"],
+  ["Riverwalk Power Washing", "pressure washing"],
+  // Nashville — pressure washing ×8
+  ["Music City Pressure Washing", "pressure washing"],
+  ["Cumberland Power Wash", "pressure washing"],
+  ["Nolensville Pressure Washing", "pressure washing"],
+  ["Broadway Soft Wash", "pressure washing"],
+  ["Harpeth Valley Power Washing", "pressure washing"],
+  ["Germantown Pressure Pros", "pressure washing"],
+  ["Donelson Power Wash Co.", "pressure washing"],
+  ["Bellevue Soft Wash", "pressure washing"],
+  ["Twelve South Landscaping", "landscaping"],
+  ["Percy Warner Lawn Care", "landscaping"],
+  ["Stones River Roofing", "roofing"],
+  ["Antioch Ridge Roofing", "roofing"],
+];
+
+// The 12 leads already in the pipeline, by index into the list above: 4 New,
+// 4 Contacted, 2 Interested, 1 Won, 1 Lost, spread 4 per city.
+const SAVED_PLAN = [
+  { i: 0, stage: "Contacted", contacted: 3, savedAgo: 18, notes: "Quoted $2,400 — deciding this week" },
+  { i: 2, stage: "New", savedAgo: 16, notes: "Google listing only, no site at all" },
+  { i: 5, stage: "Interested", savedAgo: 14, notes: "Wants something up before the spring rush" },
+  { i: 8, stage: "Contacted", contacted: 6, savedAgo: 13, notes: "Voicemail ×2, try Thursday" },
+  { i: 12, stage: "Won", savedAgo: 11, notes: "Signed — 5 pages, build starts Monday" },
+  { i: 14, stage: "New", savedAgo: 10, notes: "Storm-damage ads on FB, still no website" },
+  { i: 17, stage: "Contacted", contacted: 2, savedAgo: 8, notes: "Owner asked for pricing by email" },
+  { i: 20, stage: "Lost", savedAgo: 7, notes: "Nephew is building them one" },
+  { i: 24, stage: "Contacted", contacted: 9, savedAgo: 6, notes: "Left a card at the shop — call back Friday" },
+  { i: 26, stage: "New", savedAgo: 4, notes: "2.1k on Instagram, link in bio goes nowhere" },
+  { i: 29, stage: "Interested", savedAgo: 3, notes: "Asked what a 5-page site runs" },
+  { i: 33, stage: "New", savedAgo: 1, notes: "Referred by the Iron Oak crew" },
+];
+
+const FOLLOWUPS = [
+  { title: "Call back Marcus @ Iron Oak", note: "Wants the $2,400 quote broken out by page", due: -2 },
+  { title: "Send Scenic City Roof Works the mockup", note: "Promised it on Tuesday's call", due: 0 },
+  { title: "Follow up with Music City Pressure Washing", note: "Left a card at the shop — ask for Dana", due: 3 },
+];
+
+// 14 metered searches summing to exactly $12.40 → 1,240 of the plan's 2,500 tokens,
+// which lands the sidebar meter at a comfortable-but-visible half full.
+const USAGE_COSTS = [1.2, 0.85, 0.6, 1.1, 0.75, 0.95, 1.35, 0.5, 0.8, 1.05, 0.65, 1.15, 0.7, 0.75];
+
+// The brain: the 36 leads (no website) plus 84 businesses that already had one, so the
+// "Remembered" statbox reads 120 · 36 no site · 84 had one — the ratio that sells the filter.
+const FILLER_COUNT = 84;
+const FILLER_SUFFIX = ["& Sons", "Services", "Pros", "Co.", "Group", "of Tennessee", "Contractors"];
+
+const DEMO_TABLES = ["leads", "checked_businesses", "searches", "app_state", "usage_log", "manual_followups"];
+
+// Mirrors cacheKey() in lib/pipeline.js so a seeded search really is a cache HIT.
+function seedCacheKey(niche, city) {
+  return [niche, city, DEMO_STATE, [...SEED_SOURCES].sort().join(","), SEED_LIMIT]
+    .map((x) => String(x ?? "").trim().toLowerCase())
+    .join("|");
+}
+
+function buildLeads() {
+  const out = [];
+  DEMO_CITIES.forEach((c, ci) => {
+    for (let k = 0; k < 12; k++) {
+      const i = ci * 12 + k;
+      const [name, trade] = DEMO_BUSINESSES[i];
+      const source = SOURCE_CYCLE[i % 3];
+      const category = CATEGORY[trade][k % 2];
+      const phone = `(${c.area}) 555-01${pad2(k + 1)}`;
+      const email = i % 5 < 3 ? `${slug(name).slice(0, 24)}@${i % 2 ? "yahoo.com" : "gmail.com"}` : ""; // ~60%
+      const about = ABOUT[trade][i % 4].replace("{city}", c.city).replace("{name}", name);
+      // ~2/3 have a dated last activity (3–200 days back); the rest read as "undated".
+      const lastActivity = i % 3 !== 2 ? daysAgo(3 + ((i * 17) % 198)).getTime() : null;
+      out.push({
+        i, trade, name, category, phone, email, source,
+        city: c.city,
+        externalId: `demo-${slug(name)}`,
+        lead_json: { name, category, city: c.city, state: DEMO_STATE, phone, email, source, about, lastActivity },
+      });
+    }
+  });
+  return out;
+}
+
+// The stats block a real search would have produced for this group of leads.
+function statsFor(group) {
+  const bySource = { google: 0, facebook: 0, instagram: 0 };
+  let activeSeen = 0;
+  for (const l of group) {
+    if (l.source === "google_maps") bySource.google++;
+    else if (l.source === "facebook") bySource.facebook++;
+    else bySource.instagram++;
+    if (l.lead_json.lastActivity) activeSeen++;
+  }
+  return {
+    scanned: 44, qualified: group.length, hasWebsite: 27, offNiche: 5,
+    activeSeen, staleSeen: 2, unknownSeen: 3, inactive: 0, crossSourceMerged: 2,
+    sinceLabel: null, fbDeepChecked: 0, googleDeepChecked: 0, dismissed: 0, bySource,
+  };
+}
+
+// ── reseed ───────────────────────────────────────────────────────────────────
+// Wipe every row the demo user owns and lay the whole workspace down again. The auth
+// user and its profile row survive (deleting the account would break impersonation);
+// the profile is re-stamped with the plan the demo is supposed to show.
+//
+// `step` is carried through so a failure comes back as {ok:false, step, error} and the
+// operator can see WHICH part broke from the browser, mid-meeting, without a log.
+async function reseedDemo(sb, userId) {
+  let step = "wipe";
+  try {
+    for (const table of DEMO_TABLES) {
+      const { error } = await sb.from(table).delete().eq("user_id", userId);
+      if (error) throw new Error(`${table}: ${error.message}`);
+    }
+
+    // Leads first — every other table refers to the ids Postgres hands back.
+    step = "leads";
+    const leads = buildLeads();
+    const savedBy = new Map(SAVED_PLAN.map((p) => [p.i, p]));
+    const leadRows = leads.map((l) => {
+      const p = savedBy.get(l.i);
+      return {
+        user_id: userId,
+        source: l.source,
+        external_id: l.externalId,
+        name: l.name,
+        category: l.category,
+        city: l.city,
+        state: DEMO_STATE,
+        phone: l.phone,
+        email: l.email,
+        website: "",
+        lead_json: l.lead_json,
+        dedup_key: store.dedupKeyFor({ phone: l.phone, name: l.name, city: l.city }),
+        status: "new",
+        dismissed: false,
+        created_at: isoDaysAgo(2 + (l.i % 21)),
+        saved: !!p,
+        saved_at: p ? isoDaysAgo(p.savedAgo) : null,
+        crm_stage: p ? p.stage : "New",
+        notes: p ? p.notes : "",
+        contacted_on: p && p.contacted ? isoDaysAgo(p.contacted) : null,
+      };
+    });
+    const inserted = await sb.from("leads").insert(leadRows).select("id,external_id");
+    if (inserted.error) throw new Error(inserted.error.message);
+    const idByExt = new Map((inserted.data || []).map((r) => [r.external_id, r.id]));
+    if (idByExt.size !== leadRows.length) {
+      throw new Error(`inserted ${idByExt.size} of ${leadRows.length} leads`);
+    }
+
+    // Cached searches — one per city, keyed exactly as the pipeline would key them,
+    // so the operator can replay any of the three chips for free.
+    step = "searches";
+    const searchRows = [];
+    let lastSearch = null;
+    DEMO_CITIES.forEach((c, ci) => {
+      const group = leads.filter((l) => l.city === c.city && l.trade === c.niche);
+      const ids = group.map((l) => idByExt.get(l.externalId)).filter((n) => n != null);
+      const stats = statsFor(group);
+      stats.qualified = ids.length;
+      searchRows.push({
+        user_id: userId,
+        key: seedCacheKey(c.niche, c.city),
+        data: { ids, stats },
+        updated_at: isoDaysAgo(1 + ci * 2),
+      });
+      if (ci === 0) {
+        lastSearch = {
+          niche: c.niche, city: c.city, state: DEMO_STATE,
+          sources: SEED_SOURCES.slice(), limit: SEED_LIMIT, ids, stats, ts: Date.now(),
+        };
+      }
+    });
+    const searchIns = await sb.from("searches").insert(searchRows);
+    if (searchIns.error) throw new Error(searchIns.error.message);
+
+    // The Search page restores this the moment the operator lands on it — results
+    // already on screen, before anyone has typed anything.
+    step = "app_state";
+    const stateIns = await sb.from("app_state").insert({ user_id: userId, key: "last_search", value: lastSearch });
+    if (stateIns.error) throw new Error(stateIns.error.message);
+
+    step = "usage_log";
+    const monthStart = Date.UTC(new Date().getUTCFullYear(), new Date().getUTCMonth(), 1);
+    const span = Math.max(1, Date.now() - monthStart);
+    const usageRows = USAGE_COSTS.map((cost, n) => ({
+      user_id: userId,
+      kind: "search",
+      cost,
+      at: new Date(monthStart + Math.round((span * (n + 0.5)) / USAGE_COSTS.length)).toISOString(),
+    }));
+    const usageIns = await sb.from("usage_log").insert(usageRows);
+    if (usageIns.error) throw new Error(usageIns.error.message);
+
+    step = "manual_followups";
+    const fuIns = await sb.from("manual_followups").insert(
+      FOLLOWUPS.map((f) => ({
+        user_id: userId, title: f.title, note: f.note, due: dueDate(f.due), done: false,
+        created_at: isoDaysAgo(5),
+      }))
+    );
+    if (fuIns.error) throw new Error(fuIns.error.message);
+
+    step = "checked_businesses";
+    const checkedRows = leads.map((l) => ({
+      user_id: userId,
+      source: l.source,
+      external_id: l.externalId,
+      name: l.name,
+      has_website: false,
+      niche: l.trade,
+      city: l.city,
+      state: DEMO_STATE,
+      checked_at: isoDaysAgo(1 + (l.i % 20)),
+    }));
+    for (let n = 0; n < FILLER_COUNT; n++) {
+      const base = leads[n % leads.length];
+      checkedRows.push({
+        user_id: userId,
+        source: SOURCE_CYCLE[(n + 1) % 3],
+        external_id: `demo-checked-${n}`,
+        name: `${base.name} ${FILLER_SUFFIX[n % FILLER_SUFFIX.length]}`,
+        has_website: true,
+        niche: base.trade,
+        city: base.city,
+        state: DEMO_STATE,
+        checked_at: isoDaysAgo(1 + (n % 26)),
+      });
+    }
+    const checkedIns = await sb.from("checked_businesses").insert(checkedRows);
+    if (checkedIns.error) throw new Error(checkedIns.error.message);
+
+    step = "profile";
+    const profIns = await sb
+      .from("profiles")
+      .update({ tier: "starter", monthly_token_allotment: 2500 })
+      .eq("id", userId)
+      .select("id");
+    if (profIns.error) throw new Error(profIns.error.message);
+    if (!profIns.data || !profIns.data.length) throw new Error("no profile row for the demo account");
+
+    const usd = USAGE_COSTS.reduce((a, c) => a + c, 0);
+    return {
+      ok: true,
+      seeded: {
+        leads: leadRows.length,
+        saved: SAVED_PLAN.length,
+        followups: FOLLOWUPS.length,
+        checked: checkedRows.length,
+        searches: searchRows.length,
+        tokensUsed: Math.round(usd * tokensPerUsd()),
+      },
+    };
+  } catch (e) {
+    return { ok: false, step, error: e && e.message ? e.message : String(e) };
+  }
+}
+
+// ── the demo account ─────────────────────────────────────────────────────────
+
+// Find the auth user by email even when its profile row is missing (a half-created
+// account from an interrupted first run).
+async function findAuthUserId(sb, email) {
+  for (let page = 1; page <= 5; page++) {
+    const { data, error } = await sb.auth.admin.listUsers({ page, perPage: 200 });
+    if (error) throw new Error(error.message);
+    const users = (data && data.users) || [];
+    const hit = users.find((u) => String(u.email || "").toLowerCase() === email);
+    if (hit) return String(hit.id);
+    if (users.length < 200) break;
+  }
+  return null;
+}
+
+// The demo account, created on first use. Its password is random and immediately
+// thrown away: the account is only ever reached by admin impersonation, never by
+// signing in, so nobody (including us) holds a credential for it.
+async function ensureDemoAccount(sb) {
+  const email = demoEmail();
+
+  const known = await demoUserId();
+  if (known) {
+    const check = await sb.from("profiles").select("id").eq("id", known).maybeSingle();
+    if (check.data && check.data.id) return known;
+    forgetDemoUserId(); // deleted from the Supabase dashboard → build it again
+  }
+
+  let id = null;
+  const { data, error } = await sb.auth.admin.createUser({
+    email,
+    password: crypto.randomBytes(24).toString("base64url").slice(0, 32),
+    email_confirm: true,
+  });
+  if (error) {
+    id = await findAuthUserId(sb, email); // already there → adopt it
+    if (!id) throw new Error(error.message || "Could not create the demo account.");
+  } else {
+    id = String((data && data.user && data.user.id) || "");
+    if (!id) throw new Error("Supabase created the demo account but returned no id.");
+  }
+
+  // The signup trigger writes the profile row; give it a beat, then verify. If the
+  // trigger isn't installed we write the row ourselves — impersonation resolves the
+  // demo account BY its profile row, so a missing one would silently disable the
+  // whole feature.
+  let hasProfile = false;
+  for (let n = 0; n < 10 && !hasProfile; n++) {
+    const r = await sb.from("profiles").select("id").eq("id", id).maybeSingle();
+    if (r.data && r.data.id) hasProfile = true;
+    else await sleep(300);
+  }
+  if (!hasProfile) {
+    const up = await sb
+      .from("profiles")
+      .upsert({ id, email, tier: "starter", monthly_token_allotment: 2500 }, { onConflict: "id" });
+    if (up.error) throw new Error(`profile: ${up.error.message}`);
+  }
+
+  rememberDemoUserId(id);
+  return id;
+}
+
+// ── workspace routes ─────────────────────────────────────────────────────────
+
+const SQLITE_NOTE = "The demo workspace needs Supabase mode.";
+
+// Enter: make sure the account and its data exist, then set the cookie and land on
+// the Search page — which restores the seeded search, so the room sees results
+// before the operator has typed a word.
+demoRouter.post("/demo/enter", requireUser, requireAdmin, async (req, res) => {
+  if (dataProvider() !== "supabase") return res.redirect(303, "/demo?err=" + encodeURIComponent(SQLITE_NOTE));
+  try {
+    const sb = await getSupabase();
+    const userId = await ensureDemoAccount(sb);
+
+    const { count, error } = await sb
+      .from("leads")
+      .select("*", { count: "exact", head: true })
+      .eq("user_id", userId);
+    if (error) throw new Error(`leads count: ${error.message}`);
+    if (!count) {
+      const seeded = await reseedDemo(sb, userId);
+      if (!seeded.ok) throw new Error(`${seeded.step}: ${seeded.error}`);
+    }
+
+    writeDemoCookie(req, res);
+    return res.redirect(303, "/");
+  } catch (e) {
+    const msg = e && e.message ? e.message : "Could not start the demo workspace.";
+    return res.redirect(303, "/demo?err=" + encodeURIComponent(msg));
+  }
+});
+
+// Exit: drop the cookie. Works in every mode — clearing a cookie that isn't there
+// is a no-op, so this can never leave the operator stuck in the demo.
+demoRouter.post("/demo/exit", requireUser, requireAdmin, (req, res) => {
+  clearDemoCookie(req, res);
+  return res.redirect(303, "/demo");
+});
+
+demoRouter.post("/demo/api/reset", requireUser, requireAdmin, async (req, res) => {
+  if (dataProvider() !== "supabase") {
+    return res.status(400).json({ ok: false, step: "mode", error: SQLITE_NOTE });
+  }
+  try {
+    const sb = await getSupabase();
+    const userId = await ensureDemoAccount(sb);
+    const result = await reseedDemo(sb, userId);
+    return res.status(result.ok ? 200 : 500).json(result);
+  } catch (e) {
+    return res.status(500).json({
+      ok: false,
+      step: "account",
+      error: e && e.message ? e.message : "Could not prepare the demo account.",
+    });
+  }
+});
+
 // ── page ─────────────────────────────────────────────────────────────────────
+
+// The "Client demo" panel under the saved-demos strip: enter, reset, or (once you're
+// in) get back out. Server-rendered from req.isDemo so it can never disagree with the
+// cookie the browser is actually carrying.
+function workspacePanel(req) {
+  const raw = String((req.query && req.query.err) || "").slice(0, 300);
+  const err = raw ? `<div class="dwork-err">⚠️ ${escHtml(raw)}</div>` : "";
+
+  if (dataProvider() !== "supabase") {
+    return `<div class="dwork">
+  <div class="dwork-ttl">Client demo</div>
+  <h2>The demo workspace needs Supabase mode</h2>
+  <p>This app is running on local SQLite, which is single-user — there is no second account to present as, so there is nothing to stage or reset.</p>
+  <div class="dwork-note">Set <code>DATA_PROVIDER=supabase</code> in <code>.env</code> (with the project URL and service-role key) and restart to use the demo workspace.</div>
+  ${err}
+</div>`;
+  }
+
+  if (req.isDemo) {
+    return `<div class="dwork">
+  <div class="dwork-ttl">Client demo</div>
+  <h2>You're presenting in the demo workspace</h2>
+  <p>Every page you open is the real product, reading the demo account's staged data — nothing you click touches your own leads. Exit when the meeting ends, then reset from this panel before the next one.</p>
+  <div class="dwork-act">
+    <form method="post" action="/demo/exit"><button class="dwork-go" type="submit">Exit demo</button></form>
+  </div>
+  ${err}
+</div>`;
+  }
+
+  return `<div class="dwork">
+  <div class="dwork-ttl">Client demo</div>
+  <h2>Enter the demo workspace</h2>
+  <p>Opens the real app as a dedicated demo account: 36 leads across Knoxville, Chattanooga and Nashville, a 12-lead pipeline mid-flight, follow-ups coming due, and half a plan of tokens spent. Nothing in there touches your own account — and Reset puts it back exactly as it started.</p>
+  <div class="dwork-act">
+    <form method="post" action="/demo/enter"><button class="dwork-go" type="submit">Enter demo workspace →</button></form>
+    <button class="dwork-reset" type="button" onclick="resetDemoData(this)">Reset demo data</button>
+    <span class="dwork-flag" id="dwFlag"></span>
+  </div>
+  ${err}
+</div>`;
+}
 
 function renderDemoPage(req) {
   return `<!doctype html><html lang="en"><head>${THEME_INIT_SCRIPT}<meta charset="utf-8">
@@ -157,6 +690,28 @@ function renderDemoPage(req) {
   .dact{margin-top:11px;display:inline-flex;align-items:center;gap:6px;font-size:13px;font-weight:700;
         padding:4px 11px;border-radius:7px;background:var(--accent-weak);color:var(--accent-ink)}
   .dot{color:var(--faint)}
+  .dwork{margin-top:26px;background:var(--panel);border:1px solid var(--border);border-radius:16px;padding:22px 24px}
+  .dwork-ttl{font-size:11px;text-transform:uppercase;letter-spacing:.7px;font-weight:700;color:var(--muted)}
+  .dwork h2{font-size:20px;font-weight:800;letter-spacing:-.2px;color:var(--text);margin:10px 0 7px}
+  .dwork p{font-size:14px;line-height:1.6;color:var(--muted);max-width:660px}
+  .dwork-act{display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-top:18px}
+  .dwork form{margin:0}
+  .dwork-go{font-family:inherit;font-size:16px;font-weight:800;padding:13px 24px;border-radius:11px;border:none;
+            background:var(--accent);color:var(--on-accent);cursor:pointer;white-space:nowrap}
+  .dwork-go:hover{filter:brightness(.96)}
+  .dwork-reset{font-family:inherit;font-size:14px;font-weight:600;padding:12px 18px;border-radius:11px;
+               background:transparent;border:1px solid var(--border-strong);color:var(--muted);cursor:pointer}
+  .dwork-reset:hover{color:var(--text)}
+  .dwork-reset:disabled{opacity:.55;cursor:wait}
+  .dwork-flag{display:inline-flex;align-items:center;gap:8px;font-size:13px;font-weight:600;color:var(--muted)}
+  .dwork-flag.ok{color:var(--accent-ink)}
+  .dwork-flag.err{color:var(--danger)}
+  .dwork-spin{display:inline-block;width:13px;height:13px;border:2px solid var(--accent);border-top-color:transparent;
+              border-radius:50%;animation:dspin .7s linear infinite}
+  .dwork-err{margin-top:14px;font-size:13px;line-height:1.55;color:var(--danger)}
+  .dwork-note{margin-top:16px;font-size:13px;line-height:1.6;color:var(--muted);background:var(--surface2);
+              border:1px solid var(--border);border-radius:10px;padding:14px 16px}
+  .dwork-note code{background:var(--panel);border:1px solid var(--border);border-radius:5px;padding:1px 6px;font-size:12px;color:var(--text)}
   @media(max-width:820px){
     .dform{grid-template-columns:1fr 1fr;gap:12px}
     .dgo{grid-column:1/-1;width:100%}
@@ -165,7 +720,7 @@ function renderDemoPage(req) {
     .dstat .n{font-size:44px}
   }
 ${SHARED_CSS}</style></head><body>
-${sidebar("demo", { isAdmin: true })}
+${sidebar("demo", { isAdmin: true, demo: !!req.isDemo })}
 <div class="demo">
   <div class="dhead">
     <h1>Which businesses near you have no website?</h1>
@@ -184,6 +739,8 @@ ${sidebar("demo", { isAdmin: true })}
     <div class="dsavedlbl">Saved demos — instant, no credits</div>
     <div class="dchips" id="savedChips"></div>
   </div>
+
+${workspacePanel(req)}
 
   <div class="dmsg" id="msg" style="display:none"></div>
   <div class="dstages" id="stages" style="display:none"></div>
@@ -416,6 +973,34 @@ async function loadSaved(){
     }
     updateEstimate();
   }catch(e){}
+}
+
+// ── demo workspace ─────────────────────────────────────────────────────────
+// Reset reports what it actually wrote, and on failure names the step that broke —
+// enough to diagnose it from the projector without opening a log.
+async function resetDemoData(btn){
+  var flag = $('dwFlag');
+  btn.disabled = true;
+  flag.className = 'dwork-flag';
+  flag.innerHTML = '<span class="dwork-spin"></span> Reseeding\\u2026';
+  try{
+    var resp = await fetch('/demo/api/reset',{method:'POST',headers:{'Accept':'application/json'}});
+    var j = await resp.json().catch(function(){return null});
+    if(j && j.ok){
+      var s = j.seeded || {};
+      flag.className = 'dwork-flag ok';
+      flag.textContent = '\\u2713 ' + nfmt(s.leads) + ' leads \\u00b7 ' + nfmt(s.saved) + ' tracked \\u00b7 ' +
+        nfmt(s.followups) + ' follow-ups \\u00b7 ' + nfmt(s.checked) + ' remembered \\u00b7 ' +
+        nfmt(s.tokensUsed) + ' tokens used';
+    }else{
+      flag.className = 'dwork-flag err';
+      flag.textContent = '\\u2715 ' + ((j && j.step) ? j.step + ': ' : '') + ((j && j.error) || 'Reset failed');
+    }
+  }catch(e){
+    flag.className = 'dwork-flag err';
+    flag.textContent = '\\u2715 Reset failed \\u2014 the server did not answer.';
+  }
+  btn.disabled = false;
 }
 
 ['city','state','niche'].forEach(function(id){

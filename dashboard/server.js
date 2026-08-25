@@ -377,7 +377,7 @@ async function renderSearchPage(req) {
   .spinner{display:inline-block;width:14px;height:14px;border:2px solid var(--gold);border-top-color:transparent;border-radius:50%;animation:spin .7s linear infinite;vertical-align:-2px;margin-right:6px}
   @keyframes spin{to{transform:rotate(360deg)}}
 ${SHARED_CSS}</style></head><body>
-${sidebar("search", { isAdmin: req.isAdmin })}<div class="pagehead"><div class="titlewrap"><h1>Prospector</h1><div class="pagesub">Find local businesses that don't have a website yet</div></div><div class="spacer"></div>
+${sidebar("search", { isAdmin: req.isAdmin, demo: req.isDemo })}<div class="pagehead"><div class="titlewrap"><h1>Prospector</h1><div class="pagesub">Find local businesses that don't have a website yet</div></div><div class="spacer"></div>
   <div class="statbox">
     <div class="cell"><span class="k">🧠 Remembered</span><span class="v" id="sbMem">—</span><span class="s2" id="sbMemSub"></span></div>
     <div class="sep"></div>
@@ -796,7 +796,7 @@ async function renderLeadsPage(req, view = "tracked") {
   .fu-del{color:var(--muted)}.fu-del:hover{color:#e05b5b;border-color:#e05b5b}
   .sechead{font-size:13px;text-transform:uppercase;letter-spacing:.5px;color:var(--muted);margin:8px 0 10px;font-weight:700}
 ${SHARED_CSS}</style></head><body>
-${sidebar("leads", { isAdmin: req.isAdmin })}<div class="pagehead"><div class="titlewrap"><h1>Leads</h1><div class="pagesub">Everything the machine found — and the ones you're working</div></div><div class="spacer"></div></div>
+${sidebar("leads", { isAdmin: req.isAdmin, demo: req.isDemo })}<div class="pagehead"><div class="titlewrap"><h1>Leads</h1><div class="pagesub">Everything the machine found — and the ones you're working</div></div><div class="spacer"></div></div>
 <div class="tabs">
   <a class="tab ${tab === "tracked" ? "active" : ""}" href="/leads">Tracked <span class="pill">${trackedCount}</span></a>
   <a class="tab ${tab === "found" ? "active" : ""}" href="/leads?view=found">Found <span class="pill">${foundCount}</span></a>

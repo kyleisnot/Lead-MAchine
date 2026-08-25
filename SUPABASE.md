@@ -65,3 +65,33 @@ users get the same trial profile as email signups (created by the DB trigger).
 receives the session in the URL *fragment* and POSTs it to `/auth/session`. That route re-verifies the
 access token with `auth.getUser()` before writing the usual `lm_session` httpOnly cookie — the tokens
 are never trusted just because they were posted.
+
+## Demo workspace
+
+For client meetings, `/demo` has a **Client demo** panel that drops the operator into the *real* app
+signed in as a dedicated, fully staged account — and puts it back afterwards. Supabase mode only
+(SQLite is single-user, so there is no second account to present as).
+
+| Route | Does |
+|---|---|
+| `POST /demo/enter` | Creates the demo account if it's missing, seeds it if it's empty, sets the `lm_demo` cookie, redirects to `/` |
+| `POST /demo/exit` | Clears the cookie |
+| `POST /demo/api/reset` | Deletes every demo row and lays the seed down again → `{ok, seeded:{…}}` (or `{ok:false, step, error}`) |
+
+- **The account.** `DEMO_EMAIL` (default `demo-workspace@leadmachine.internal`), created server-side with
+  a random 32-char password that is thrown away — it is only ever reached by impersonation, never by
+  signing in. Its profile is set to `starter` / 2,500 tokens. Reset never deletes the auth user or its
+  profile row, only its data.
+- **Impersonation.** `lm_demo=1` is a marker cookie with no authority of its own: `requireUser` swaps
+  `req.userId` to the demo account **only** for an already-authenticated admin (`ADMIN_EMAILS`), and only
+  once that account exists. Non-admins holding the cookie are unaffected, `req.realUserId` keeps the real
+  admin's id, and `req.isDemo` puts an amber "Demo workspace" banner with an Exit button on every page.
+- **The seed** (deterministic; only dates are relative): 36 no-website leads across Knoxville /
+  Chattanooga / Nashville TN in landscaping, roofing and pressure washing · 12 saved into the CRM across
+  all five stages · 3 manual follow-ups (one overdue, one due today, one in 3 days) · 14 metered searches
+  totalling $12.40 (1,240 of 2,500 tokens) · 3 cached searches keyed exactly as `lib/pipeline.js` keys
+  them, so the saved-demo chips replay for free · a `last_search` app_state row, so the Search page shows
+  restored results the instant the operator lands · 120 remembered businesses (36 no site, 84 with one).
+- **Adding to it.** The seed lives in `dashboard/demo.js` (`DEMO_BUSINESSES`, `SAVED_PLAN`, `FOLLOWUPS`,
+  `USAGE_COSTS`). Keep it free of `Math.random`/`Date.now` for identity — same data every reset is the
+  point.

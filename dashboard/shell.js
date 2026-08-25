@@ -32,9 +32,18 @@ function navIcon(key) {
   return s + "</svg>";
 }
 
+// The demo-workspace banner: every page the operator shows a prospect says, quietly,
+// that this is the staged account — so nobody (least of all the operator) mistakes it
+// for real client data. Rendered first inside <main>, above the page's own header.
+const DEMO_BANNER = `<div class="demobar" role="status">
+  <span class="demobar-txt">🎬 Demo workspace — staged data, resets after the meeting</span>
+  <form method="post" action="/demo/exit"><button class="demobar-btn" type="submit">Exit demo</button></form>
+</div>`;
+
 // The left rail + opening <main>. Pages close it with `</main></div>` (in SHELL footer).
 // opts.isAdmin adds the Admin link (only render it for admin users).
-export function sidebar(active, { isAdmin = false } = {}) {
+// opts.demo adds the demo-workspace banner (set from req.isDemo).
+export function sidebar(active, { isAdmin = false, demo = false } = {}) {
   const link = (href, key, label) =>
     `<a class="navlink${active === key ? " active" : ""}" href="${href}"><span class="ic">${navIcon(key)}</span><span class="lbl">${label}</span></a>`;
   return `<div class="app"><nav class="side">
@@ -47,7 +56,7 @@ export function sidebar(active, { isAdmin = false } = {}) {
   <div class="foot">
     <button class="themebtn" id="themeBtn" onclick="lmToggleTheme()" aria-label="Toggle light or dark mode"><span class="ti">&#9788;</span><span class="tl">Light mode</span></button>
   </div>
-</nav><main class="main">`;
+</nav><main class="main">${demo ? DEMO_BANNER : ""}`;
 }
 
 // All shared styling (both themes + layout + components). Appended to each page's
@@ -163,6 +172,11 @@ input,select{padding:11px 13px}
 .ex-item p{color:var(--muted);font-size:13px;margin-top:4px;line-height:1.55}
 .ex-foot{color:var(--muted);font-size:13px;margin-top:4px;padding-top:12px;border-top:1px solid var(--border);line-height:1.55}
 .ex-foot b,.ex-item p b{color:var(--accent-ink)}
+.demobar{display:flex;align-items:center;gap:12px;flex-wrap:wrap;background:var(--warn-weak);color:var(--warn);border:1px solid var(--warn-weak);border-radius:10px;padding:8px 8px 8px 14px;margin-bottom:16px;font-size:13px;font-weight:600;line-height:1.4}
+.demobar-txt{flex:1;min-width:0}
+.demobar form{margin:0;display:flex}
+.demobar-btn{font-family:inherit;font-size:12px;font-weight:700;color:var(--warn);background:transparent;border:1px solid var(--warn);border-radius:7px;padding:5px 12px;cursor:pointer;white-space:nowrap}
+.demobar-btn:hover{background:var(--warn);color:var(--panel)}
 @media(max-width:860px){.side{width:60px;padding:14px 8px}.side .brand{display:none}.navlink .lbl,.themebtn .tl{display:none}.themebtn{justify-content:center}.main{padding:18px 16px}}
 @media(max-width:700px){.row{grid-template-columns:1fr 1fr}.statbox{width:100%}}
 `;

@@ -154,7 +154,7 @@ async function loadOverview() {
 
 // ── render ───────────────────────────────────────────────────────────────────
 
-function page(body, extraScript = "") {
+function page(body, extraScript = "", demo = false) {
   return `<!doctype html><html><head>${THEME_INIT_SCRIPT}<meta charset="utf-8"><title>Lead Machine — Admin</title>
 <style>
   *{box-sizing:border-box;margin:0;padding:0}
@@ -189,7 +189,7 @@ function page(body, extraScript = "") {
   .empty{color:var(--muted);font-size:15px;padding:26px 4px}
   @media(max-width:900px){.stats{grid-template-columns:repeat(2,1fr)}}
 ${SHARED_CSS}</style></head><body>
-${sidebar("admin", { isAdmin: true })}<div class="pagehead"><div class="titlewrap"><h1>Admin</h1><div class="pagesub">Operator overview — every user, their usage this month, and their plan</div></div><div class="spacer"></div></div>
+${sidebar("admin", { isAdmin: true, demo })}<div class="pagehead"><div class="titlewrap"><h1>Admin</h1><div class="pagesub">Operator overview — every user, their usage this month, and their plan</div></div><div class="spacer"></div></div>
 ${body}
 ${extraScript}${SHELL_TAIL_SCRIPT}</main></div></body></html>`;
 }
@@ -228,7 +228,7 @@ function userRow(u) {
 </tr>`;
 }
 
-function renderOverview(d, spend) {
+function renderOverview(d, spend, demo = false) {
   const cards = `<div class="stats">
 ${statCard(num(d.totalUsers), "Users")}
 ${statCard(num(d.totalLeads), "Leads, all users")}
@@ -271,7 +271,7 @@ async function lmSaveUser(id,btn){
 }
 </script>`;
 
-  return page(cards + table, script);
+  return page(cards + table, script, demo);
 }
 
 // ── routes ───────────────────────────────────────────────────────────────────
@@ -294,7 +294,7 @@ adminRouter.get("/admin", requireUser, requireAdmin, async (req, res) => {
       loadOverview(),
       apifySpend().catch(() => null),
     ]);
-    res.send(renderOverview(data, spend));
+    res.send(renderOverview(data, spend, !!req.isDemo));
   } catch (e) {
     res
       .status(500)
