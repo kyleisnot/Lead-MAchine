@@ -18,7 +18,7 @@
 //   silently `refreshSession({refresh_token})` and re-write the cookie.
 //   Cookies are parsed/serialized by hand — no extra dependency.
 import express from "express";
-import { dataProvider, getSupabase } from "../lib/supabase.js";
+import { dataProvider, getSupabase, supabaseUrl } from "../lib/supabase.js";
 import { THEME_INIT_SCRIPT, SHARED_CSS } from "./shell.js";
 
 // ── config ──────────────────────────────────────────────────────────────────
@@ -29,7 +29,11 @@ const TOKEN_CACHE_MAX = 1000;
 const MIN_PASSWORD = 8;
 
 // Paths that must stay reachable without a session.
-const PUBLIC_PATHS = new Set(["/login", "/signup", "/logout", "/logo.png", "/mark.png"]);
+// /auth/* is the Google OAuth handoff: the browser hits them while still signed out.
+const PUBLIC_PATHS = new Set([
+  "/login", "/signup", "/logout", "/logo.png", "/mark.png",
+  "/auth/google", "/auth/callback", "/auth/session",
+]);
 function isPublicPath(pathname) {
   return PUBLIC_PATHS.has(pathname) || pathname.startsWith("/favicon");
 }
@@ -75,6 +79,13 @@ function isSecureRequest(req) {
   if (req?.secure) return true;
   const proto = String(req?.headers?.["x-forwarded-proto"] || "").split(",")[0].trim();
   return proto === "https";
+}
+
+// Public origin of THIS request ("https://host"), so the OAuth redirect comes back to
+// whichever host the user is actually on (localhost in dev, the Vercel domain in prod).
+function originOf(req) {
+  const host = String(req?.headers?.host || "").split(",")[0].trim();
+  return `${isSecureRequest(req) ? "https" : "http"}://${host}`;
 }
 
 function appendCookie(res, value) {
@@ -213,7 +224,27 @@ const AUTH_CSS = `
 .authcard .alt{font-size:13px;color:var(--muted);text-align:center;margin:20px 0 0}
 .authcard .alt a{color:var(--accent);font-weight:600;text-decoration:none}
 .authcard .alt a:hover{text-decoration:underline}
+/* "Continue with Google" — a surface-coloured button so the 4-colour mark reads in
+   both themes; the divider below it separates it from the email form. */
+.authcard .gbtn{display:flex;align-items:center;justify-content:center;gap:10px;width:100%;box-sizing:border-box;
+  border:1px solid var(--border-strong);border-radius:9px;background:var(--surface);color:var(--text);
+  padding:11px 13px;font-size:14px;font-weight:600;font-family:inherit;text-decoration:none;cursor:pointer}
+.authcard .gbtn:hover{background:var(--surface2)}
+.authcard .gbtn svg{width:18px;height:18px;flex:none;display:block}
+.authcard .orsep{display:flex;align-items:center;gap:12px;margin:18px 0}
+.authcard .orsep::before,.authcard .orsep::after{content:"";flex:1;height:1px;background:var(--border)}
+.authcard .orsep span{font-size:11px;font-weight:600;letter-spacing:.6px;text-transform:uppercase;color:var(--faint)}
 `;
+
+// Google's 4-colour "G", inline so there is no external request and no build step.
+const GOOGLE_G_SVG = `<svg viewBox="0 0 48 48" aria-hidden="true" focusable="false">` +
+  `<path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/>` +
+  `<path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/>` +
+  `<path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.28-3.14.76-4.59l-7.97-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/>` +
+  `<path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.97 6.19C6.51 42.62 14.62 48 24 48z"/></svg>`;
+
+const GOOGLE_BLOCK = `  <a class="gbtn" href="/auth/google">${GOOGLE_G_SVG}<span>Continue with Google</span></a>
+  <div class="orsep"><span>or</span></div>`;
 
 // One template for both pages — `mode` is "login" or "signup".
 function authPage({ mode, email = "", error = "" }) {
@@ -240,6 +271,7 @@ ${THEME_INIT_SCRIPT}
   <h1>${title}</h1>
   <p class="sub">${sub}</p>
   ${error ? `<p class="err" role="alert">${esc(error)}</p>` : ""}
+${GOOGLE_BLOCK}
   <form method="post" action="${action}" novalidate>
     <div class="field">
       <label for="email">Email</label>
@@ -372,6 +404,125 @@ authRouter.post("/signup", formBody, async (req, res) => {
     return res.redirect("/");
   } catch {
     return fail(500, ERR_GENERIC);
+  }
+});
+
+// ── Google sign-in (hosted Supabase OAuth, implicit flow) ───────────────────
+// The three legs:
+//   GET  /auth/google   → bounce to Supabase's authorize endpoint
+//   GET  /auth/callback → Supabase lands here with the session in the URL *fragment*
+//                         (never sent to a server), so a tiny inline script reads it…
+//   POST /auth/session  → …and hands it to us same-origin. We re-verify the access
+//                         token with getUser() and only then write the httpOnly cookie.
+// New Google users get their trial profile from the same DB trigger as email signups.
+
+const ERR_GOOGLE = "Google sign-in did not complete. Try again.";
+
+// The handoff page. No external scripts; error text is set with textContent, never HTML.
+function callbackPage() {
+  return `<!doctype html><html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Signing you in · Lead Machine</title>
+<link rel="icon" href="/mark.png">
+${THEME_INIT_SCRIPT}
+<style>${SHARED_CSS}${AUTH_CSS}</style>
+</head><body>
+<div class="authwrap"><div class="authcard">
+  <div class="brand"><img src="/logo.png" alt="Avanzta"></div>
+  <h1 id="hd">Signing you in…</h1>
+  <p class="sub" id="sb">Finishing your Google sign-in. This only takes a moment.</p>
+  <p class="err" role="alert" id="er" hidden></p>
+  <p class="alt" id="bk" hidden><a href="/login">Back to sign in</a></p>
+  <noscript><p class="err">JavaScript is required to finish signing in.</p>
+  <p class="alt"><a href="/login">Back to sign in</a></p></noscript>
+</div></div>
+<script>
+(function(){
+  var FALLBACK = ${JSON.stringify(ERR_GOOGLE)};
+  function fail(msg){
+    var hd=document.getElementById('hd'), sb=document.getElementById('sb'),
+        er=document.getElementById('er'), bk=document.getElementById('bk');
+    hd.textContent='Could not sign you in';
+    sb.hidden=true;
+    er.textContent=(msg&&String(msg).trim())?String(msg).trim():FALLBACK;
+    er.hidden=false; bk.hidden=false;
+  }
+  try{
+    var hp=new URLSearchParams((location.hash||'').replace(/^#/,''));
+    var qp=new URLSearchParams(location.search||'');
+    var err=qp.get('error_description')||qp.get('error')||hp.get('error_description')||hp.get('error');
+    if(err){ fail(err); return; }
+    var at=hp.get('access_token')||'';
+    var rt=hp.get('refresh_token')||'';
+    if(!at){ fail(''); return; }
+    fetch('/auth/session',{
+      method:'POST', credentials:'same-origin',
+      headers:{'Content-Type':'application/json','Accept':'application/json'},
+      body:JSON.stringify({access_token:at,refresh_token:rt})
+    }).then(function(r){
+        return r.json().catch(function(){ return {}; })
+                .then(function(j){ return {status:r.status, body:j}; });
+      })
+      .then(function(x){
+        if(x.body&&x.body.ok){
+          try{ history.replaceState(null,'',location.pathname); }catch(e){}
+          location.replace('/');
+          return;
+        }
+        // A 401 only means the token didn't check out — the API's terse
+        // "Sign in required" would read oddly here, so use our own wording.
+        // Anything else (e.g. a 503 config problem) is worth showing verbatim.
+        fail(x.status===401 ? '' : (x.body&&x.body.error));
+      }).catch(function(){ fail(''); });
+  }catch(e){ fail(''); }
+})();
+</script>
+</body></html>`;
+}
+
+// GET /auth/google — hand off to Supabase's hosted Google flow.
+authRouter.get("/auth/google", (req, res) => {
+  if (!supabaseMode()) return res.redirect("/");
+  const base = String(supabaseUrl() || "").replace(/\/+$/, "");
+  if (!base) return sendPage(res, 503, { mode: "login", error: ERR_UNAVAILABLE });
+  const redirectTo = `${originOf(req)}/auth/callback`;
+  return res.redirect(
+    302,
+    `${base}/auth/v1/authorize?provider=google&redirect_to=${encodeURIComponent(redirectTo)}`
+  );
+});
+
+// GET /auth/callback — the fragment lands in the browser; the page above forwards it.
+authRouter.get("/auth/callback", (req, res) => {
+  if (!supabaseMode()) return res.redirect("/");
+  res.status(200).type("html").send(callbackPage());
+});
+
+// POST /auth/session — never trust the posted tokens: verify server-side first.
+authRouter.post("/auth/session", express.json(), async (req, res) => {
+  if (!supabaseMode()) return res.redirect("/");
+  const deny = () => res.status(401).json({ ok: false, error: "Sign in required" });
+
+  const access_token = String(req.body?.access_token ?? "").trim();
+  const refresh_token = String(req.body?.refresh_token ?? "").trim();
+  if (!access_token) return deny();
+
+  let sb;
+  try { sb = await getSupabase(); }
+  catch { return res.status(503).json({ ok: false, error: ERR_UNAVAILABLE }); }
+
+  try {
+    const { data, error } = await sb.auth.getUser(access_token);
+    const user = error ? null : userFrom(data?.user);
+    if (!user) return deny();
+    writeSessionCookie(req, res, { access_token, refresh_token });
+    cachePut(access_token, user);
+    return res.json({ ok: true });
+  } catch {
+    // Network/config failure — still a clean JSON answer, never a crash.
+    return deny();
   }
 });
 

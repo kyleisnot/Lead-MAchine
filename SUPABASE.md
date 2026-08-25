@@ -39,3 +39,29 @@ on multi-user = creating a Supabase project and flipping a few env values.
 - **Admin panel** (`/admin`): all users with usage/leads/tier, inline tier + allotment editing, operator Apify spend.
 
 Local dev stays login-free: `DATA_PROVIDER=sqlite npm run dashboard`.
+
+## Google sign-in setup
+
+The "Continue with Google" button on `/login` and `/signup` uses Supabase's hosted OAuth.
+Three places have to line up — Google, the Supabase provider, and Supabase's redirect allow-list.
+
+1. **Google Cloud OAuth client.** In the [Google Cloud console](https://console.cloud.google.com/apis/credentials) → **APIs & Services → Credentials → Create credentials → OAuth client ID** → application type **Web application**. Add this **Authorized redirect URI** (Supabase's endpoint, not the app's):
+   ```
+   https://rhlecrahjwxfqewpzecp.supabase.co/auth/v1/callback
+   ```
+   Fill in the OAuth consent screen if prompted, then copy the **Client ID** and **Client secret**.
+2. **Enable the provider in Supabase.** Dashboard → **Authentication → Providers → Google** → toggle on, paste the client ID and secret, save.
+3. **Allow the app's callback URLs.** Dashboard → **Authentication → URL Configuration → Redirect URLs**, add both:
+   ```
+   https://lead-machine-app-ts-advisors.vercel.app/auth/callback
+   http://localhost:4000/auth/callback
+   ```
+   Supabase refuses any `redirect_to` that isn't on this list, so a missing entry is the usual cause of a failed sign-in.
+
+No extra env vars are needed — the app builds the authorize URL from `SUPABASE_URL`. First-time Google
+users get the same trial profile as email signups (created by the DB trigger).
+
+**How it flows:** `/auth/google` → Supabase authorize → Google → Supabase → `/auth/callback`, which
+receives the session in the URL *fragment* and POSTs it to `/auth/session`. That route re-verifies the
+access token with `auth.getUser()` before writing the usual `lm_session` httpOnly cookie — the tokens
+are never trusted just because they were posted.
