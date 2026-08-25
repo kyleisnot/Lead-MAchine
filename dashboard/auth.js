@@ -20,7 +20,7 @@
 //   Cookies are parsed/serialized by hand — no extra dependency.
 import express from "express";
 import crypto from "node:crypto";
-import { dataProvider, getSupabase, supabaseUrl } from "../lib/supabase.js";
+import { dataProvider, getSupabase, getAuthSupabase, supabaseUrl } from "../lib/supabase.js";
 import { THEME_INIT_SCRIPT, SHARED_CSS } from "./shell.js";
 
 // ── config ──────────────────────────────────────────────────────────────────
@@ -253,7 +253,10 @@ const refreshing = new Map();
 
 async function refreshOnce(sb, refresh_token) {
   if (refreshing.has(refresh_token)) return refreshing.get(refresh_token);
-  const p = sb.auth.refreshSession({ refresh_token })
+  // Refresh on the dedicated auth client: refreshSession() mutates a client's
+  // internal session, which must never happen on the shared service client.
+  const p = getAuthSupabase()
+    .then((authSb) => authSb.auth.refreshSession({ refresh_token }))
     .then((r) => (r?.error ? null : r?.data || null))
     .catch(() => null)
     .finally(() => { setTimeout(() => refreshing.delete(refresh_token), 1000).unref?.(); });
@@ -441,7 +444,7 @@ authRouter.post("/login", formBody, async (req, res) => {
   }
 
   let sb;
-  try { sb = await getSupabase(); }
+  try { sb = await getAuthSupabase(); } // interactive sign-in stays off the service client
   catch { return sendPage(res, 503, { mode: "login", email, error: ERR_UNAVAILABLE }); }
 
   try {
@@ -498,7 +501,8 @@ authRouter.post("/signup", formBody, async (req, res) => {
       return fail(400, ERR_GENERIC);
     }
 
-    const { data, error: signInError } = await sb.auth.signInWithPassword({ email, password });
+    const sbAuth = await getAuthSupabase(); // sign-in leg off the service client
+    const { data, error: signInError } = await sbAuth.auth.signInWithPassword({ email, password });
     if (signInError || !data?.session) {
       // Account exists but the sign-in leg failed — send them to the login page.
       return sendPage(res, 200, {
