@@ -33,12 +33,10 @@ function navIcon(key) {
 }
 
 // The demo-workspace banner: every page the operator shows a prospect says, quietly,
-// that this is the staged account — so nobody (least of all the operator) mistakes it
-// for real client data. Rendered first inside <main>, above the page's own header.
-const DEMO_BANNER = `<div class="demobar" role="status">
-  <span class="demobar-txt">🎬 Demo workspace — staged data, resets after the meeting</span>
-  <form method="post" action="/demo/exit"><button class="demobar-btn" type="submit">Exit demo</button></form>
-</div>`;
+// Banner intentionally removed (operator request): clients watching a demo should see
+// the product exactly as a customer would, with no "staged" chrome. The operator enters
+// and exits demo mode from the /demo page, which still shows the current state.
+const DEMO_BANNER = "";
 
 // The left rail + opening <main>. Pages close it with `</main></div>` (in SHELL footer).
 // opts.isAdmin adds the Admin link (only render it for admin users).
