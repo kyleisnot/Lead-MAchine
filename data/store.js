@@ -136,8 +136,26 @@ export async function listLeads(userId, status) {
   return (data || []).map(leadRow);
 }
 
+// Every lead ever surfaced, newest first — powers the "found" tab of /leads.
+// Deliberately SLIM: only the columns that tab renders. lead_json/site_data are the
+// two fat jsonb columns and neither is used there, so leaving them out keeps this
+// page fast even for a user with thousands of leads. Capped at 2000 rows (the tab
+// renders the newest 500 and filters client-side).
+const FOUND_COLS = "id,source,name,category,city,state,phone,email,status,created_at,saved,crm_stage,contacted_on";
 export async function listAllLeads(userId) {
-  return listLeads(userId);
+  if (!isSupabase()) return listLeads(userId);
+  const c = await getSupabase();
+  const data = must(
+    await c
+      .from("leads")
+      .select(FOUND_COLS)
+      .eq("user_id", userId)
+      .eq("dismissed", false)
+      .order("created_at", { ascending: false })
+      .range(0, 1999),
+    "listAllLeads"
+  );
+  return data || [];
 }
 
 // [{ status, n }] — same shape SQLite's GROUP BY returns.
@@ -385,17 +403,28 @@ export async function listCrm(userId, stage) {
   return (data || []).map(leadRow);
 }
 
-// [{ crm_stage, n }]
+// [{ crm_stage, n }] — same shape SQLite's GROUP BY returns (zero rows omitted).
+// One HEAD count per stage instead of pulling every saved row back just to tally it:
+// the five run in parallel, and nothing but the counts crosses the wire.
+const CRM_STAGES = ["New", "Contacted", "Interested", "Won", "Lost"];
 export async function crmCounts(userId) {
   if (!isSupabase()) return (await db()).crmCounts();
   const c = await getSupabase();
-  const data = must(
-    await c.from("leads").select("crm_stage").eq("user_id", userId).eq("saved", true).range(0, BIG),
-    "crmCounts"
+  const results = await Promise.all(
+    CRM_STAGES.map((crm_stage) =>
+      c
+        .from("leads")
+        .select("*", { count: "exact", head: true })
+        .eq("user_id", userId)
+        .eq("saved", true)
+        .eq("crm_stage", crm_stage)
+        .then(({ count, error }) => {
+          if (error) throw new Error(`crmCounts: ${error.message}`);
+          return { crm_stage, n: count || 0 };
+        })
+    )
   );
-  const tally = new Map();
-  for (const r of data || []) tally.set(r.crm_stage, (tally.get(r.crm_stage) || 0) + 1);
-  return [...tally].map(([crm_stage, n]) => ({ crm_stage, n }));
+  return results.filter((r) => r.n);
 }
 
 // ── Manual follow-ups (the user's own reminders) ─────────────────────────────

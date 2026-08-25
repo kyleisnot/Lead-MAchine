@@ -1,5 +1,5 @@
-// server.js — the Lead Machine dashboard: find local businesses with no website, track
-// the ones you want in the CRM, and browse everything the machine has ever scanned.
+// server.js — the Lead Machine dashboard: find local businesses with no website (Search)
+// and work them on one Leads page (found · tracked · follow-up).
 //
 // Multi-user: ./auth.js resolves WHO is asking (req.userId / req.userEmail / req.isAdmin)
 // and every data call goes through ../data/store.js scoped to that user. In sqlite (local
@@ -181,10 +181,16 @@ app.post("/api/crm/update/:id", route(async (req, res) => {
   res.json({ ok: true });
 }));
 
-app.get("/crm", route(async (req, res) => res.send(await renderCrmPage(req, req.query.view))));
+// ── LEADS: one page, three tabs (tracked · found · follow-up) ──
+// `tracked` is the old CRM table, `found` is every lead the machine has surfaced
+// (the old Brain "Your leads" tab, now actionable), `followup` is the old CRM tab.
+app.get("/leads", route(async (req, res) => res.send(await renderLeadsPage(req, req.query.view))));
 
-// The "brain" — browse every business the machine has ever scanned or surfaced.
-app.get("/brain", route(async (req, res) => res.send(await renderBrainPage(req, req.query.view))));
+// Old URLs keep working: /crm and /brain are now tabs of /leads.
+app.get("/crm", (req, res) =>
+  res.redirect(302, req.query.view === "followup" ? "/leads?view=followup" : "/leads")
+);
+app.get("/brain", (req, res) => res.redirect(302, "/leads?view=found"));
 
 // ── Manual follow-ups (your own reminders) ──
 app.post("/api/followup/add", route(async (req, res) => {
@@ -385,7 +391,7 @@ ${sidebar("search", { isAdmin: req.isAdmin })}<div class="pagehead"><div class="
     <div class="ex-item"><span class="ex-num">1</span><div><b>It's one of your trades</b><p>${explainNiches}</p></div></div>
     <div class="ex-item"><span class="ex-num">2</span><div><b>It has no real website</b><p>A Facebook, Instagram, or Yelp page doesn't count &mdash; we're after businesses with no website of their own (so you can offer to build them one).</p></div></div>
     <div class="ex-item"><span class="ex-num">3</span><div><b>It's still active</b><p>${activeExplain}</p></div></div>
-    <p class="ex-foot">Miss any one of these and the business is skipped. Everything we've ever scanned is remembered in the <b>Brain</b> so we never re-check it &mdash; but only the ones that pass all three become <b>your leads</b>.</p>
+    <p class="ex-foot">Miss any one of these and the business is skipped. Everything we've ever scanned is <b>remembered</b> so we never re-check it &mdash; but only the ones that pass all three land in <b>Leads</b>.</p>
   </div>
 </details>
 
@@ -570,7 +576,7 @@ function esc(s){return (s||'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>'
 </script>${SHELL_TAIL_SCRIPT}</main></div></body></html>`;
 }
 
-// ── CRM PAGE ──
+// ── CRM ROWS (the tracked + follow-up tabs of /leads) ──
 const CRM_STAGES = ["New", "Contacted", "Interested", "Won", "Lost"];
 
 // Human "how long ago" from either a SQLite UTC datetime ("2026-06-09 14:03:00") or a
@@ -637,134 +643,101 @@ function renderFollowupItem(f) {
   </div>`;
 }
 
-// ── The Brain: browse everything the machine has ever seen ──
-// Three tabs: qualifying no-website businesses (the "400+"), everything scanned,
-// and the detailed leads it actually surfaced. All client-side searchable.
+// ── LEADS PAGE (tracked · found · follow-up) ──
+// One page for the whole lead lifecycle. `tracked` and `followup` are the old CRM
+// tabs; `found` is every lead the machine has ever surfaced (the old Brain "Your
+// leads" tab) — now actionable, with Save and dismiss on each row.
+
+// Scrapers write a few variants ("google", "google_maps"), so match on the prefix —
+// this is the same label the tracked tab shows for the same lead.
 function srcLabel(s) {
-  return s === "facebook" ? "Facebook" : s === "instagram" ? "Instagram" : s === "google" ? "Google" : (s || "—");
+  const v = String(s || "");
+  if (v.startsWith("facebook")) return "Facebook";
+  if (v.startsWith("instagram")) return "Instagram";
+  if (v.startsWith("google")) return "Google";
+  return v || "—";
 }
-function shortDate(s) {
-  if (!s) return "—";
-  const d = String(s).slice(0, 10); // YYYY-MM-DD
-  return d || "—";
-}
-function renderCheckedRow(b) {
-  const site = b.has_website
-    ? `<span class="tag site">has site</span>`
-    : `<span class="tag nosite">no site</span>`;
-  return `<tr>
-    <td><b>${esc(b.name || "—")}</b></td>
-    <td>${esc(b.niche || "—")}</td>
-    <td>${esc([b.city, b.state].filter(Boolean).join(", ") || "—")}</td>
-    <td><span class="src">${esc(srcLabel(b.source))}</span></td>
-    <td>${site}</td>
-    <td class="sub">${esc(shortDate(b.checked_at))}</td>
-  </tr>`;
-}
-function renderLeadRow(l) {
-  return `<tr>
+
+// The found tab renders at most this many rows (newest first); the filter box
+// searches what's rendered, so the note tells the user when there's more behind it.
+const FOUND_LIMIT = 500;
+
+// A row on the `found` tab. Deliberately light: no lead_json, so no license badge —
+// that detail lives on the tracked tab, where the CRM query still loads it.
+function renderFoundRow(l) {
+  const saved = !!l.saved;
+  const stage = esc(l.crm_stage || "New");
+  const stageCell = saved ? `<span class="tag site">${stage}</span>` : `<span class="tag">not saved</span>`;
+  const saveBtn = saved
+    ? `<button class="save saved-on" id="fs-${l.id}" disabled>✅ Saved</button>`
+    : `<button class="save" id="fs-${l.id}" onclick="saveFound(${l.id})">💾 Save</button>`;
+  return `<tr id="found-${l.id}" data-stage="${stage}">
     <td><b>${esc(l.name || "—")}</b><div class="sub">${esc(l.category || "")}</div></td>
     <td>${esc([l.city, l.state].filter(Boolean).join(", ") || "—")}</td>
     <td>${esc(l.phone || "—")}<div class="sub">${l.email ? esc(l.email) : '<span class="warn">no email</span>'}</div></td>
     <td><span class="src">${esc(srcLabel(l.source))}</span></td>
-    <td><span class="tag ${l.saved ? "site" : ""}">${esc(l.crm_stage || "New")}</span></td>
+    <td class="stagecell">${stageCell}</td>
+    <td class="actions">
+      ${saveBtn}
+      <button class="hide" onclick="dismissFound(${l.id})" title="Mark off — won&#39;t show in future searches">✕</button>
+    </td>
   </tr>`;
 }
-async function renderBrainPage(req, view = "nosite") {
-  const tab = ["nosite", "all", "leads"].includes(view) ? view : "nosite";
-  const [noSite, cs, leads] = await Promise.all([
-    store.listCheckedBusinesses(req.userId, { noSiteOnly: true }),
-    store.checkedStats(req.userId),
+
+async function renderLeadsPage(req, view = "tracked") {
+  const tab = view === "found" ? "found" : view === "followup" ? "followup" : "tracked";
+  const wantCrm = tab !== "found";
+  // Everything the page needs, in parallel. listAllLeads is the slim query (no
+  // lead_json/site_data), so fetching it for the tab count is cheap; the fat
+  // listCrm query is skipped entirely on the found tab.
+  const [crmLeads, counts, found, followups] = await Promise.all([
+    wantCrm ? store.listCrm(req.userId) : null,
+    store.crmCounts(req.userId),
     store.listAllLeads(req.userId),
+    tab === "followup" ? store.listFollowups(req.userId) : [],
   ]);
-  const totalScanned = cs.total || 0;
 
-  let head, rowsHtml, count, hint;
-  if (tab === "leads") {
-    head = `<tr><th>Business</th><th>Location</th><th>Contact</th><th>Source</th><th>Stage</th></tr>`;
-    rowsHtml = leads.map(renderLeadRow).join("");
-    count = leads.length;
-    hint = "The businesses we handed you to contact — in your trades, no website, and still active. These are the ones to save to your CRM.";
-  } else if (tab === "all") {
-    const all = await store.listCheckedBusinesses(req.userId);
-    head = `<tr><th>Business</th><th>Niche</th><th>Location</th><th>Source</th><th>Website</th><th>Checked</th></tr>`;
-    rowsHtml = all.map(renderCheckedRow).join("");
-    count = all.length;
-    hint = "Every business we've ever scanned. Most get filtered out — we just remember them so we never waste time re-checking the same ones.";
-  } else {
-    head = `<tr><th>Business</th><th>Niche</th><th>Location</th><th>Source</th><th>Website</th><th>Checked</th></tr>`;
-    rowsHtml = noSite.map(renderCheckedRow).join("");
-    count = noSite.length;
-    hint = "Businesses with no real website — the pool your leads are pulled from (before the niche and activity checks).";
-  }
-
-  return `<!doctype html><html><head>${THEME_INIT_SCRIPT}<meta charset="utf-8"><title>Lead Machine — Brain</title>
-<style>
-  :root{--gold:#14FFB9;--bg:#0a1124;--panel:#0f1a30;--border:rgba(20,255,185,.22);--text:#e8eaf0;--muted:#7b8499}
-  *{box-sizing:border-box;margin:0;padding:0}
-  .brandlogo{height:40px;width:auto;display:block}
-  body::before{content:"";position:fixed;inset:0;background:url(/mark.png) center 120px/360px no-repeat;opacity:.05;pointer-events:none;z-index:0}
-  body>*{position:relative;z-index:1}
-  body{font-family:system-ui,sans-serif;background:var(--bg);color:var(--text);padding:24px;max-width:1200px;margin:auto}
-  header{display:flex;align-items:center;gap:16px;margin-bottom:8px}
-  .nav{margin-left:auto;display:flex;gap:16px;align-items:center;flex-wrap:wrap;row-gap:10px}.nav a{color:var(--gold);text-decoration:none;font-weight:600;font-size:14px}
-  .stats{color:var(--muted);font-size:13px;margin:6px 0 14px}
-  .tabs{display:flex;gap:8px;margin:6px 0 14px;flex-wrap:wrap}
-  .tab{display:inline-flex;align-items:center;gap:6px;text-decoration:none;font-weight:700;font-size:14px;color:var(--muted);background:var(--panel);border:1px solid var(--border);border-radius:9px;padding:9px 16px}
-  .tab:hover{color:var(--text)}
-  .tab.active{color:#000;background:var(--gold);border-color:var(--gold)}
-  .tab .pill{background:rgba(0,0,0,.18);border-radius:20px;padding:1px 8px;font-size:12px}
-  .tab:not(.active) .pill{background:rgba(20,255,185,.16);color:var(--gold)}
-  .search{width:100%;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.14);border-radius:10px;padding:12px 14px;color:var(--text);font-size:15px;margin-bottom:14px}
-  .search::placeholder{color:var(--muted)}
-  table{width:100%;border-collapse:collapse;background:var(--panel);border:1px solid var(--border);border-radius:12px;overflow:hidden}
-  th{text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.5px;color:var(--muted);padding:12px 14px;border-bottom:1px solid var(--border)}
-  td{padding:11px 14px;border-bottom:1px solid rgba(255,255,255,.05);font-size:14px;vertical-align:top}
-  tr:last-child td{border-bottom:none}
-  .sub{color:var(--muted);font-size:12px;margin-top:3px}.warn{color:#e0a93b}
-  .src{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px}
-  .actions a{color:var(--gold);text-decoration:none;font-size:13px}
-  .tag{font-size:11px;font-weight:700;padding:2px 9px;border-radius:20px;background:rgba(255,255,255,.06);color:var(--muted)}
-  .tag.nosite{background:rgba(20,255,185,.16);color:var(--gold)}
-  .tag.site{background:rgba(224,169,59,.16);color:#e0a93b}
-  .empty{color:var(--muted);text-align:center;margin-top:50px;font-size:15px}
-  #noMatch{display:none;color:var(--muted);text-align:center;margin-top:30px;font-size:14px}
-${SHARED_CSS}</style></head><body>
-${sidebar("brain", { isAdmin: req.isAdmin })}<div class="pagehead"><h1>Brain</h1><div class="spacer"></div></div>
-<div class="tabs">
-  <a class="tab ${tab === "nosite" ? "active" : ""}" href="/brain">No website <span class="pill">${noSite.length}</span></a>
-  <a class="tab ${tab === "all" ? "active" : ""}" href="/brain?view=all">All scanned <span class="pill">${totalScanned}</span></a>
-  <a class="tab ${tab === "leads" ? "active" : ""}" href="/brain?view=leads">Your leads <span class="pill">${leads.length}</span></a>
-</div>
-<div class="stats">${esc(hint)} &nbsp;·&nbsp; <b>${count}</b> shown</div>
-<input class="search" id="q" placeholder="🔍 Filter by name, niche, city, state…" oninput="filterRows()" autofocus>
-${count
-    ? `<table id="tbl"><thead>${head}</thead><tbody id="tb">${rowsHtml}</tbody></table><div id="noMatch">No businesses match your filter.</div>`
-    : '<div class="empty">Nothing here yet.</div>'}
-<script>
-function filterRows(){
-  var q=document.getElementById('q').value.toLowerCase().trim();
-  var rows=document.querySelectorAll('#tb tr');var shown=0;
-  rows.forEach(function(r){
-    var hit=!q||r.textContent.toLowerCase().indexOf(q)>-1;
-    r.style.display=hit?'':'none';if(hit)shown++;
-  });
-  var nm=document.getElementById('noMatch');if(nm)nm.style.display=shown?'none':'block';
-}
-</script>
-${SHELL_TAIL_SCRIPT}</main></div></body></html>`;
-}
-
-async function renderCrmPage(req, view = "all") {
-  const followup = view === "followup";
-  const [allLeads, counts] = await Promise.all([store.listCrm(req.userId), store.crmCounts(req.userId)]);
-  const contactedCount = counts.find((c) => c.crm_stage === "Contacted")?.n || 0;
-  const leads = followup ? allLeads.filter((l) => l.crm_stage === "Contacted") : allLeads;
-  const total = leads.length;
-  const byStage = CRM_STAGES.map((s) => `${s}: ${counts.find((c) => c.crm_stage === s)?.n || 0}`).join(" · ");
-  const followups = followup ? await store.listFollowups(req.userId) : [];
+  const stageCount = (s) => counts.find((c) => c.crm_stage === s)?.n || 0;
+  const contactedCount = stageCount("Contacted");
+  const trackedCount = crmLeads ? crmLeads.length : counts.reduce((a, c) => a + (Number(c.n) || 0), 0);
+  const foundCount = found.length;
+  const byStage = CRM_STAGES.map((s) => `${s}: ${stageCount(s)}`).join(" · ");
   const openFollowups = followups.filter((f) => !f.done).length;
-  return `<!doctype html><html><head>${THEME_INIT_SCRIPT}<meta charset="utf-8"><title>Lead Machine — CRM</title>
+
+  const followup = tab === "followup";
+  const crmRows = wantCrm ? (followup ? crmLeads.filter((l) => l.crm_stage === "Contacted") : crmLeads) : [];
+  const foundRows = tab === "found" ? found.slice(0, FOUND_LIMIT) : [];
+  const capped = foundCount > FOUND_LIMIT;
+
+  const stats =
+    tab === "found"
+      ? `Every business the machine has surfaced for you. <b>Save</b> the ones worth chasing — they move to <b>Tracked</b>. &nbsp;·&nbsp; ${
+          capped
+            ? `<b>showing newest ${FOUND_LIMIT}</b> of ${foundCount} — use the filter to reach the rest`
+            : `<b>${foundRows.length}</b> shown`
+        }`
+      : followup
+      ? `<b>${openFollowups}</b> personal follow-up${openFollowups === 1 ? "" : "s"} &nbsp;·&nbsp; <b>${contactedCount}</b> contacted lead${contactedCount === 1 ? "" : "s"}`
+      : `<b>${trackedCount}</b> saved leads &nbsp;·&nbsp; ${esc(byStage)}`;
+
+  const foundBody = foundRows.length
+    ? `<input class="search" id="q" placeholder="🔍 Filter by name, category, city, phone…" oninput="filterRows()" autofocus>
+<table id="tbl"><thead><tr><th>Business</th><th>Location</th><th>Contact</th><th>Source</th><th>Stage</th><th>Actions</th></tr></thead><tbody id="tb">${foundRows
+        .map(renderFoundRow)
+        .join("")}</tbody></table><div id="noMatch">No businesses match your filter.</div>`
+    : '<div class="empty">Nothing found yet.<br>Go to <a href="/">Search</a> and run a scan — everything it surfaces lands here.</div>';
+
+  const crmBody = crmRows.length
+    ? `<table><thead><tr><th>Business</th><th>Contact</th><th>Source</th>${
+        followup ? "<th>Contacted</th>" : ""
+      }<th>Stage</th><th>Notes</th><th>Actions</th></tr></thead><tbody>${crmRows
+        .map((l) => renderCrmRow(l, followup))
+        .join("")}</tbody></table>`
+    : followup
+    ? '<div class="empty" style="margin-top:20px">No contacted leads yet.<br>Set a lead\'s stage to <b>Contacted</b> in <b>Tracked</b> and it\'ll show here.</div>'
+    : '<div class="empty">No saved leads yet.<br>Open the <a href="/leads?view=found">Found</a> tab and click <b>💾 Save</b> on the ones you want to track.</div>';
+
+  return `<!doctype html><html><head>${THEME_INIT_SCRIPT}<meta charset="utf-8"><title>Lead Machine — Leads</title>
 <style>
   :root{--gold:#14FFB9;--bg:#0a1124;--panel:#0f1a30;--border:rgba(20,255,185,.22);--text:#e8eaf0;--muted:#7b8499}
   *{box-sizing:border-box;margin:0;padding:0}
@@ -784,12 +757,21 @@ async function renderCrmPage(req, view = "all") {
   .src{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px}
   select.stage,input.notes{background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.12);border-radius:7px;padding:7px 9px;color:var(--text);font-size:13px}
   input.notes{width:100%;min-width:160px}
-  .actions{display:flex;gap:10px;align-items:center;white-space:nowrap}
+  .actions{display:flex;gap:8px;align-items:center;white-space:nowrap}
   .actions a{color:var(--gold);text-decoration:none;font-size:13px}
   .rm{background:transparent;border:1px solid var(--border);color:var(--muted);border-radius:6px;padding:5px 10px;cursor:pointer;font-size:12px}
   .rm:hover{color:#e05b5b;border-color:#e05b5b}
+  .save{border-radius:7px;padding:6px 11px;font-weight:600;cursor:pointer;font-size:12px;white-space:nowrap;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.14);color:var(--text)}
+  .save:disabled{cursor:default}
+  .hide{border-radius:7px;padding:6px 10px;cursor:pointer;font-size:12px;background:transparent;border:1px solid rgba(255,255,255,.14);color:var(--muted)}
+  .hide:hover{color:#e05b5b;border-color:#e05b5b}
+  .search{width:100%;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.14);border-radius:10px;padding:12px 14px;color:var(--text);font-size:15px;margin-bottom:14px}
+  .search::placeholder{color:var(--muted)}
+  .tag{display:inline-block;font-size:11px;font-weight:700;padding:2px 9px;border-radius:20px;background:rgba(255,255,255,.06);color:var(--muted)}
+  .tag.site{background:rgba(20,255,185,.16);color:var(--gold)}
+  #noMatch{display:none;color:var(--muted);text-align:center;margin-top:30px;font-size:14px}
   .empty{color:var(--muted);text-align:center;margin-top:50px;font-size:15px}
-  .tabs{display:flex;gap:8px;margin:6px 0 16px}
+  .tabs{display:flex;gap:8px;margin:6px 0 16px;flex-wrap:wrap}
   .tab{display:inline-flex;align-items:center;gap:6px;text-decoration:none;font-weight:700;font-size:14px;color:var(--muted);background:var(--panel);border:1px solid var(--border);border-radius:9px;padding:9px 16px}
   .tab:hover{color:var(--text)}
   .tab.active{color:#000;background:var(--gold);border-color:var(--gold)}
@@ -814,16 +796,13 @@ async function renderCrmPage(req, view = "all") {
   .fu-del{color:var(--muted)}.fu-del:hover{color:#e05b5b;border-color:#e05b5b}
   .sechead{font-size:13px;text-transform:uppercase;letter-spacing:.5px;color:var(--muted);margin:8px 0 10px;font-weight:700}
 ${SHARED_CSS}</style></head><body>
-${sidebar("crm", { isAdmin: req.isAdmin })}<div class="pagehead"><h1>CRM</h1><div class="spacer"></div></div>
+${sidebar("leads", { isAdmin: req.isAdmin })}<div class="pagehead"><div class="titlewrap"><h1>Leads</h1><div class="pagesub">Everything the machine found — and the ones you're working</div></div><div class="spacer"></div></div>
 <div class="tabs">
-  <a class="tab ${followup ? "" : "active"}" href="/crm">All leads <span class="pill">${allLeads.length}</span></a>
-  <a class="tab ${followup ? "active" : ""}" href="/crm?view=followup">⏰ Follow-up <span class="pill">${contactedCount}</span></a>
+  <a class="tab ${tab === "tracked" ? "active" : ""}" href="/leads">Tracked <span class="pill">${trackedCount}</span></a>
+  <a class="tab ${tab === "found" ? "active" : ""}" href="/leads?view=found">Found <span class="pill">${foundCount}</span></a>
+  <a class="tab ${followup ? "active" : ""}" href="/leads?view=followup">⏰ Follow-up <span class="pill">${contactedCount}</span></a>
 </div>
-<div class="stats">${
-  followup
-    ? `<b>${openFollowups}</b> personal follow-up${openFollowups === 1 ? "" : "s"} &nbsp;·&nbsp; <b>${contactedCount}</b> contacted lead${contactedCount === 1 ? "" : "s"}`
-    : `<b>${total}</b> saved leads &nbsp;·&nbsp; ${esc(byStage)}`
-}</div>
+<div class="stats">${stats}</div>
 ${
   followup
     ? `<div class="fubox">
@@ -844,21 +823,10 @@ ${
       <div class="sechead">Contacted leads${contactedCount ? ` — ${contactedCount}` : ""}</div>`
     : ""
 }
-${
-  total
-    ? `<table><thead><tr><th>Business</th><th>Contact</th><th>Source</th>${
-        followup ? "<th>Contacted</th>" : ""
-      }<th>Stage</th><th>Notes</th><th>Actions</th></tr></thead><tbody>${leads
-        .map((l) => renderCrmRow(l, followup))
-        .join("")}</tbody></table>`
-    : followup
-    ? '<div class="empty" style="margin-top:20px">No contacted leads yet.<br>Set a lead\'s stage to <b>Contacted</b> in <b>All leads</b> and it\'ll show here.</div>'
-    : '<div class="empty">No saved leads yet.<br>Go to <a href="/" style="color:var(--gold)">Search</a>, find prospects, and click <b>💾 Save</b> to add them here.</div>'
-}
+${tab === "found" ? foundBody : crmBody}
 <script>
 const FOLLOWUP=${followup};
 async function post(url,data){const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data||{})});return r.json()}
-function esc(s){return (s||'')}
 function dropRow(id){const r=document.getElementById('crm-'+id);if(r){r.style.transition='opacity .3s';r.style.opacity='0';setTimeout(()=>r.remove(),300)}}
 async function setStage(id,stage){await post('/api/crm/update/'+id,{stage});if(FOLLOWUP&&stage!=='Contacted')dropRow(id)}
 async function setNotes(id,notes){await post('/api/crm/update/'+id,{notes})}
@@ -871,5 +839,28 @@ async function addFu(){
 }
 async function fuDone(id,done){await post('/api/followup/update/'+id,{done:!!done});location.reload()}
 async function fuDel(id){await post('/api/followup/remove/'+id,{});const r=document.getElementById('fu-'+id);if(r)r.remove()}
+// ── found tab ──
+async function saveFound(id){
+  var b=document.getElementById('fs-'+id);if(b)b.disabled=true;
+  var r=await post('/api/crm/save/'+id,{});
+  if(!r.ok){if(b){b.disabled=false;b.textContent='⚠️ retry'}return}
+  if(b){b.textContent='✅ Saved';b.classList.add('saved-on');b.onclick=null}
+  var row=document.getElementById('found-'+id);
+  if(row){var c=row.querySelector('.stagecell');if(c)c.innerHTML='<span class="tag site">'+(row.getAttribute('data-stage')||'New')+'</span>'}
+}
+async function dismissFound(id){
+  await post('/api/dismiss/'+id,{});
+  var r=document.getElementById('found-'+id);
+  if(r){r.style.transition='opacity .3s';r.style.opacity='0';setTimeout(function(){r.remove()},300)}
+}
+function filterRows(){
+  var box=document.getElementById('q');if(!box)return;
+  var q=box.value.toLowerCase().trim(),shown=0;
+  document.querySelectorAll('#tb tr').forEach(function(r){
+    var hit=!q||r.textContent.toLowerCase().indexOf(q)>-1;
+    r.style.display=hit?'':'none';if(hit)shown++;
+  });
+  var nm=document.getElementById('noMatch');if(nm)nm.style.display=shown?'none':'block';
+}
 </script>${SHELL_TAIL_SCRIPT}</main></div></body></html>`;
 }

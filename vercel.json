@@ -6,5 +6,6 @@
       "maxDuration": 300,
       "includeFiles": "dashboard/public/**"
     }
-  }
+  },
+  "crons": [{ "path": "/healthz", "schedule": "*/5 * * * *" }]
 }

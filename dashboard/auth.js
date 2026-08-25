@@ -12,12 +12,14 @@
 // How the session works (supabase mode):
 //   Sign-in happens server-side (`signInWithPassword`) and the resulting Supabase
 //   session is stored in one httpOnly cookie, `lm_session`, holding
-//   {access_token, refresh_token} as JSON. Every request verifies the access token
-//   with `auth.getUser(token)`; verified tokens are cached in memory for 5 minutes so
+//   {access_token, refresh_token} as JSON. Every request verifies the access token —
+//   locally (HS256 signature check) when SUPABASE_JWT_SECRET is set, otherwise with
+//   `auth.getUser(token)`; verified tokens are cached in memory for 5 minutes so
 //   we don't make a network call per request. When the access token has expired we
 //   silently `refreshSession({refresh_token})` and re-write the cookie.
 //   Cookies are parsed/serialized by hand — no extra dependency.
 import express from "express";
+import crypto from "node:crypto";
 import { dataProvider, getSupabase, supabaseUrl } from "../lib/supabase.js";
 import { THEME_INIT_SCRIPT, SHARED_CSS } from "./shell.js";
 
@@ -149,6 +151,43 @@ function userFrom(u) {
   return { userId: u.id, userEmail, isAdmin: isAdminEmail(userEmail) };
 }
 
+// ── local (offline) access-token verification ───────────────────────────────
+// A Supabase access token is a plain HS256 JWT signed with the project's JWT
+// secret. When SUPABASE_JWT_SECRET is set we check the signature ourselves, which
+// turns the per-request `auth.getUser()` round-trip into a few microseconds of
+// HMAC — the difference between a fast page and a cold serverless page.
+//
+// It is strictly an optimisation: ANY problem (no secret, wrong alg, bad
+// signature, expired, malformed) returns null and the caller falls back to the
+// network path, so a stale or mistyped secret can never lock a user out.
+const b64urlDecode = (s) => Buffer.from(String(s).replace(/-/g, "+").replace(/_/g, "/"), "base64");
+
+function verifyAccessTokenLocally(token) {
+  const secret = process.env.SUPABASE_JWT_SECRET;
+  if (!secret || !token) return null;
+  try {
+    const [head, body, sig] = String(token).split(".");
+    if (!head || !body || !sig) return null;
+
+    const header = JSON.parse(b64urlDecode(head).toString("utf8"));
+    if (header?.alg !== "HS256") return null; // never accept "none" or an asymmetric alg here
+
+    const expected = crypto.createHmac("sha256", secret).update(`${head}.${body}`).digest();
+    const given = b64urlDecode(sig);
+    if (given.length !== expected.length) return null; // timingSafeEqual demands equal lengths
+    if (!crypto.timingSafeEqual(given, expected)) return null;
+
+    const payload = JSON.parse(b64urlDecode(body).toString("utf8"));
+    if (!payload?.sub) return null;
+    const exp = Number(payload.exp);
+    if (!Number.isFinite(exp) || exp <= Math.floor(Date.now() / 1000)) return null;
+
+    return { userId: String(payload.sub), userEmail: payload.email || "" };
+  } catch {
+    return null;
+  }
+}
+
 // ── session resolution ──────────────────────────────────────────────────────
 // One in-flight refresh per refresh_token, so parallel requests from the same
 // browser don't race each other into rotating the token several times over.
@@ -178,6 +217,16 @@ async function resolveSession(req, res) {
 
   const cached = access ? cacheGet(access) : null;
   if (cached) return cached;
+
+  // Fast path: verify the signature in-process, before we even build a client.
+  if (access) {
+    const local = verifyAccessTokenLocally(access);
+    if (local) {
+      const user = { ...local, isAdmin: isAdminEmail(local.userEmail) };
+      cachePut(access, user);
+      return user;
+    }
+  }
 
   let sb;
   try { sb = await getSupabase(); } catch { return null; }

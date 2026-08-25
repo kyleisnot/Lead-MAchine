@@ -24,7 +24,8 @@ else{if(t)t.textContent=(Number(r.tokens)||0).toLocaleString()+' tokens';if(s)s.
 function navIcon(key) {
   const s = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="18" height="18" aria-hidden="true">';
   if (key === "search") return s + '<circle cx="11" cy="11" r="7"></circle><path d="M21 21l-4.2-4.2"></path></svg>';
-  if (key === "crm") return s + '<rect x="3" y="4" width="18" height="16" rx="2"></rect><path d="M3 10h18M9 4v16"></path></svg>';
+  // "leads" is the merged CRM + Brain page; it reuses the original CRM table icon.
+  if (key === "leads" || key === "crm") return s + '<rect x="3" y="4" width="18" height="16" rx="2"></rect><path d="M3 10h18M9 4v16"></path></svg>';
   if (key === "brain") return s + '<path d="M9 4a3 3 0 0 0-3 3 3 3 0 0 0-1.5 5.6V17a2 2 0 0 0 2 2h1"></path><path d="M15 4a3 3 0 0 1 3 3 3 3 0 0 1 1.5 5.6V17a2 2 0 0 1-2 2h-1"></path><path d="M12 4v15"></path></svg>';
   if (key === "demo") return s + '<circle cx="12" cy="12" r="9"></circle><path d="M10 8.5l6 3.5-6 3.5z"></path></svg>';
   if (key === "admin") return s + '<path d="M12 3l7 4v5c0 4.4-3 8.4-7 9-4-.6-7-4.6-7-9V7z"></path><path d="M9.5 12l2 2 3.5-3.5"></path></svg>';
@@ -39,8 +40,7 @@ export function sidebar(active, { isAdmin = false } = {}) {
   return `<div class="app"><nav class="side">
   <div class="brand"><img src="/logo.png" alt="Avanzta"></div>
   ${link("/", "search", "Search")}
-  ${link("/crm", "crm", "CRM")}
-  ${link("/brain", "brain", "Brain")}
+  ${link("/leads", "leads", "Leads")}
   ${isAdmin ? link("/demo", "demo", "Demo") : ""}
   ${isAdmin ? link("/admin", "admin", "Admin") : ""}
   <div class="grow"></div>
