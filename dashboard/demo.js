@@ -545,6 +545,11 @@ async function ensureDemoAccount(sb) {
 // seeded (the meeting's real searches ARE the data) and the profile is left on the
 // trigger's defaults — trial / 500 tokens — because this is a genuine new signup that
 // the prospect will keep. Returns the account's uuid.
+// A demo'd prospect keeps every lead found in the meeting, but has no search credit
+// left: the empty meter is what asks for the sale. `prospect` is the admin panel's
+// 1-token plan (0 would mean UNLIMITED), so the next search prompts an upgrade.
+const PROSPECT_PLAN = { tier: "prospect", monthly_token_allotment: 1 };
+
 async function ensureProspectAccount(sb, email) {
   const existing = await sb.from("profiles").select("id").eq("email", email).limit(1);
   if (!existing.error && existing.data && existing.data[0] && existing.data[0].id) {
@@ -574,10 +579,13 @@ async function ensureProspectAccount(sb, email) {
     else await sleep(300);
   }
   if (!hasProfile) {
-    // No tier/allotment here — the column defaults (trial / 500) are what the trigger
-    // would have written, and this account belongs to the prospect, not to the demo.
-    const up = await sb.from("profiles").upsert({ id, email }, { onConflict: "id" });
+    const up = await sb.from("profiles").upsert({ id, email, ...PROSPECT_PLAN }, { onConflict: "id" });
     if (up.error) throw new Error(`profile: ${up.error.message}`);
+  } else {
+    // The signup trigger writes trial/500. A brand-new account created FOR a demo
+    // starts on the prospect plan instead — an account they already made themselves
+    // was returned earlier, so this only ever touches accounts we just created.
+    await sb.from("profiles").update(PROSPECT_PLAN).eq("id", id);
   }
   return id;
 }
