@@ -45,6 +45,8 @@ app.get("/healthz", (req, res) => {
     urlSet: has("SUPABASE_URL") || has("NEXT_PUBLIC_SUPABASE_URL"),
     anonKeySet: has("SUPABASE_ANON_KEY") || has("NEXT_PUBLIC_SUPABASE_ANON_KEY") || has("SUPABASE_KEY") || has("SUPABASE_PUBLISHABLE_KEY"),
     serviceKeySet: has("SUPABASE_SERVICE_ROLE_KEY") || has("SUPABASE_SERVICE_KEY") || has("SUPABASE_SECRET_KEY"),
+    jwtSecretSet: has("SUPABASE_JWT_SECRET"),
+    apifyTokenSet: has("APIFY_TOKEN"),
   });
 });
 
