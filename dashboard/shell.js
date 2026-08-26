@@ -14,8 +14,18 @@
 export function icon(key, size = 18) {
   const s = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="${size}" height="${size}" aria-hidden="true">`;
   if (key === "search") return s + '<circle cx="11" cy="11" r="7"></circle><path d="M21 21l-4.2-4.2"></path></svg>';
-  // "leads" is the merged CRM + Brain page; it reuses the original CRM table icon.
-  if (key === "leads" || key === "crm") return s + '<rect x="3" y="4" width="18" height="16" rx="2"></rect><path d="M3 10h18M9 4v16"></path></svg>';
+  // "leads" is the merged CRM + Brain page, shown in the nav as Companies. A tall
+  // business tower with window ticks next to a small house, matching the `companies`
+  // mark server.js draws in the page headers so the nav and the page agree.
+  if (key === "leads" || key === "crm")
+    return (
+      s +
+      '<path d="M3 21V5a2 2 0 0 1 2-2h5a2 2 0 0 1 2 2v16"></path>' +
+      '<path d="M6 7h1M9 7h1M6 11h1M9 11h1M6 15h1M9 15h1"></path>' +
+      '<path d="M15 21v-6.6l3-2.4 3 2.4V21"></path><path d="M18 21v-3"></path>' +
+      '<path d="M2 21h20"></path>' +
+      "</svg>"
+    );
   if (key === "brain") return s + '<path d="M9 4a3 3 0 0 0-3 3 3 3 0 0 0-1.5 5.6V17a2 2 0 0 0 2 2h1"></path><path d="M15 4a3 3 0 0 1 3 3 3 3 0 0 1 1.5 5.6V17a2 2 0 0 1-2 2h-1"></path><path d="M12 4v15"></path></svg>';
   // "wins" is the closed-deal trophy case, drawn as a trophy cup.
   if (key === "wins") return s + '<path d="M8 21h8M12 17v4M7 4h10v4a5 5 0 0 1-10 0z"></path><path d="M7 6H4v1a4 4 0 0 0 3 3.9M17 6h3v1a4 4 0 0 1-3 3.9"></path></svg>';
@@ -69,7 +79,7 @@ export function sidebar(active, { isAdmin = false, demo = false } = {}) {
   return `<div class="app"><nav class="side">
   <div class="brand"><span class="bmark"><svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linejoin="round" aria-hidden="true"><path d="M6 3h12l3 6-9 12L3 9z"/><path d="M3 9h18M9 3l-2 6 5 12 5-12-2-6"/></svg></span><span class="bname">Prospector</span></div>
   ${link("/", "search", "Search")}
-  ${link("/leads", "leads", "Leads")}
+  ${link("/leads", "leads", "Companies")}
   ${link("/wins", "wins", "Wins")}
   ${isAdmin ? link("/admin", "admin", "Admin") : ""}
   <div class="grow"></div>

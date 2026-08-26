@@ -76,7 +76,7 @@ function iconScript(keys, size = 15) {
 const CRM_BUCKETS = store.CRM_BUCKETS;
 const BUCKET_META = {
   qualified: {
-    title: "No-website leads",
+    title: "No-website companies",
     sub: "no website and still active, the ones worth calling first",
   },
   inactive: {
@@ -656,7 +656,7 @@ ${TABLE_CSS}
   .cotools .moveall{margin-left:auto}
   table.cotable{min-width:940px}
   /* Fixed column widths, sized so nothing needs a scrollbar at a normal desktop width.
-     The action column is budgeted for its widest state: "In your leads" plus dismiss. */
+     The action column is budgeted for its widest state: "In your companies" plus dismiss. */
   table.cotable th:nth-child(1),table.cotable td:nth-child(1){width:22%}
   table.cotable th:nth-child(2),table.cotable td:nth-child(2){width:9%}
   table.cotable th:nth-child(3),table.cotable td:nth-child(3){width:10%}
@@ -714,7 +714,7 @@ ${sidebar("search", { isAdmin: req.isAdmin, demo: req.isDemo })}<div class="page
 </div>
 
 <details class="explain">
-  <summary><span class="ex-ttl">What counts as a lead?</span><span class="ex-sub">a business must pass all 3 checks to be a top prospect</span></summary>
+  <summary><span class="ex-ttl">What counts as a top prospect?</span><span class="ex-sub">a business must pass all 3 checks below</span></summary>
   <div class="ex-body">
     <div class="ex-item"><span class="ex-num">1</span><div><b>It's one of your trades</b><p>${explainNiches}</p></div></div>
     <div class="ex-item"><span class="ex-num">2</span><div><b>It has no real website</b><p>A Facebook, Instagram, or Yelp page doesn't count. We're after businesses with no website of their own, so you can offer to build them one.</p></div></div>
@@ -787,7 +787,7 @@ function stErr(msg){st('<span class="statuserr">'+ICONS.warn+' '+esc(msg||'Somet
 function estSeconds(sources,depth){return Math.round(sources*(18+depth*1.1)+35);}
 function fmtMin(sec){return Math.max(1,Math.round(sec/60))+' min';}
 function mmss(s){var m=Math.floor(s/60),x=s%60;return m+':'+(x<10?'0':'')+x;}
-var PROG_STAGES=['Scanning Google Maps\u2026','Checking Facebook pages\u2026','Checking Instagram profiles\u2026','Dropping businesses that already have a website\u2026','Checking who is still active\u2026','Putting your leads together\u2026'];
+var PROG_STAGES=['Scanning Google Maps\u2026','Checking Facebook pages\u2026','Checking Instagram profiles\u2026','Dropping businesses that already have a website\u2026','Checking who is still active\u2026','Putting your list together\u2026'];
 var progTimer=null;
 function startProgress(expSec){
   var t0=Date.now();
@@ -1028,8 +1028,8 @@ function doneHtml(key,added,skipped){
   var meta=BUCKETS[key]||{title:key};
   var extra=skipped?', <span class="muted"><b>'+skipped+'</b> already in your CRM</span>':'';
   return '<div class="grp-done" id="done-'+key+'"><span class="ok">'+ICONS.check+'</span>'+
-    '<span>'+esc(meta.title)+': <b>'+added+'</b> moved to your leads'+extra+'</span>'+
-    '<a href="/leads">Open leads</a></div>';
+    '<span>'+esc(meta.title)+': <b>'+added+'</b> moved to your companies'+extra+'</span>'+
+    '<a href="/leads">Open companies</a></div>';
 }
 
 // ── One row ──
@@ -1054,7 +1054,7 @@ function row(p,bucket){
     ? '<button class="hide" onclick="hideLead(\\''+p.id+'\\')" title="Mark off so it never shows in a future search">'+ICONS.x+'</button>'
     : '';
   var addBtn = p.saved||p.moved
-    ? '<button class="save saved-on" id="s-'+p.id+'" disabled>'+ICONS.check+' In your leads</button>'
+    ? '<button class="save saved-on" id="s-'+p.id+'" disabled>'+ICONS.check+' In your companies</button>'
     : '<button class="save" id="s-'+p.id+'" onclick="addLead(\\''+p.id+'\\',\\''+bucket+'\\')">'+ICONS.crm+' Add</button>';
   // License/registration signal, from the business's own profile text. Only worth a
   // badge when there is one; "nothing found" is the normal case and just adds noise.
@@ -1119,14 +1119,14 @@ async function addLead(id,bucket){
   var r=await post('/api/crm/move',{prospects:[p],bucket:bucket});
   if(!r||!r.ok){if(b){b.disabled=false;b.innerHTML=ICONS.warn+' Try again'}return}
   p.moved=true;
-  if(b){b.innerHTML=ICONS.check+' In your leads';b.classList.add('saved-on');b.onclick=null}
+  if(b){b.innerHTML=ICONS.check+' In your companies';b.classList.add('saved-on');b.onclick=null}
   paintTabs(); // one fewer left in this list
 }
 
 function render(s,prospects,mode){
   document.getElementById('statsWrap').innerHTML=
     '<div class="stats" style="grid-template-columns:repeat(3,1fr)">'+
-    stat(s.qualified,'No-website leads','good')+stat(s.scanned||0,'Scanned')+stat(s.hasWebsite!=null?s.hasWebsite:0,'Already had a site')+
+    stat(s.qualified,'No-website companies','good')+stat(s.scanned||0,'Scanned')+stat(s.hasWebsite!=null?s.hasWebsite:0,'Already had a site')+
     '</div>';
   // After a search the user just ran, glide down to the results so they don't have to
   // scroll to find them. Skip on 'restored' (that fires on page load, so jumping would jar).
@@ -1318,10 +1318,10 @@ function renderCrmRow(l) {
     <td class="c-name"><span class="c-nm">${esc(l.name)}</span>${tags}</td>
     <td>${mutedCell(place)}</td>
     <td>${mutedCell(l.phone)}</td>
-    <td><select class="stage" title="Where this lead stands" onchange="setStage(${l.id},this.value)">${opts}</select></td>
+    <td><select class="stage" title="Where this company stands" onchange="setStage(${l.id},this.value)">${opts}</select></td>
     <td class="fucell">${fuCell}</td>
-    <td class="c-note"><button type="button" class="notebtn${notes ? " on" : ""}" id="nb-${l.id}" aria-expanded="false" aria-controls="note-${l.id}" title="${notes ? "Notes on this lead" : "Add notes"}" onclick="toggleNote(${l.id})">${icon("note", 14)}</button></td>
-    <td class="c-act"><div class="actwrap">${followMenu(l.id)}<select class="movebucket" title="Move this lead to another list" onchange="moveBucket(${l.id},this.value,this)"><option value="">Move to</option>${moveOpts}</select><button class="rm" onclick="removeCrm(${l.id})">Remove</button></div></td>
+    <td class="c-note"><button type="button" class="notebtn${notes ? " on" : ""}" id="nb-${l.id}" aria-expanded="false" aria-controls="note-${l.id}" title="${notes ? "Notes on this company" : "Add notes"}" onclick="toggleNote(${l.id})">${icon("note", 14)}</button></td>
+    <td class="c-act"><div class="actwrap">${followMenu(l.id)}<select class="movebucket" title="Move this company to another list" onchange="moveBucket(${l.id},this.value,this)"><option value="">Move to</option>${moveOpts}</select><button class="rm" onclick="removeCrm(${l.id})">Remove</button></div></td>
   </tr>
   <tr class="noterow" id="note-${l.id}" hidden><td class="notecell" colspan="${CRM_COLS}">
     <div class="notepanel">
@@ -1336,12 +1336,12 @@ function renderCrmRow(l) {
 // Two tail rows ride along: the empty-state line, and the no-match line the filter shows.
 function crmTable(bucket, list, rows) {
   const empty =
-    list === "working" ? "Nothing in the working list right now." : "No follow-ups scheduled here yet.";
+    list === "working" ? "Nothing in the working list." : "No follow-ups scheduled in this list.";
   return `<div class="cotwrap"><table class="cotable">
     <thead><tr><th>Company name</th><th>City, state</th><th>Phone</th><th>Stage</th><th>Follow up</th><th>Notes</th><th class="c-act"></th></tr></thead>
     <tbody id="tb-${bucket}-${list}">${rows.map(renderCrmRow).join("")}<tr class="emptyrow"${
       rows.length ? ' style="display:none"' : ""
-    }><td colspan="${CRM_COLS}">${empty}</td></tr><tr class="norow gone"><td colspan="${CRM_COLS}" class="co-empty">No leads here match that search.</td></tr></tbody>
+    }><td colspan="${CRM_COLS}">${empty}</td></tr><tr class="norow gone"><td colspan="${CRM_COLS}" class="co-empty">No companies here match that search.</td></tr></tbody>
   </table></div>`;
 }
 
@@ -1349,23 +1349,69 @@ function sumText(working, followups) {
   return `${working} working, ${followups} follow-up${followups === 1 ? "" : "s"}`;
 }
 
-// One bucket's whole content: the filter toolbar, then the working table, then the
-// follow-ups table. Every bucket is rendered, and all but the selected one is hidden, so
-// a row can move to another bucket's list without a reload and the counts still add up.
+// How many of a bucket's follow-ups have come due: anything dated today or earlier.
+// This is the number the segmented toggle puts in a warn-coloured chip, and the reason a
+// bucket opens on its follow-ups instead of its working list.
+function dueCount(followups) {
+  const endOfToday = new Date();
+  endOfToday.setHours(23, 59, 59, 999);
+  let n = 0;
+  for (const l of followups) {
+    const ts = parseStamp(l.follow_up_at);
+    if (ts != null && ts <= endOfToday.getTime()) n++;
+  }
+  return n;
+}
+
+// Which list a bucket opens on. Working is the everyday case, but a follow-up that has
+// come due is the whole reason to be on this page, so a bucket holding one opens there.
+function defaultSeg(data) {
+  return dueCount(data.followups || []) ? "followups" : "working";
+}
+
+// ── The segmented toggle ──
+// One bucket holds two lists, and only one of them is on screen. This is the switch: a
+// small pill-shaped pair sitting on the filter toolbar, deliberately quieter than the
+// underlined bucket tabs above it so the hierarchy reads bucket first, list second.
+// The follow-ups half carries a warn-coloured "N due" chip whenever anything has come due.
+function segBar(key, workingN, followupsN, due, seg) {
+  const one = (list, label, n, extra) =>
+    `<button type="button" class="lseg${seg === list ? " on" : ""}" id="sg-${key}-${list}" role="tab" aria-selected="${
+      seg === list ? "true" : "false"
+    }" aria-controls="list-${key}-${list}" onclick="pickSeg('${key}','${list}')">${label}<span class="sg-n" id="sgn-${key}-${list}">(${n})</span>${extra}</button>`;
+  const chip = `<span class="sg-due" id="sgd-${key}"${due ? "" : " hidden"}>${due} due</span>`;
+  return `<div class="lsegs" id="seg-${key}" role="tablist" aria-label="Working list or follow-ups">${one(
+    "working",
+    "Working",
+    workingN,
+    ""
+  )}${one("followups", "Follow-ups", followupsN, chip)}</div>`;
+}
+
+// One bucket's whole content: the toggle and filter toolbar, then whichever of the two
+// lists is selected, full width. Both tables stay in the page (the hidden one included),
+// so a row can move between lists or buckets without a reload and the counts still add up.
 function bucketPane(key, data, active) {
   const working = data.working || [];
   const followups = data.followups || [];
   const all = working.length + followups.length;
+  const seg = defaultSeg(data);
+  const pane = (list, body) =>
+    `<div class="lwrap" id="list-${key}-${list}" role="tabpanel" aria-labelledby="sg-${key}-${list}"${
+      seg === list ? "" : " hidden"
+    }>${body}</div>`;
   return `<div class="lpane" id="pane-${key}" role="tabpanel" aria-labelledby="bt-${key}"${active ? "" : " hidden"}>
   <div id="body-${key}"${all ? "" : " hidden"}>
     <div class="cotools">
-      <div class="cofind"><span class="cf-i">${icon("search", 14)}</span><input id="find-${key}" type="text" autocomplete="off" placeholder="Search these leads" oninput="filterRows('${key}')"></div>
+      ${segBar(key, working.length, followups.length, dueCount(followups), seg)}
+      <div class="cofind"><span class="cf-i">${icon("search", 14)}</span><input id="find-${key}" type="text" autocomplete="off" placeholder="Search these companies" oninput="filterRows('${key}')"></div>
       <div class="cosum" id="sum-${key}">${sumText(working.length, followups.length)}</div>
     </div>
-    <div class="lsub">Working <span class="cnt" id="cnt-${key}-working">${working.length}</span></div>
-    ${crmTable(key, "working", working)}
-    <div class="lsub" id="fus-${key}">Follow-ups <span class="cnt" id="cnt-${key}-followups">${followups.length}</span> <span class="lsubnote">soonest first</span></div>
-    ${crmTable(key, "followups", followups)}
+    ${pane("working", crmTable(key, "working", working))}
+    ${pane(
+      "followups",
+      `<div class="lnote">Soonest first, so anything due sits at the top.</div>${crmTable(key, "followups", followups)}`
+    )}
   </div>
   <div class="co-empty" id="none-${key}"${all ? " hidden" : ""}>Nothing in this list yet. Move companies over from a search.</div>
 </div>`;
@@ -1422,18 +1468,18 @@ async function renderLeadsPage(req) {
   const [crmRaw, reminders] = await Promise.all([store.listCrm(req.userId), store.listFollowups(req.userId)]);
   const crm = normalizeCrm(crmRaw);
 
-  const endOfToday = new Date();
-  endOfToday.setHours(23, 59, 59, 999);
   let total = 0;
   let scheduled = 0;
   let dueNow = 0;
+  // Which list each bucket opens on. Working by default; a bucket with a follow-up that
+  // has come due opens on its follow-ups instead, and the page script keeps this object
+  // up to date as the user flips segments during the visit.
+  const segs = {};
   for (const b of CRM_BUCKETS) {
     total += crm[b].working.length + crm[b].followups.length;
     scheduled += crm[b].followups.length;
-    for (const l of crm[b].followups) {
-      const ts = parseStamp(l.follow_up_at);
-      if (ts != null && ts <= endOfToday.getTime()) dueNow++;
-    }
+    dueNow += dueCount(crm[b].followups);
+    segs[b] = defaultSeg(crm[b]);
   }
   const openReminders = reminders.filter((f) => !f.done).length;
   // The header carries the total, so this line covers only what's scheduled.
@@ -1449,7 +1495,7 @@ async function renderLeadsPage(req) {
   const tabs = bucketTabs(crm, activeTab);
   const panes = CRM_BUCKETS.map((b) => bucketPane(b, crm[b], b === activeTab)).join("");
 
-  return `<!doctype html><html><head>${THEME_INIT_SCRIPT}<meta charset="utf-8">${FAVICON}<title>Prospector · Leads</title>
+  return `<!doctype html><html><head>${THEME_INIT_SCRIPT}<meta charset="utf-8">${FAVICON}<title>Prospector · Companies</title>
 <style>
   :root{--gold:#14FFB9;--bg:#0a1124;--panel:#0f1a30;--border:rgba(20,255,185,.22);--text:#e8eaf0;--muted:#7b8499}
   *{box-sizing:border-box;margin:0;padding:0}
@@ -1469,10 +1515,23 @@ ${TABLE_CSS}
   .leadline b{color:var(--text)}
   /* The toolbar's right-hand side is a read-out here, not a button. */
   .cosum{margin-left:auto;font-size:13px;color:var(--muted);white-space:nowrap}
-  /* The two lists inside one bucket. */
-  .lsub{display:flex;align-items:center;gap:8px;margin:20px 0 0;font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;color:var(--muted)}
-  .lsub .cnt{background:var(--surface2);color:var(--muted);border-radius:20px;padding:1px 8px;font-size:11px;letter-spacing:0}
-  .lsub .lsubnote{text-transform:none;letter-spacing:0;font-weight:500;color:var(--faint)}
+  /* ── The segmented toggle: which of the bucket's two lists is on screen ──
+     Pill-shaped and a size down from the underlined bucket tabs above it, so the two
+     levels never read as the same control. The selected half is lifted out of the track
+     rather than underlined, which is the other half of keeping them apart. */
+  .lsegs{display:inline-flex;align-items:center;gap:2px;flex:none;background:var(--surface2);border:1px solid var(--border);border-radius:999px;padding:3px}
+  .lseg{display:inline-flex;align-items:center;gap:6px;font-family:inherit;background:transparent;border:0;border-radius:999px;padding:6px 13px;font-size:12.5px;font-weight:600;color:var(--muted);cursor:pointer;white-space:nowrap}
+  .lseg:hover{color:var(--text)}
+  .lseg.on{background:var(--surface);color:var(--text);box-shadow:inset 0 0 0 1px var(--border-strong)}
+  .lseg .sg-n{font-size:12px;font-weight:600;color:var(--faint)}
+  .lseg.on .sg-n{color:var(--muted)}
+  /* The due chip. Warn colours, so a follow-up that has come due pulls the eye even
+     while the working list is the one showing. */
+  .lseg .sg-due{background:var(--warn-weak);color:var(--warn);border-radius:999px;padding:1px 8px;font-size:11.5px;font-weight:700;letter-spacing:.1px}
+  .lseg .sg-due[hidden]{display:none}
+  /* The one-line note above the follow-ups table. */
+  .lnote{margin:14px 0 0;font-size:12.5px;color:var(--faint)}
+  .lnote+.cotwrap{margin-top:9px}
   /* Wider than the Search table: these rows carry three live controls, and the action
      column is budgeted for all three of them side by side. */
   table.cotable{min-width:1040px}
@@ -1495,9 +1554,11 @@ ${TABLE_CSS}
   .rm:hover{color:var(--danger);border-color:var(--danger)}
   /* ── Notes: a button in the row, the editor in a full-width row underneath ── */
   .cotable td.c-note{padding-right:8px}
-  .notebtn{display:inline-flex;align-items:center;justify-content:center;width:32px;height:32px;background:transparent;border:1px solid var(--border);border-radius:8px;color:var(--faint);cursor:pointer;font-family:inherit}
+  .notebtn{position:relative;display:inline-flex;align-items:center;justify-content:center;width:32px;height:32px;background:transparent;border:1px solid var(--border);border-radius:8px;color:var(--faint);cursor:pointer;font-family:inherit}
   .notebtn:hover{color:var(--text);border-color:var(--border-strong)}
   .notebtn.on{background:var(--accent-weak);border-color:transparent;color:var(--accent-ink)}
+  /* A filled button plus a dot: at a glance, this company already has notes on it. */
+  .notebtn.on::after{content:"";position:absolute;top:-3px;right:-3px;width:7px;height:7px;border-radius:50%;background:var(--accent);border:1.5px solid var(--panel)}
   .crmrow.noteon .notebtn{color:var(--text);border-color:var(--border-strong)}
   .cotable td.notecell{height:auto;padding:0 0 14px}
   .cotable tbody tr.noterow:hover{background:transparent}
@@ -1540,12 +1601,12 @@ ${TABLE_CSS}
   .fu-del{color:var(--muted)}.fu-del:hover{color:#e05b5b;border-color:#e05b5b}
   @media(max-width:820px){.fu-add{grid-template-columns:1fr}}
 ${SHARED_CSS}</style></head><body>
-${sidebar("leads", { isAdmin: req.isAdmin, demo: req.isDemo })}<div class="pagehead"><div class="titlewrap"><h1>Leads</h1><div class="pagesub">The businesses you're working, and when to call them back</div></div><div class="spacer"></div></div>
+${sidebar("leads", { isAdmin: req.isAdmin, demo: req.isDemo })}<div class="pagehead"><div class="titlewrap"><h1>Companies</h1><div class="pagesub">The businesses you're working, and when to call them back</div></div><div class="spacer"></div></div>
 
 <section class="copanel" id="followups">
   <div class="cohead"><span class="co-ic">${icon("companies")}</span>
-    <span class="co-ttl">Leads</span>
-    <span class="co-n" id="leadTotal">${total.toLocaleString()} lead${total === 1 ? "" : "s"}</span></div>
+    <span class="co-ttl">Companies</span>
+    <span class="co-n" id="leadTotal">${total.toLocaleString()} compan${total === 1 ? "y" : "ies"}</span></div>
   <div class="leadline">${stats}</div>
   ${tabs}
   ${panes}
@@ -1574,6 +1635,10 @@ async function post(url,data){var r=await fetch(url,{method:'POST',headers:{'Con
 var BUCKET_KEYS=${JSON.stringify(CRM_BUCKETS)};
 var BUCKETS=${JSON.stringify(BUCKET_META)};
 var TAB=${JSON.stringify(activeTab)};
+// Which list each bucket is showing. Seeded server-side (working, unless that bucket has
+// a follow-up that has come due) and then kept per bucket for the rest of the visit, so
+// leaving a bucket and coming back lands on the list you left it on.
+var SEG=${JSON.stringify(segs)};
 
 // ── bucket tabs ──
 // Every bucket's tables stay in the page, hidden, so a row can be sent to another
@@ -1585,6 +1650,21 @@ function pickTab(key){
     if(p)p.hidden=b!==key;
     var t=document.getElementById('bt-'+b);
     if(t){t.classList.toggle('on',b===key);t.setAttribute('aria-selected',b===key?'true':'false')}
+  });
+  closeMenus();
+  filterRows(key);
+}
+
+// ── the segmented toggle ──
+// Flip one bucket between its working list and its follow-ups. Both tables stay in the
+// page either way, so this is only a matter of which one is hidden.
+function pickSeg(key,list){
+  SEG[key]=list;
+  ['working','followups'].forEach(function(l){
+    var w=document.getElementById('list-'+key+'-'+l);
+    if(w)w.hidden=l!==list;
+    var b=document.getElementById('sg-'+key+'-'+l);
+    if(b){b.classList.toggle('on',l===list);b.setAttribute('aria-selected',l===list?'true':'false')}
   });
   closeMenus();
   filterRows(key);
@@ -1604,7 +1684,9 @@ function refreshKey(row){
 }
 function leadId(row){return String(row.id||'').slice(4)}
 function noteRow(row){return document.getElementById('note-'+leadId(row))}
-// Notes live in a row that expands under the lead's own row.
+// Notes live in a row that expands under the company's own row. Opening one is a single
+// click from anywhere in either list, and the textarea takes focus straight away with the
+// caret after whatever is already there, so a note can be typed without a second click.
 function toggleNote(id){
   var row=document.getElementById('crm-'+id);
   if(!row)return;
@@ -1613,7 +1695,10 @@ function toggleNote(id){
   var b=document.getElementById('nb-'+id);
   if(b)b.setAttribute('aria-expanded',on?'true':'false');
   syncNote(row);
-  if(on){var t=document.getElementById('nt-'+id);if(t)t.focus()}
+  if(on){
+    var t=document.getElementById('nt-'+id);
+    if(t){t.focus();try{t.setSelectionRange(t.value.length,t.value.length)}catch(e){}}
+  }
 }
 // That row shows only while its lead row is both expanded and past the filter.
 function syncNote(row){
@@ -1628,7 +1713,7 @@ async function saveNote(id){
   var row=document.getElementById('crm-'+id);
   if(row){row.setAttribute('data-notes',v);refreshKey(row)}
   var b=document.getElementById('nb-'+id);
-  if(b){b.classList.toggle('on',!!v.trim());b.title=v.trim()?'Notes on this lead':'Add notes'}
+  if(b){b.classList.toggle('on',!!v.trim());b.title=v.trim()?'Notes on this company':'Add notes'}
   var ok=document.getElementById('nok-'+id);
   if(ok){ok.textContent='Saved';clearTimeout(ok._t);ok._t=setTimeout(function(){ok.textContent=''},1600)}
 }
@@ -1725,6 +1810,15 @@ function sortFollowups(tb){
   keepTail(tb);
 }
 function sumText(w,f){return w+' working, '+f+' follow-up'+(f===1?'':'s')}
+// How many of a bucket's follow-ups have come due, read straight off the rows' data-fu
+// stamps so it stays right after a row is scheduled, cleared or moved. Mirrors the
+// server's dueCount().
+function dueOf(b){
+  var tb=document.getElementById('tb-'+b+'-followups');
+  if(!tb)return 0;
+  var end=new Date();end.setHours(23,59,59,999);end=end.getTime();
+  return dataRows(tb).filter(function(r){var t=Number(r.getAttribute('data-fu'))||0;return t>0&&t<=end}).length;
+}
 // Repaint every bucket's counts and empty states, then re-apply each one's filter.
 function paintCounts(){
   var grand=0;
@@ -1734,9 +1828,12 @@ function paintCounts(){
       var tb=document.getElementById('tb-'+b+'-'+list);
       if(!tb)return;
       n[list]=dataRows(tb).length;
-      var c=document.getElementById('cnt-'+b+'-'+list);
-      if(c)c.textContent=n[list];
+      var c=document.getElementById('sgn-'+b+'-'+list);
+      if(c)c.textContent='('+n[list]+')';
     });
+    var due=dueOf(b);
+    var chip=document.getElementById('sgd-'+b);
+    if(chip){chip.textContent=due+' due';chip.hidden=!due}
     var all=n.working+n.followups;
     grand+=all;
     var t=document.getElementById('bt-'+b);
@@ -1754,7 +1851,7 @@ function paintCounts(){
     filterRows(b);
   });
   var tot=document.getElementById('leadTotal');
-  if(tot)tot.textContent=grand.toLocaleString()+' lead'+(grand===1?'':'s');
+  if(tot)tot.textContent=grand.toLocaleString()+' compan'+(grand===1?'y':'ies');
 }
 // The "no website" tag is true of every bucket except "has a website", so it has to
 // follow a row that is moved between them.
@@ -1835,7 +1932,9 @@ function filterRows(key){
 }
 paintCounts();
 // /crm?view=followup and /leads?view=followup both land here. Open the first bucket that
-// actually has follow-ups and put that list on screen.
+// actually has follow-ups and flip it to its follow-ups segment. The panel itself carries
+// the #followups id, so the browser's own jump already puts the toggle and the table on
+// screen and nothing else needs scrolling.
 if(location.hash==='#followups'){
   var fuTab='';
   for(var fi=0;fi<BUCKET_KEYS.length;fi++){
@@ -1844,10 +1943,7 @@ if(location.hash==='#followups'){
   }
   if(fuTab){
     pickTab(fuTab);
-    var fuHead=document.getElementById('fus-'+fuTab);
-    // The browser does its own jump to #followups as the page loads, so this one waits
-    // until that is done and then lands on the follow-ups list itself.
-    if(fuHead)window.addEventListener('load',function(){setTimeout(function(){fuHead.scrollIntoView({block:'start'})},0)});
+    pickSeg(fuTab,'followups');
   }
 }
 </script>${SHELL_TAIL_SCRIPT}</main></div></body></html>`;
