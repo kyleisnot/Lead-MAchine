@@ -50,6 +50,13 @@ function icon(key, size = 15) {
     badge: '<rect x="2" y="5" width="20" height="14" rx="2"></rect><circle cx="8.5" cy="12" r="2.5"></circle><path d="M14 10.5h4M14 14h4"></path>',
     calendar: '<rect x="3" y="5" width="18" height="16" rx="2"></rect><path d="M3 10h18M8 3v4M16 3v4"></path>',
     refresh: '<path d="M21 12a9 9 0 1 1-2.6-6.4"></path><polyline points="21 3 21 9 15 9"></polyline>',
+    // A tall business tower with window ticks next to a small house: the mix of
+    // local businesses a scan turns up, and the mark for the Companies table.
+    companies:
+      '<path d="M3 21V5a2 2 0 0 1 2-2h5a2 2 0 0 1 2 2v16"></path>' +
+      '<path d="M6 7h1M9 7h1M6 11h1M9 11h1M6 15h1M9 15h1"></path>' +
+      '<path d="M15 21v-6.6l3-2.4 3 2.4V21"></path><path d="M18 21v-3"></path>' +
+      '<path d="M2 21h20"></path>',
   };
   return s + (paths[key] || "") + "</svg>";
 }
@@ -586,29 +593,69 @@ async function renderSearchPage(req) {
   .srchbar .sb-go{display:inline-flex;align-items:center;gap:7px;font-family:inherit;margin-left:auto;background:transparent;border:1px solid var(--border);color:var(--text);border-radius:8px;padding:8px 15px;font-size:13px;font-weight:600;cursor:pointer;white-space:nowrap;flex:none}
   .srchbar .sb-go:hover{border-color:var(--accent);color:var(--accent)}
 
-  /* Jump buttons: pick a list and the page glides to that column. */
-  .colnav{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 14px}
-  .colnav .cn{display:inline-flex;align-items:center;gap:8px;font-family:inherit;background:var(--panel);border:1px solid var(--border);color:var(--text);border-radius:999px;padding:8px 15px;font-size:13px;font-weight:600;cursor:pointer}
-  .colnav .cn:hover:not(:disabled){border-color:var(--accent)}
-  .colnav .cn.on{border-color:var(--accent);background:var(--accent-weak);color:var(--accent-ink)}
-  .colnav .cn:disabled{opacity:.45;cursor:default}
-  .colnav .cn-n{background:var(--bg);border-radius:999px;padding:1px 9px;font-size:12px;font-weight:700}
-  .colnav .cn.on .cn-n{background:var(--panel)}
+  /* ── Companies: one full-width table, one bucket on screen at a time ── */
+  .copanel{background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:18px 20px 20px}
+  .cohead{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  .cohead .co-ic{display:inline-flex;color:var(--muted);flex:none}
+  .cohead .co-ic svg{width:19px;height:19px}
+  .cohead .co-ttl{font-size:17px;font-weight:700;letter-spacing:-.2px;color:var(--text)}
+  .cohead .co-n{font-size:13px;font-weight:500;color:var(--muted)}
+  .copanel .scanline{margin:8px 0 0}
 
-  /* The three result columns. */
-  .cols{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px;align-items:start}
-  .col{background:var(--panel);border:1px solid var(--border);border-radius:14px;overflow:hidden;scroll-margin-top:16px;transition:border-color .25s}
-  .col.flash{border-color:var(--accent)}
-  .colhead{padding:14px 16px;border-bottom:1px solid var(--border)}
-  .colhead .ch-top{display:flex;align-items:center;gap:10px}
-  .colhead .col-ttl{font-size:14px;font-weight:700;color:var(--text)}
-  .colhead .col-n{background:var(--surface);color:var(--muted);border-radius:999px;padding:1px 9px;font-size:12px;font-weight:700}
-  .col-lead .colhead .col-n{background:var(--accent-weak);color:var(--accent-ink)}
-  .colhead .col-sub{margin:6px 0 11px;font-size:12px;color:var(--muted);line-height:1.45}
-  .colhead .moveall{width:100%;justify-content:center}
-  .col-body{padding:12px;display:flex;flex-direction:column;gap:10px;max-height:70vh;overflow-y:auto}
-  .col-body .lead{margin:0;grid-template-columns:1fr;gap:10px}
-  @media (max-width:1150px){.cols{grid-template-columns:1fr}.col-body{max-height:none}}
+  /* Bucket tabs: the selected one carries a dark underline sitting on the bar's hairline. */
+  .btabs{display:flex;flex-wrap:wrap;gap:24px;border-bottom:1px solid var(--border);margin:15px 0 0}
+  .btab{position:relative;display:inline-flex;align-items:center;gap:7px;font-family:inherit;background:none;border:0;padding:0 0 11px;font-size:14px;font-weight:600;color:var(--muted);cursor:pointer}
+  .btab:hover{color:var(--text)}
+  .btab.on{color:var(--text)}
+  .btab.zero{color:var(--faint)}
+  .btab.zero:hover{color:var(--muted)}
+  .btab .bt-n{font-size:13px;font-weight:600;color:var(--faint)}
+  .btab.on .bt-n{color:var(--muted)}
+  .btab .bt-u{position:absolute;left:0;right:0;bottom:-1px;height:3px;border-radius:2px;background:transparent}
+  .btab.on .bt-u{background:var(--text)}
+
+  /* Toolbar: filter what's on screen, or move the whole list over in one go. */
+  .cotools{display:flex;align-items:center;flex-wrap:wrap;gap:12px;margin:16px 0 0}
+  .cofind{position:relative;flex:1 1 260px;min-width:190px;max-width:400px}
+  .cofind .cf-i{position:absolute;left:13px;top:50%;transform:translateY(-50%);display:inline-flex;color:var(--faint);pointer-events:none}
+  .cofind input{width:100%;border-radius:999px;padding:9px 14px 9px 37px;font-size:13.5px}
+  .cotools .moveall{margin-left:auto}
+
+  /* The table. Narrow screens scroll the table itself, never the whole page. */
+  .cotwrap{overflow-x:auto;margin-top:14px;border-top:1px solid var(--border)}
+  table.cotable{width:100%;min-width:940px;border-collapse:collapse;background:transparent;border:0;table-layout:fixed}
+  table.cotable th{text-align:left;font-size:12px;font-weight:700;color:var(--muted);white-space:nowrap;padding:11px 14px 11px 0;border-bottom:1px solid var(--border);background:transparent;position:static}
+  table.cotable td{height:52px;vertical-align:middle;padding:8px 14px;padding-left:0;border-bottom:1px solid var(--border);font-size:13.5px;color:var(--muted)}
+  table.cotable tbody tr:nth-child(even){background:transparent}
+  table.cotable tbody tr:hover{background:var(--surface2)}
+  table.cotable tbody tr.norow:hover{background:transparent}
+  table.cotable tr.gone{display:none}
+  /* Fixed column widths, sized so nothing needs a scrollbar at a normal desktop width.
+     The action column is budgeted for its widest state: "In your leads" plus dismiss. */
+  table.cotable th:nth-child(1),table.cotable td:nth-child(1){width:22%}
+  table.cotable th:nth-child(2),table.cotable td:nth-child(2){width:9%}
+  table.cotable th:nth-child(3),table.cotable td:nth-child(3){width:10%}
+  table.cotable th:nth-child(4),table.cotable td:nth-child(4){width:12%;white-space:nowrap}
+  table.cotable th:nth-child(5),table.cotable td:nth-child(5){width:13%;overflow-wrap:anywhere}
+  table.cotable th:nth-child(6),table.cotable td:nth-child(6){width:8%}
+  table.cotable th:nth-child(7),table.cotable td:nth-child(7){width:9%}
+  table.cotable th:nth-child(8),table.cotable td:nth-child(8){width:17%}
+  .cotable .c-name{line-height:1.35}
+  .cotable .c-nm{font-size:14px;font-weight:700;color:var(--text)}
+  .cotable .c-tags{display:flex;align-items:center;flex-wrap:wrap;gap:6px;margin-top:5px}
+  .cotable .c-tags .badge{margin-left:0;font-size:10.5px;padding:2px 7px}
+  .cotable .c-tags .lic-badge{font-size:10.5px;padding:1px 7px;max-width:118px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+  .cotable .c-mut{color:var(--muted)}
+  .cotable .c-ic{display:inline-flex;align-items:center;gap:5px;color:var(--muted)}
+  .cotable .c-em{color:var(--accent)}
+  .cotable .c-actv{display:inline-flex;align-items:center;flex-wrap:wrap;gap:4px 8px}
+  .cotable .fresh-badge{margin:0;font-size:11.5px;padding:2px 8px}
+  .cotable .c-act{text-align:right;white-space:nowrap;padding-right:0}
+  .cotable .c-act .save{padding:6px 11px;font-size:12px}
+  .cotable .c-act .hide{padding:6px 9px;font-size:12px;margin-left:6px}
+  .co-empty{padding:24px 0;color:var(--muted);font-size:14px}
+  .copanel .grp-done{margin:16px 0 0}
+  @media (max-width:760px){.copanel{padding:16px 14px}.btabs{gap:18px}}
   .save{display:inline-flex;align-items:center;gap:6px}
   .fresh-badge svg,.lic-badge svg,.save svg,.hide svg{flex:none}
   .lic-badge{display:inline-flex;align-items:center;gap:5px}
@@ -708,7 +755,7 @@ ${sidebar("search", { isAdmin: req.isAdmin, demo: req.isDemo })}<div class="page
   var NICHE_KEYS = ${JSON.stringify(NICHES.map((n) => n.key))};
   var RATE_PER_1K = ${RATE_PER_1K};
   var TOKENS_PER_USD = ${TOKENS_PER_USD};
-  ${iconScript(["crm", "check", "x", "warn", "clock", "mail", "dot", "badge", "refresh", "undo", "search"], 14)}
+  ${iconScript(["crm", "check", "x", "warn", "clock", "mail", "dot", "badge", "refresh", "undo", "search", "companies"], 14)}
   var BUCKETS = ${JSON.stringify(BUCKET_META)};
 </script>
 
@@ -863,7 +910,7 @@ function srcName(s){
 }
 // ── The collapsed search bar ──
 // Once results are on screen the form has done its job, so it folds into a one-line
-// summary and hands the whole viewport to the three columns.
+// summary and hands the whole viewport to the Companies table.
 function searchSummary(){
   var cities=parseCities().join(', ')||'anywhere';
   var stv=(document.getElementById('state').value||'').trim();
@@ -890,61 +937,147 @@ function openSearch(){
   p.scrollIntoView({behavior:'smooth',block:'start'});
 }
 
-// ── The three columns ──
-// One column per bucket, side by side, so the whole scan is visible at a glance
-// instead of buried in stacked accordions.
-function colNav(){
-  var btns=GROUP_KEYS.map(function(k){
-    var n=(GROUPS[k]||[]).length;
-    var meta=BUCKETS[k]||{title:k};
-    return '<button class="cn'+(k===firstFilled()?' on':'')+'" id="cn-'+k+'" '+
-      (n?'onclick="jumpCol(\\''+k+'\\')"':'disabled')+'>'+
-      esc(meta.title)+' <span class="cn-n">'+n+'</span></button>';
-  });
-  return '<div class="colnav">'+btns.join('')+'</div>';
-}
+// ── The Companies table ──
+// One full-width table instead of three cramped columns. The three buckets are the
+// different types of lead, and they sit behind tabs: only one list is on screen at a
+// time, so every business gets the whole row rather than a third of it.
+var TAB='qualified';   // which bucket's table is showing
+var MOVED={};          // bucket -> {added,skipped} once its "Move all" has gone through
 function firstFilled(){
   for(var i=0;i<GROUP_KEYS.length;i++){var k=GROUP_KEYS[i];if((GROUPS[k]||[]).length)return k}
   return GROUP_KEYS[0];
 }
-function jumpCol(key){
-  var el=document.getElementById('grp-'+key);
-  if(!el)return;
+// What a tab counts: businesses in that list you haven't taken yet.
+function leftIn(key){return (GROUPS[key]||[]).filter(function(p){return !p.moved}).length}
+function totalFound(){var n=0;GROUP_KEYS.forEach(function(k){n+=(GROUPS[k]||[]).length});return n}
+
+function tabsHtml(){
+  return '<div class="btabs" role="tablist">'+GROUP_KEYS.map(function(k){
+    var meta=BUCKETS[k]||{title:k};
+    var n=leftIn(k);
+    return '<button type="button" class="btab'+(k===TAB?' on':'')+(n?'':' zero')+'" id="bt-'+k+'" role="tab"'+
+      ' aria-selected="'+(k===TAB?'true':'false')+'" title="'+esc(meta.sub||'')+'"'+
+      ' onclick="pickTab(\\''+k+'\\')">'+esc(meta.title)+
+      '<span class="bt-n">'+n+'</span><span class="bt-u"></span></button>';
+  }).join('')+'</div>';
+}
+// Repaint the tab bar in place (selection and counts) without rebuilding the table.
+function paintTabs(){
   GROUP_KEYS.forEach(function(k){
-    var b=document.getElementById('cn-'+k);
-    if(b)b.classList.toggle('on',k===key);
+    var b=document.getElementById('bt-'+k);
+    if(!b)return;
+    var n=leftIn(k);
+    b.classList.toggle('on',k===TAB);
+    b.classList.toggle('zero',!n);
+    b.setAttribute('aria-selected',k===TAB?'true':'false');
+    var c=b.querySelector('.bt-n');
+    if(c)c.textContent=n;
   });
-  el.scrollIntoView({behavior:'smooth',block:'start'});
-  el.classList.add('flash');
-  setTimeout(function(){el.classList.remove('flash')},900);
 }
-function colSection(key){
+function pickTab(key){TAB=key;paintTabs();paintBody();}
+
+function toolsHtml(key){
+  var lead=key==='qualified';
+  return '<div class="cotools">'+
+    '<div class="cofind"><span class="cf-i">'+ICONS.search+'</span>'+
+      '<input id="cofind" type="text" autocomplete="off" placeholder="Search these results" oninput="filterRows()"></div>'+
+    '<button class="moveall'+(lead?'':' ghost')+'" id="mv-'+key+'" onclick="moveGroup(event,\\''+key+'\\')"'+
+      (leftIn(key)?'':' disabled')+'>'+ICONS.crm+' Move all to CRM</button>'+
+  '</div>';
+}
+function tableHtml(key,list){
+  return '<div class="cotwrap"><table class="cotable">'+
+    '<thead><tr><th>Company name</th><th>Trade</th><th>City, state</th><th>Phone</th>'+
+    '<th>Email</th><th>Source</th><th>Activity</th><th class="c-act"></th></tr></thead>'+
+    '<tbody id="corows">'+list.map(function(p){return row(p,key)}).join('')+
+      '<tr id="conone" class="norow gone"><td colspan="8" class="co-empty">No businesses here match that search.</td></tr>'+
+    '</tbody></table></div>';
+}
+// The table area for whichever tab is selected: the receipt if it's been moved, an
+// empty-state line if the scan put nothing here, otherwise the toolbar and the table.
+function paintBody(){
+  var host=document.getElementById('cobody');
+  if(!host)return;
+  var key=TAB;
+  if(MOVED[key]){host.innerHTML=doneHtml(key,MOVED[key].added,MOVED[key].skipped);return}
   var list=GROUPS[key]||[];
-  if(!list.length)return '';
-  var meta=BUCKETS[key]||{title:key,sub:''};
-  var first=key==='qualified';
-  return '<section class="col'+(first?' col-lead':'')+'" id="grp-'+key+'">'+
-    '<header class="colhead">'+
-      '<div class="ch-top"><span class="col-ttl">'+esc(meta.title)+'</span>'+
-      '<span class="col-n">'+list.length+'</span></div>'+
-      '<div class="col-sub">'+esc(meta.sub)+'</div>'+
-      '<button class="moveall'+(first?'':' ghost')+'" id="mv-'+key+'" onclick="moveGroup(event,\\''+key+'\\')">'+
-        ICONS.crm+' Move all to CRM</button>'+
-    '</header>'+
-    '<div class="col-body">'+list.map(function(p){return card(p,key)}).join('')+'</div>'+
-  '</section>';
+  if(!list.length){host.innerHTML='<div class="co-empty">Nothing in this list from the last scan.</div>';return}
+  host.innerHTML=toolsHtml(key)+tableHtml(key,list);
 }
-// Once a group has been moved, it shrinks to a single line so the eye moves on.
+// Once a list has been moved, its table shrinks to a one-line receipt so the eye moves on.
 function collapseGroup(key,added,skipped){
-  var el=document.getElementById('grp-'+key);
-  if(!el)return;
+  MOVED[key]={added:added,skipped:skipped};
+  paintTabs();
+  if(TAB===key)paintBody();
+}
+function doneHtml(key,added,skipped){
   var meta=BUCKETS[key]||{title:key};
   var extra=skipped?', <span class="muted"><b>'+skipped+'</b> already in your CRM</span>':'';
-  var done=document.createElement('div');
-  done.className='grp-done';
-  done.id='grp-'+key;
-  done.innerHTML='<span class="ok">'+ICONS.check+'</span><span>'+esc(meta.title)+': <b>'+added+'</b> moved to your leads'+extra+'</span><a href="/leads">Open leads</a>';
-  el.replaceWith(done);
+  return '<div class="grp-done" id="done-'+key+'"><span class="ok">'+ICONS.check+'</span>'+
+    '<span>'+esc(meta.title)+': <b>'+added+'</b> moved to your leads'+extra+'</span>'+
+    '<a href="/leads">Open leads</a></div>';
+}
+
+// ── One row ──
+function dash(){return '<span class="c-mut">--</span>'}
+function cell(v){return v?'<span class="c-mut">'+esc(String(v))+'</span>':dash()}
+// Why this business landed in the list it did, kept to one line.
+function activityCell(p){
+  if(p.activeStatus==='active'){
+    return '<span class="c-actv"><span class="fresh-badge fresh-active">'+ICONS.dot+' Active</span>'+
+      (p.lastActive?'<span class="c-mut">'+esc(p.lastActive)+'</span>':'')+'</span>';
+  }
+  if(p.lastActive)return '<span class="c-ic">'+ICONS.clock+' '+esc(p.lastActive)+'</span>';
+  return '<span class="c-mut">No dated activity</span>';
+}
+// What the toolbar search box matches against.
+function findKey(p){return [p.name,p.category,p.city,p.phone,p.email].filter(Boolean).join(' ').toLowerCase()}
+function row(p,bucket){
+  // Marking a business off works on its lead row, and a browsable "also seen" business
+  // doesn't have one yet (it gets a "w3" style id instead of a numeric one). Those get no
+  // dismiss button rather than a button that quietly does nothing.
+  var hideBtn = isStored(p.id)
+    ? '<button class="hide" onclick="hideLead(\\''+p.id+'\\')" title="Mark off so it never shows in a future search">'+ICONS.x+'</button>'
+    : '';
+  var addBtn = p.saved||p.moved
+    ? '<button class="save saved-on" id="s-'+p.id+'" disabled>'+ICONS.check+' In your leads</button>'
+    : '<button class="save" id="s-'+p.id+'" onclick="addLead(\\''+p.id+'\\',\\''+bucket+'\\')">'+ICONS.crm+' Add</button>';
+  // License/registration signal, from the business's own profile text. Only worth a
+  // badge when there is one; "nothing found" is the normal case and just adds noise.
+  var lic=p.license||{};
+  var licTxt = esc(lic.evidence||'licensed/registered');
+  var licBadge = lic.status==='mentioned'
+    ? '<span class="lic-badge lic-yes" title="Advertises: '+licTxt+'. Confirm it on the official search.">'+ICONS.badge+' '+licTxt+'</span>'
+    : '';
+  var tag = bucket==='has_website' ? '' : '<span class="badge">no website</span>';
+  var tags = (tag||licBadge) ? '<span class="c-tags">'+tag+licBadge+'</span>' : '';
+  var place=[p.city,p.state].filter(Boolean).join(', ');
+  return '<tr id="lead-'+p.id+'" data-k="'+esc(findKey(p))+'">'+
+    '<td class="c-name"><span class="c-nm">'+esc(p.name||'')+'</span>'+tags+'</td>'+
+    '<td>'+cell(p.category)+'</td>'+
+    '<td>'+cell(place)+'</td>'+
+    '<td>'+cell(p.phone)+'</td>'+
+    '<td>'+(p.email?'<span class="c-em" title="'+esc(p.email)+'">'+esc(p.email)+'</span>':dash())+'</td>'+
+    '<td>'+cell(srcName(p.source))+'</td>'+
+    '<td>'+activityCell(p)+'</td>'+
+    '<td class="c-act">'+addBtn+hideBtn+'</td>'+
+  '</tr>';
+}
+// Live filter over the visible table: plain case-insensitive substring, no debounce
+// needed at these list sizes.
+function filterRows(){
+  var tb=document.getElementById('corows');
+  if(!tb)return;
+  var box=document.getElementById('cofind');
+  var q=(box?box.value:'').trim().toLowerCase();
+  var rows=tb.querySelectorAll('tr[data-k]'),shown=0;
+  for(var i=0;i<rows.length;i++){
+    var hit=!q||rows[i].getAttribute('data-k').indexOf(q)>-1;
+    rows[i].classList.toggle('gone',!hit);
+    if(hit)shown++;
+  }
+  var none=document.getElementById('conone');
+  if(none)none.classList.toggle('gone',shown>0);
 }
 async function moveGroup(e,key){
   if(e){e.preventDefault();e.stopPropagation()}
@@ -973,6 +1106,7 @@ async function addLead(id,bucket){
   if(!r||!r.ok){if(b){b.disabled=false;b.innerHTML=ICONS.warn+' Try again'}return}
   p.moved=true;
   if(b){b.innerHTML=ICONS.check+' In your leads';b.classList.add('saved-on');b.onclick=null}
+  paintTabs(); // one fewer left in this list
 }
 
 function render(s,prospects,mode){
@@ -999,46 +1133,20 @@ function render(s,prospects,mode){
   st(msg+' &nbsp;<span class="muted">('+prospects.length+' shown)</span>'+hid+merged);
   // The value story first: how much ground the scan covered for them.
   var scanned=Number(s.scanned||0);
-  var head=scanned?'<div class="scanline">We scanned <b>'+scanned.toLocaleString()+' businesses</b> for you and sorted them into three lists.</div>':'';
-  document.getElementById('results').innerHTML=head+colNav()+'<div class="cols">'+GROUP_KEYS.map(colSection).join('')+'</div>';
+  var head=scanned?'<div class="scanline">We scanned <b>'+scanned.toLocaleString()+' businesses</b> for you and sorted them into the three lists below.</div>':'';
+  MOVED={};
+  TAB=firstFilled();
+  document.getElementById('results').innerHTML=
+    '<section class="copanel">'+
+      '<div class="cohead"><span class="co-ic">'+ICONS.companies+'</span>'+
+        '<span class="co-ttl">Companies</span>'+
+        '<span class="co-n">'+totalFound().toLocaleString()+' found</span></div>'+
+      head+tabsHtml()+'<div id="cobody"></div>'+
+    '</section>';
+  paintBody();
   collapseSearch();
 }
 function stat(n,l,cls){return '<div class="stat '+(cls||'')+'"><div class="n">'+n+'</div><div class="l">'+l+'</div></div>'}
-function card(p,bucket){
-  var email=p.email?'<span class="email">'+ICONS.mail+' '+esc(p.email)+'</span>':'<span class="noemail">no email found</span>';
-  var saveBtn=p.saved||p.moved
-    ? '<button class="save saved-on" id="s-'+p.id+'" disabled>'+ICONS.check+' In your leads</button>'
-    : '<button class="save" id="s-'+p.id+'" onclick="addLead(\\''+p.id+'\\',\\''+bucket+'\\')">'+ICONS.crm+' Add</button>';
-  // Activity badge: why this business landed in the list it did.
-  var fresh = p.activeStatus==='active'
-    ? '<span class="fresh-badge fresh-active">'+ICONS.dot+' Active · '+esc(p.lastActive)+(p.activeSignal?' · '+esc(p.activeSignal):'')+'</span>'
-    : p.lastActive
-    ? '<span class="fresh-badge fresh-stale">'+ICONS.clock+' Last seen '+esc(p.lastActive)+'</span>'
-    : '<span class="fresh-badge fresh-unknown">'+ICONS.clock+' no dated activity</span>';
-  // License/registration signal (best-effort, from the business's own profile text) plus a
-  // one-click link to verify it on an official search. Never hides a lead, just informs.
-  var lic=p.license||{};
-  var licBadge = lic.status==='mentioned'
-    ? '<span class="lic-badge lic-yes" title="What the business advertises. Confirm it with Verify.">'+ICONS.badge+' '+esc(lic.evidence||'licensed/registered')+'</span>'
-    : '<span class="lic-badge lic-no" title="Nothing found in their profile text. Check the official search.">'+ICONS.badge+' no license info</span>';
-  var lic_line = '<div style="margin-top:6px">'+licBadge+(p.licenseUrl?' <a class="lic-verify" href="'+p.licenseUrl+'" target="_blank" rel="noopener">Verify</a>':'')+'</div>';
-  var tag = bucket==='has_website' ? 'has a website' : 'no website';
-  // Marking a business off works on its lead row, and a browsable "also seen" business
-  // doesn't have one yet (it gets a "w3" style id instead of a numeric one). Those get no
-  // dismiss button rather than a button that quietly does nothing.
-  var hideBtn = isStored(p.id)
-    ? '<button class="hide" onclick="hideLead(\\''+p.id+'\\')" title="Mark off so it never shows in a future search">'+ICONS.x+'</button>'
-    : '';
-  return '<div class="lead" id="lead-'+p.id+'">'+
-    '<div><h3>'+esc(p.name)+'<span class="badge">'+tag+'</span></h3>'+
-    '<div class="meta">'+esc(p.category||'')+' · '+esc(p.city||'')+', '+esc(p.state||'')+' · '+esc(p.phone||'no phone')+'</div>'+
-    '<div class="meta"><span class="src">'+esc(srcName(p.source))+'</span> &nbsp; '+email+'</div>'+
-    '<div style="margin-top:6px">'+fresh+'</div>'+lic_line+'</div>'+
-    '<div style="display:flex;gap:8px;align-items:center">'+
-      saveBtn+hideBtn+
-    '</div>'+
-    '</div>';
-}
 // A numeric id means the business is already a lead row in the database; anything else is a
 // scan result the user can browse but hasn't taken yet.
 function isStored(id){return /^\\d+$/.test(String(id))}
