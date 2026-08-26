@@ -13,3 +13,7 @@ process.env.TOKENS_PER_USD ||= "75";
 // Measured, not guessed: a 3-source scan really bills ~$7.50 per 1,000 places
 // (each scraper carries its own startup cost). The old $4 undercharged by ~46%.
 process.env.APIFY_RATE_PER_1K ||= "7.5";
+// Bounds the slowest part of a scan. Measured: an uncapped run hit 235s of the 300s
+// serverless limit on a SMALL result set, and the pass grows with lead yield — so the
+// best-performing searches were the likeliest to time out. 8 keeps it ~255s worst case.
+process.env.DEEP_CHECK_MAX ||= "8";
