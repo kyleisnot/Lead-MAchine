@@ -62,8 +62,8 @@ const DEMO_LIMIT = 20;
 const MAX_CHIPS = 18;
 
 function tokensPerUsd() {
-  const n = parseFloat(process.env.TOKENS_PER_USD || "100");
-  return Number.isFinite(n) && n > 0 ? n : 100;
+  const n = parseFloat(process.env.TOKENS_PER_USD || "75");
+  return Number.isFinite(n) && n > 0 ? n : 75;
 }
 
 // Cache keys are `niche|city|state|sources|limit`, lowercased, sources comma-joined

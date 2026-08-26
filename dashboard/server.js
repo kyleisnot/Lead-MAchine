@@ -54,7 +54,7 @@ app.use(authRouter);
 app.use(requireUser);
 
 // Cost is shown as "tokens" (a credit unit) instead of raw dollars. 1 USD = TOKENS_PER_USD tokens.
-const TOKENS_PER_USD = parseFloat(process.env.TOKENS_PER_USD || "100") || 100;
+const TOKENS_PER_USD = parseFloat(process.env.TOKENS_PER_USD || "75") || 75;
 const usdToTokens = (usd) => Math.max(0, Math.round((Number(usd) || 0) * TOKENS_PER_USD));
 
 function planResetLabel() {

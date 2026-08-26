@@ -29,9 +29,9 @@ export const adminRouter = express.Router();
 // plans. `prospect` is the near-nothing plan demo-created accounts sit on.
 const PLANS = {
   prospect: { label: "Prospect (demo)", tokens: 1, price: 0 },
-  trial: { label: "Trial", tokens: 500, price: 0 },
-  starter: { label: "Starter", tokens: 2500, price: 97 },
-  pro: { label: "Pro", tokens: 8000, price: 297 },
+  trial: { label: "Trial", tokens: 300, price: 0 },
+  starter: { label: "Starter", tokens: 2000, price: 97 },
+  pro: { label: "Pro", tokens: 6000, price: 297 },
   unlimited: { label: "Unlimited", tokens: 0, price: 997 },
 };
 const PLAN_KEYS = Object.keys(PLANS);
@@ -55,10 +55,11 @@ function esc(s) {
   );
 }
 
-// Tokens are the user-facing unit; usage_log.cost is stored in USD.
+// Credits are the user-facing unit; usage_log.cost is stored in USD. Deliberately
+// not a 1:1 cent mapping — see deploy-env.js.
 function tokensPerUsd() {
-  const n = parseFloat(process.env.TOKENS_PER_USD || "100");
-  return Number.isFinite(n) && n > 0 ? n : 100;
+  const n = parseFloat(process.env.TOKENS_PER_USD || "75");
+  return Number.isFinite(n) && n > 0 ? n : 75;
 }
 
 // Start of the current calendar month, server-local, as an ISO timestamp.
