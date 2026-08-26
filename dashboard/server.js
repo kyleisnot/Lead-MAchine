@@ -543,6 +543,9 @@ function render(s,prospects,mode){
     '<div class="stats" style="grid-template-columns:repeat(3,1fr)">'+
     stat(s.qualified,'No-website leads','good')+stat(s.scanned||'—','Scanned')+stat(s.hasWebsite!=null?s.hasWebsite:'—','Already had a site')+
     '</div>';
+  // After a search the user just ran, glide down to the results so they don't have to
+  // scroll to find them. Skip on 'restored' (that fires on page load — jumping would jar).
+  if(mode!=='restored'){var __sw=document.getElementById('statsWrap');if(__sw)setTimeout(function(){__sw.scrollIntoView({behavior:'smooth',block:'start'});},80);}
   if(!prospects.length){st(mode==='fresh'||mode==='batch'?'No qualified (no-website) leads found. Try a higher Depth, more cities, or All trades.':'No saved leads here yet — hit Search to find some.');return}
   var msg = mode==='cached' ? '💾 Saved results — <b>$0 credits used</b>. Hit 🔄 to re-scan for fresh data.'
           : mode==='restored' ? '↩️ Restored your last search (no credits used).'
