@@ -135,18 +135,30 @@ select.stage,input.notes{background:var(--surface);border:1px solid var(--border
 .fu-btn{background:var(--surface2);border:1px solid var(--border);color:var(--text)}.fu-del{color:var(--muted)}.fu-del:hover{color:var(--danger);border-color:var(--danger)}
 .sechead{color:var(--muted)}
 .panel{padding:26px 28px}
-.row{gap:18px;row-gap:20px}
-.row label,.opts label{margin-bottom:8px;font-size:11px}
 input,select{padding:11px 13px}
 .go{padding:12px 26px;font-size:15px}
-.rescan{padding:12px 15px}
-.chiplabel,.optslabel{font-size:11px;text-transform:uppercase;letter-spacing:.6px;color:var(--muted);font-weight:600}
-.chiplabel{margin:22px 0 10px}
-.optslabel{margin:24px 0 12px;padding-top:20px;border-top:1px solid var(--border)}
-.chips{margin-top:0;gap:9px}
-.chip{padding:7px 14px}
-.opts{margin-top:0}
-#estimate{margin-top:16px}
+.rescan{padding:12px 18px;font-size:14px;font-weight:600;border-radius:8px}
+/* Search form: stacked, labelled groups rather than one wide row of inputs. */
+.searchpanel{max-width:720px;padding:8px 28px 24px}
+.fgroup{padding:20px 0;border-bottom:1px solid var(--border)}
+.fgroup:last-of-type{border-bottom:0}
+.glabel{font-size:11px;text-transform:uppercase;letter-spacing:.7px;color:var(--faint);font-weight:700;margin-bottom:12px}
+.frow{display:grid;gap:14px}
+.frow.where{grid-template-columns:1fr 108px}
+.frow.deep{grid-template-columns:1fr 168px}
+.f{min-width:0}
+.f label{display:block;font-size:12px;font-weight:600;color:var(--muted);margin-bottom:6px;text-transform:none;letter-spacing:0}
+.f .hint{font-weight:400;color:var(--faint);font-size:11px;margin-left:5px}
+.f input,.f select{width:100%}
+.searchpanel .chips{margin:12px 0 0;gap:8px}
+.searchpanel .chip{padding:6px 13px;font-size:12.5px}
+.searchpanel .opt{display:flex;align-items:center;gap:8px;margin-top:16px;font-size:13px;color:var(--muted);cursor:pointer;text-transform:none;letter-spacing:0;font-weight:400}
+.searchpanel .opt b{color:var(--text);font-weight:600}
+.searchpanel .opt input{width:auto;padding:0}
+.gorow{display:flex;align-items:center;gap:16px;flex-wrap:wrap;padding-top:20px;border-top:1px solid var(--border)}
+.gobtns{margin-left:auto;display:flex;gap:10px}
+#estimate{margin:0;flex:1;min-width:180px}
+@media(max-width:560px){.frow.where,.frow.deep{grid-template-columns:1fr}.gobtns{margin-left:0;width:100%}.gobtns .go{flex:1}}
 .pagehead{flex-wrap:wrap;gap:12px 14px}
 .statbox{display:flex;align-items:center;gap:16px;background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:10px 16px}
 .statbox .cell{display:flex;flex-direction:column;gap:1px;line-height:1.25}

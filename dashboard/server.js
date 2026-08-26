@@ -383,7 +383,7 @@ async function renderSearchPage(req) {
 ${SHARED_CSS}</style></head><body>
 ${sidebar("search", { isAdmin: req.isAdmin, demo: req.isDemo })}<div class="pagehead"><div class="titlewrap"><h1>Search</h1><div class="pagesub">Find local businesses that don't have a website yet</div></div><div class="spacer"></div>
   <div class="statbox">
-    <div class="cell"><span class="k">🧠 Remembered</span><span class="v" id="sbMem">—</span><span class="s2" id="sbMemSub"></span></div>
+    <div class="cell"><span class="k"><svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="vertical-align:-1px;margin-right:4px"><ellipse cx="12" cy="6" rx="8" ry="3"/><path d="M4 6v6c0 1.7 3.6 3 8 3s8-1.3 8-3V6"/><path d="M4 12v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6"/></svg>Remembered</span><span class="v" id="sbMem">—</span><span class="s2" id="sbMemSub"></span></div>
     <div class="sep"></div>
     <div class="cell"><span class="k">Tokens used</span><span class="v" id="sbTok">—</span><span class="s2" id="sbSearches"></span><div class="tokbar" id="sbBarWrap"><div class="tokbar-fill" id="sbBar"></div></div></div>
   </div>
@@ -399,36 +399,46 @@ ${sidebar("search", { isAdmin: req.isAdmin, demo: req.isDemo })}<div class="page
   </div>
 </details>
 
-<div class="panel">
-  <div class="row">
-    <div><label>U.S. City <span class="muted" style="text-transform:none;letter-spacing:0">(comma-separate for several)</span></label><input id="city" placeholder="Knoxville, Maryville, Oak Ridge" value="Knoxville"></div>
-    <div><label>State</label><input id="state" placeholder="TN" value="TN"></div>
-    <div><label>Niche</label><input id="niche" placeholder="landscaping" value="landscaping"></div>
-    <div><label>Source</label><select id="source">
-      <option value="all">All (Google + FB + IG)</option>
-      <option value="facebook">Facebook only</option>
-      <option value="instagram">Instagram only</option>
-      <option value="google">Google only</option>
-    </select></div>
-    <div style="display:flex;gap:8px">
-      <button class="go" id="goBtn" onclick="runSearch(false)">Search</button>
-      <button class="rescan" id="rescanBtn" onclick="runSearch(true)" title="Re-scan live with fresh data (uses Apify credits)">🔄</button>
+<div class="panel searchpanel">
+  <div class="fgroup">
+    <div class="glabel">Where</div>
+    <div class="frow where">
+      <div class="f"><label for="city">City <span class="hint">comma-separate for several</span></label><input id="city" placeholder="Knoxville, Maryville, Oak Ridge" value="Knoxville"></div>
+      <div class="f"><label for="state">State</label><input id="state" placeholder="TN" value="TN"></div>
     </div>
   </div>
-  <div class="chiplabel">Popular niches</div>
-  <div class="chips">${nicheButtons}</div>
-  <div class="optslabel">Scan options</div>
-  <div class="opts">
-    <label class="opt"><input type="checkbox" id="allNiches" oninput="updateEstimate()"> <b>All trades</b> <span class="muted">(scan every niche)</span></label>
-    <span class="optsep"></span>
-    <label style="display:inline">Scan depth <span class="muted" style="text-transform:none;letter-spacing:0">(more = more tokens)</span></label>
-    <select id="limit" onchange="updateEstimate()" style="width:auto;display:inline-block;margin-left:6px">
-      <option value="20">Quick (20)</option><option value="40">Standard (40)</option>
-      <option value="60">Deep (60)</option><option value="100">Deeper (100)</option>
-      <option value="150">Max (150)</option><option value="250">Firehose (250)</option>
-    </select>
+
+  <div class="fgroup">
+    <div class="glabel">What</div>
+    <div class="f"><label for="niche">Trade</label><input id="niche" placeholder="landscaping" value="landscaping"></div>
+    <div class="chips">${nicheButtons}</div>
+    <label class="opt"><input type="checkbox" id="allNiches" oninput="updateEstimate()"> Search <b>all trades</b> at once</label>
   </div>
-  <div id="estimate" class="estimate"></div>
+
+  <div class="fgroup">
+    <div class="glabel">How deep</div>
+    <div class="frow deep">
+      <div class="f"><label for="source">Sources</label><select id="source">
+        <option value="all">All (Google + Facebook + Instagram)</option>
+        <option value="facebook">Facebook only</option>
+        <option value="instagram">Instagram only</option>
+        <option value="google">Google only</option>
+      </select></div>
+      <div class="f"><label for="limit">Scan depth <span class="hint">more = more credits</span></label><select id="limit" onchange="updateEstimate()">
+        <option value="20">Quick (20)</option><option value="40">Standard (40)</option>
+        <option value="60">Deep (60)</option><option value="100">Deeper (100)</option>
+        <option value="150">Max (150)</option><option value="250">Firehose (250)</option>
+      </select></div>
+    </div>
+  </div>
+
+  <div class="gorow">
+    <div id="estimate" class="estimate"></div>
+    <div class="gobtns">
+      <button class="rescan" id="rescanBtn" onclick="runSearch(true)" title="Re-scan live with fresh data (spends credits)">Re-scan</button>
+      <button class="go" id="goBtn" onclick="runSearch(false)">Search</button>
+    </div>
+  </div>
 </div>
 <script>
   var NICHE_KEYS = ${JSON.stringify(NICHES.map((n) => n.key))};
