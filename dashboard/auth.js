@@ -398,7 +398,7 @@ const AUTH_CSS = `
 .authcard .alt{font-size:13px;color:var(--muted);text-align:center;margin:20px 0 0}
 .authcard .alt a{color:var(--accent);font-weight:600;text-decoration:none}
 .authcard .alt a:hover{text-decoration:underline}
-/* "Continue with Google" — a surface-coloured button so the 4-colour mark reads in
+/* "Continue with Google" is a surface-coloured button so the 4-colour mark reads in
    both themes; the divider below it separates it from the email form. */
 .authcard .gbtn{display:flex;align-items:center;justify-content:center;gap:10px;width:100%;box-sizing:border-box;
   border:1px solid var(--border-strong);border-radius:9px;background:var(--surface);color:var(--text);
@@ -647,7 +647,7 @@ ${THEME_INIT_SCRIPT}
           location.replace('/');
           return;
         }
-        // A 401 only means the token didn't check out — the API's terse
+        // A 401 only means the token didn't check out, and the API's terse
         // "Sign in required" would read oddly here, so use our own wording.
         // Anything else (e.g. a 503 config problem) is worth showing verbatim.
         fail(x.status===401 ? '' : (x.body&&x.body.error));

@@ -81,9 +81,9 @@ function num(n) {
 }
 
 function fmtDate(v) {
-  if (!v) return "—";
+  if (!v) return "n/a";
   const d = new Date(v);
-  if (isNaN(d.getTime())) return "—";
+  if (isNaN(d.getTime())) return "n/a";
   const p = (x) => String(x).padStart(2, "0");
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
 }
@@ -188,7 +188,7 @@ async function loadOverview() {
       0
     );
     const rawTier = String(p.tier ?? "").trim();
-    const email = p.email || "—";
+    const email = p.email || "No email on file";
     return {
       id: p.id,
       email,
@@ -260,7 +260,7 @@ export function adminTabs(active) {
 }
 
 function page(body, extraScript = "", demo = false, active = null) {
-  return `<!doctype html><html><head>${THEME_INIT_SCRIPT}<meta charset="utf-8">${FAVICON}<title>Prospector — Admin</title>
+  return `<!doctype html><html><head>${THEME_INIT_SCRIPT}<meta charset="utf-8">${FAVICON}<title>Admin · Prospector</title>
 <style>
   *{box-sizing:border-box;margin:0;padding:0}
   body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
@@ -319,7 +319,7 @@ function page(body, extraScript = "", demo = false, active = null) {
   .sectionhead{font-size:13px;text-transform:uppercase;letter-spacing:.5px;color:var(--muted);font-weight:700;margin:6px 0 12px}
   @media(max-width:900px){.stats{grid-template-columns:repeat(2,1fr)}}
 ${SHARED_CSS}</style></head><body>
-${sidebar("admin", { isAdmin: true, demo })}<div class="pagehead"><div class="titlewrap"><h1>Admin</h1><div class="pagesub">Operator overview — every user, their usage this month, and their plan</div></div><div class="spacer"></div></div>
+${sidebar("admin", { isAdmin: true, demo })}<div class="pagehead"><div class="titlewrap"><h1>Admin</h1><div class="pagesub">Operator overview: every user, their usage this month, and their plan</div></div><div class="spacer"></div></div>
 ${active ? adminTabs(active) : ""}
 ${body}
 ${extraScript}${SHELL_TAIL_SCRIPT}</main></div></body></html>`;
@@ -370,7 +370,7 @@ function userRow(u, meEmail = "") {
   const opts = PLAN_KEYS.map(
     (k) =>
       `<option value="${k}"${known && u.tier === k ? " selected" : ""}>${esc(PLANS[k].label)}${
-        PLANS[k].price ? ` — $${PLANS[k].price}` : ""
+        PLANS[k].price ? `, $${PLANS[k].price}` : ""
       }</option>`
   ).join("");
 
@@ -414,7 +414,7 @@ ${statCard(`$${num(d.mrr)}<span class="per">/mo</span>`, "MRR", mixLine(d.mix))}
 ${statCard(num(d.totalLeads), "Leads, all users")}
 ${statCard(num(d.monthTokens), "Tokens this month", `at ${num(tokensPerUsd())} tokens per $1`)}
 ${statCard(
-  spend == null ? "—" : "$" + Number(spend).toFixed(2),
+  spend == null ? "n/a" : "$" + Number(spend).toFixed(2),
   "Apify spend, month to date",
   spend == null ? "No Apify token configured" : "Operator cost"
 )}
@@ -422,10 +422,10 @@ ${statCard(
 
   const legend = `<div class="legend">${PLAN_KEYS.map(
     (k) =>
-      `<b>${esc(PLANS[k].label)}</b> — ${
+      `<b>${esc(PLANS[k].label)}</b>: ${
         PLANS[k].price ? `$${PLANS[k].price}/mo` : "free"
       }, ${PLANS[k].tokens ? `${num(PLANS[k].tokens)} tokens` : "unlimited tokens"}`
-  ).join('<span class="lsep">·</span>')}<br>Picking a plan fills in its allotment — you can still override the number before saving. An allotment of <b>0</b> blocks the account (no tokens) — use it for signups you have not activated yet. <b>Add</b> tops up this month's allotment when a customer runs out; <b>Reset month</b> clears their usage rows for the current calendar month only.</div>`;
+  ).join('<span class="lsep">·</span>')}<br>Picking a plan fills in its allotment, and you can still override the number before saving. An allotment of <b>0</b> blocks the account (no tokens), so use it for signups you have not activated yet. <b>Add</b> tops up this month's allotment when a customer runs out; <b>Reset month</b> clears their usage rows for the current calendar month only.</div>`;
 
   const table = d.users.length
     ? `<div class="tblwrap"><table>
@@ -461,7 +461,7 @@ function lmPaintUsage(row){
   var cell=row.querySelector('td.usage'); if(!cell)return;
   var n=cell.querySelector('.usenum'),bar=cell.querySelector('.tokbar'),fill=cell.querySelector('.tokbar-fill');
   if(!allot){
-    if(n)n.innerHTML=lmNum(tokens)+' <span class="usealt">\\/ unlimited<\\/span>';
+    if(n)n.innerHTML='<span class="usealt">no plan yet<\\/span>';
     if(bar){bar.style.display='none';bar.className='tokbar'}
     if(fill)fill.style.width='0%';
   }else{
@@ -490,7 +490,7 @@ async function lmSaveUser(id,btn){
       row.setAttribute('data-allot',a);
       row.querySelector('input.allot').value=a;
       lmPaintUsage(row);
-      lmFlag(id,'ok','\\u2713');
+      lmFlag(id,'ok','Saved');
     }else lmFlag(id,'err',(j&&j.error)?j.error:'Save failed',true);
   }catch(e){lmFlag(id,'err','Save failed',true)}
   btn.disabled=false;
@@ -507,7 +507,7 @@ async function lmTopUp(id,btn){
       row.setAttribute('data-allot',j.allotment);
       row.querySelector('input.allot').value=j.allotment;
       lmPaintUsage(row); inp.value='';
-      lmFlag(id,'ok','\\u2713 +'+lmNum(j.added));
+      lmFlag(id,'ok','Added '+lmNum(j.added));
     }else lmFlag(id,'err',(j&&j.error)?j.error:'Top-up failed',true);
   }catch(e){lmFlag(id,'err','Top-up failed',true)}
   btn.disabled=false;
@@ -522,7 +522,7 @@ async function lmResetUsage(id,btn){
     if(j&&j.ok){
       row.setAttribute('data-tokens','0');
       lmPaintUsage(row);
-      lmFlag(id,'ok','\\u2713 cleared '+lmNum(j.deleted));
+      lmFlag(id,'ok','Cleared '+lmNum(j.deleted));
     }else lmFlag(id,'err',(j&&j.error)?j.error:'Reset failed',true);
   }catch(e){lmFlag(id,'err','Reset failed',true)}
   btn.disabled=false;
@@ -540,9 +540,9 @@ function money(n) {
   return "$" + v.toLocaleString("en-US", { maximumFractionDigits: v % 1 ? 2 : 0 });
 }
 
-// "42% of signups" for a funnel step, or "—" before there is anyone to be a % of.
+// "42% of signups" for a funnel step, or a plain note before there is anyone to be a % of.
 function pctOfSignups(n, signups) {
-  if (!signups) return "—";
+  if (!signups) return "No signups yet";
   return `${Math.round((n / signups) * 100)}% of signups`;
 }
 
@@ -596,9 +596,9 @@ async function loadAnalytics() {
 
   const recent = (unwrap(recentRes, "recent wins").data || []).map((w) => ({
     id: w.id,
-    clientName: w.client_name || "—",
+    clientName: w.client_name || "Unnamed client",
     amount: w.amount,
-    email: emailById.get(String(w.user_id)) || "—",
+    email: emailById.get(String(w.user_id)) || "Unknown user",
     createdAt: w.created_at,
   }));
 
@@ -621,7 +621,7 @@ ${statCard(money(d.revenue), "Closed revenue", `${num(d.winCount)} win${d.winCou
         .map(
           (w) => `<tr>
   <td>${esc(w.clientName)}</td>
-  <td class="n">${w.amount == null ? "—" : money(w.amount)}</td>
+  <td class="n">${w.amount == null ? "n/a" : money(w.amount)}</td>
   <td>${esc(w.email)}</td>
   <td class="d">${fmtDate(w.createdAt)}</td>
 </tr>`
@@ -788,7 +788,7 @@ adminRouter.post(
 );
 
 // Top up: add N tokens to this month's allotment (the "they ran out, they paid
-// for more" lever). Refused on an unlimited plan, where it would mean nothing.
+// for more" lever). Also works from 0 (no plan yet): the top-up becomes the allotment.
 adminRouter.post(
   "/admin/api/user/:id/topup",
   requireUser,
@@ -817,15 +817,9 @@ adminRouter.post(
       if (cur.error) return res.status(500).json({ ok: false, error: cur.error.message });
       if (!cur.data) return res.status(404).json({ ok: false, error: "User not found." });
 
+      // 0 = no plan yet (blocked). A top-up from 0 simply becomes the allotment,
+      // which unblocks the account without forcing a plan pick first.
       const current = Number(cur.data.monthly_token_allotment ?? 0);
-      if (!current) {
-        return res.status(400).json({
-          ok: false,
-          error:
-            "This account's allotment is 0, which means unlimited — there is nothing to top up. " +
-            "Set a numeric allotment first if you want to meter it.",
-        });
-      }
       const next = current + n;
       if (next > ALLOTMENT_MAX) {
         return res

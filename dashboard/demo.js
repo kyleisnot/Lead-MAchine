@@ -51,7 +51,7 @@ import {
 import * as store from "../data/store.js";
 import { dataProvider, getSupabase } from "../lib/supabase.js";
 import { RATE_PER_1K } from "../lib/spend.js";
-import { THEME_INIT_SCRIPT, SHELL_TAIL_SCRIPT, SHARED_CSS, sidebar, FAVICON } from "./shell.js";
+import { THEME_INIT_SCRIPT, SHELL_TAIL_SCRIPT, SHARED_CSS, sidebar, FAVICON, icon } from "./shell.js";
 // The admin console's tab bar, so Demo sits under the same Overview · Analytics · Demo
 // bar as the rest of the console. admin.js imports only auth.js/shell.js/lib — never
 // demo.js — so this new edge introduces no import cycle.
@@ -179,19 +179,19 @@ const ABOUT = {
   landscaping: [
     "Family-run lawn and landscape crew serving {city} since 2014. Licensed & insured.",
     "Weekly mowing, mulch and spring cleanups across {city}. Free estimates.",
-    "{name} LLC — full-service landscaping, sod and retaining walls.",
+    "{name} LLC does full-service landscaping, sod and retaining walls.",
     "Small crew, big yards. Mowing, hedges and leaf removal around {city}.",
   ],
   roofing: [
     "Roof repair, replacement and storm damage in {city}. Licensed & insured.",
     "Shingle and metal roofing. Free inspections across the {city} area.",
-    "{name} LLC — residential roofing, gutters and skylights.",
+    "{name} LLC handles residential roofing, gutters and skylights.",
     "Third-generation roofers covering {city} and the surrounding counties.",
   ],
   "pressure washing": [
     "Soft wash, driveways and decks in {city}. Licensed & insured.",
     "House washing, gutter brightening and concrete cleaning. Same-week booking.",
-    "{name} LLC — commercial and residential pressure washing.",
+    "{name} LLC does commercial and residential pressure washing.",
     "Driveways, patios and fences cleaned across greater {city}.",
   ],
 };
@@ -242,15 +242,15 @@ const DEMO_BUSINESSES = [
 // The 12 leads already in the pipeline, by index into the list above: 4 New,
 // 4 Contacted, 2 Interested, 1 Won, 1 Lost, spread 4 per city.
 const SAVED_PLAN = [
-  { i: 0, stage: "Contacted", contacted: 3, savedAgo: 18, notes: "Quoted $2,400 — deciding this week" },
+  { i: 0, stage: "Contacted", contacted: 3, savedAgo: 18, notes: "Quoted $2,400, deciding this week" },
   { i: 2, stage: "New", savedAgo: 16, notes: "Google listing only, no site at all" },
   { i: 5, stage: "Interested", savedAgo: 14, notes: "Wants something up before the spring rush" },
   { i: 8, stage: "Contacted", contacted: 6, savedAgo: 13, notes: "Voicemail ×2, try Thursday" },
-  { i: 12, stage: "Won", savedAgo: 11, notes: "Signed — 5 pages, build starts Monday" },
+  { i: 12, stage: "Won", savedAgo: 11, notes: "Signed for 5 pages, build starts Monday" },
   { i: 14, stage: "New", savedAgo: 10, notes: "Storm-damage ads on FB, still no website" },
   { i: 17, stage: "Contacted", contacted: 2, savedAgo: 8, notes: "Owner asked for pricing by email" },
   { i: 20, stage: "Lost", savedAgo: 7, notes: "Nephew is building them one" },
-  { i: 24, stage: "Contacted", contacted: 9, savedAgo: 6, notes: "Left a card at the shop — call back Friday" },
+  { i: 24, stage: "Contacted", contacted: 9, savedAgo: 6, notes: "Left a card at the shop, call back Friday" },
   { i: 26, stage: "New", savedAgo: 4, notes: "2.1k on Instagram, link in bio goes nowhere" },
   { i: 29, stage: "Interested", savedAgo: 3, notes: "Asked what a 5-page site runs" },
   { i: 33, stage: "New", savedAgo: 1, notes: "Referred by the Iron Oak crew" },
@@ -259,7 +259,7 @@ const SAVED_PLAN = [
 const FOLLOWUPS = [
   { title: "Call back Marcus @ Iron Oak", note: "Wants the $2,400 quote broken out by page", due: -2 },
   { title: "Send Scenic City Roof Works the mockup", note: "Promised it on Tuesday's call", due: 0 },
-  { title: "Follow up with Music City Pressure Washing", note: "Left a card at the shop — ask for Dana", due: 3 },
+  { title: "Follow up with Music City Pressure Washing", note: "Left a card at the shop, ask for Dana", due: 3 },
 ];
 
 // 14 metered searches summing to exactly $12.40 → 1,240 of the plan's 2,500 tokens,
@@ -660,8 +660,8 @@ demoRouter.post("/demo/prospect", requireUser, requireAdmin, prospectBody, async
   // Two accounts we must never hand an operator a live session for: a colleague's
   // (one typo and you're presenting from inside their real dashboard) and the staged
   // demo account (that's the Practice demo, and it would hand out a sign-in link for it).
-  if (isAdminEmail(email)) return bail("That's an operator account — use a prospect's own email.");
-  if (email === demoEmail()) return bail("That's the staged demo account — use the Practice demo instead.");
+  if (isAdminEmail(email)) return bail("That's an operator account. Use a prospect's own email.");
+  if (email === demoEmail()) return bail("That's the staged demo account. Use the Practice demo instead.");
 
   try {
     const sb = await getSupabase();
@@ -685,7 +685,7 @@ demoRouter.post("/demo/api/claim-link", requireUser, requireAdmin, async (req, r
   try {
     const target = await impersonationTarget(req);
     if (!target || target.staged || !target.email) {
-      return res.status(400).json({ ok: false, error: "Start a prospect demo first — there's no account to hand over." });
+      return res.status(400).json({ ok: false, error: "Start a prospect demo first. There is no account to hand over yet." });
     }
     const sb = await getSupabase();
     const { data, error } = await sb.auth.admin.generateLink({
@@ -742,13 +742,13 @@ demoRouter.post("/demo/api/reset", requireUser, requireAdmin, async (req, res) =
 // never shows the same message twice.
 function workspacePanel(req, target) {
   const raw = String((req.query && req.query.err) || "").slice(0, 300);
-  const err = raw ? `<div class="dwork-err">⚠️ ${escHtml(raw)}</div>` : "";
+  const err = raw ? `<div class="dwork-err">${icon("warning", 15)}<span>${escHtml(raw)}</span></div>` : "";
 
   if (dataProvider() !== "supabase") {
     return `<div class="dwork">
   <div class="dwork-ttl">Client demo</div>
   <h2>The demo workspace needs Supabase mode</h2>
-  <p>This app is running on local SQLite, which is single-user — there is no second account to present as, so there is nothing to stage, reset or hand over.</p>
+  <p>This app is running on local SQLite, which is single-user, so there is no second account to present as and nothing to stage, reset or hand over.</p>
   <div class="dwork-note">Set <code>DATA_PROVIDER=supabase</code> in <code>.env</code> (with the project URL and service-role key) and restart to use the demo workspace.</div>
   ${err}
 </div>`;
@@ -760,7 +760,7 @@ function workspacePanel(req, target) {
     return `<div class="dwork">
   <div class="dwork-ttl">Live demo for a prospect</div>
   <h2>You're presenting as <span class="dwork-who">${who}</span></h2>
-  <p>This is their real account. Every search you run in the meeting saves real leads into it — so when you hand it over, the pipeline they just watched you build is already theirs. Nothing here touches your own leads.</p>
+  <p>This is their real account. Every search you run in the meeting saves real leads into it, so when you hand it over, the pipeline they just watched you build is already theirs. Nothing here touches your own leads.</p>
   <div class="dwork-act">
     <form method="post" action="/demo/exit"><button class="dwork-go" type="submit">Exit demo</button></form>
     <button class="dwork-reset" type="button" onclick="getClaimLink(this)">Get their sign-in link</button>
@@ -771,7 +771,7 @@ function workspacePanel(req, target) {
       <input id="clLink" type="text" readonly spellcheck="false" onclick="this.select()">
       <button class="dwork-copy" type="button" onclick="copyClaimLink(this)">Copy</button>
     </div>
-    <div class="dwork-note">Send this to the prospect — it signs them straight into their account (Google sign-in also works if it's a Gmail).</div>
+    <div class="dwork-note">Send this to the prospect: it signs them straight into their account (Google sign-in also works if it's a Gmail).</div>
   </div>
   ${err}
 </div>`;
@@ -780,9 +780,9 @@ function workspacePanel(req, target) {
   // Practice demo in progress (or a target we couldn't resolve — the safe default).
   if (req.isDemo) {
     return `<div class="dwork">
-  <div class="dwork-ttl">Practice demo — staged data</div>
+  <div class="dwork-ttl">Practice demo with staged data</div>
   <h2>You're presenting in the demo workspace</h2>
-  <p>Every page you open is the real product, reading the demo account's staged data — nothing you click touches your own leads. Exit when the meeting ends, then reset from this panel before the next one.</p>
+  <p>Every page you open is the real product, reading the demo account's staged data, and nothing you click touches your own leads. Exit when the meeting ends, then reset from this panel before the next one.</p>
   <div class="dwork-act">
     <form method="post" action="/demo/exit"><button class="dwork-go" type="submit">Exit demo</button></form>
   </div>
@@ -791,11 +791,11 @@ function workspacePanel(req, target) {
   }
 
   return `<div class="dwork">
-  <div class="dwork-ttl">Practice demo — staged data</div>
+  <div class="dwork-ttl">Practice demo with staged data</div>
   <h2>Enter the demo workspace</h2>
-  <p>Opens the real app as a dedicated demo account: 36 leads across Knoxville, Chattanooga and Nashville, a 12-lead pipeline mid-flight, follow-ups coming due, and half a plan of tokens spent. Nothing in there touches your own account — and Reset puts it back exactly as it started.</p>
+  <p>Opens the real app as a dedicated demo account: 36 leads across Knoxville, Chattanooga and Nashville, a 12-lead pipeline mid-flight, follow-ups coming due, and half a plan of tokens spent. Nothing in there touches your own account, and Reset puts it back exactly as it started.</p>
   <div class="dwork-act">
-    <form method="post" action="/demo/enter"><button class="dwork-go" type="submit">Enter demo workspace →</button></form>
+    <form method="post" action="/demo/enter"><button class="dwork-go" type="submit"><span>Enter demo workspace</span>${icon("arrow-right", 17)}</button></form>
     <button class="dwork-reset" type="button" onclick="resetDemoData(this)">Reset demo data</button>
     <span class="dwork-flag" id="dwFlag"></span>
   </div>
@@ -804,20 +804,20 @@ function workspacePanel(req, target) {
 <div class="dwork">
   <div class="dwork-ttl">Live demo for a prospect</div>
   <h2>Present as the prospect, in their own account</h2>
-  <p>Type their email and run the meeting from inside their dashboard. At the end, one button hands them a sign-in link — the leads you just found are already in their account.</p>
+  <p>Type their email and run the meeting from inside their dashboard. At the end, one button hands them a sign-in link, and the leads you just found are already in their account.</p>
   <form class="dwork-act" method="post" action="/demo/prospect">
     <input class="dwork-email" type="email" name="email" placeholder="prospect@theircompany.com"
            autocomplete="off" spellcheck="false" autocapitalize="off" required>
     <button class="dwork-go" type="submit">Start prospect demo</button>
   </form>
-  <div class="dwork-note">Creates their real account behind the scenes — searches you run will save leads into it. Live scans need the Apify key (<code>APIFY_TOKEN</code>).</div>
+  <div class="dwork-note">Creates their real account behind the scenes, and searches you run will save leads into it. Live scans need the Apify key (<code>APIFY_TOKEN</code>).</div>
 </div>`;
 }
 
 function renderDemoPage(req, target) {
   return `<!doctype html><html lang="en"><head>${THEME_INIT_SCRIPT}<meta charset="utf-8">${FAVICON}
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Prospector — Demo</title>${FAVICON}
+<title>Demo · Prospector</title>${FAVICON}
 <style>
   *{box-sizing:border-box;margin:0;padding:0}
   body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
@@ -888,8 +888,10 @@ function renderDemoPage(req, target) {
   .dwork p{font-size:14px;line-height:1.6;color:var(--muted);max-width:660px}
   .dwork-act{display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-top:18px}
   .dwork form{margin:0}
-  .dwork-go{font-family:inherit;font-size:16px;font-weight:800;padding:13px 24px;border-radius:11px;border:none;
+  .dwork-go{display:inline-flex;align-items:center;gap:9px;font-family:inherit;font-size:16px;font-weight:800;
+            padding:13px 24px;border-radius:11px;border:none;
             background:var(--accent);color:var(--on-accent);cursor:pointer;white-space:nowrap}
+  .dwork-go svg{flex:none}
   .dwork-go:hover{filter:brightness(.96)}
   .dwork-reset{font-family:inherit;font-size:14px;font-weight:600;padding:12px 18px;border-radius:11px;
                background:transparent;border:1px solid var(--border-strong);color:var(--muted);cursor:pointer}
@@ -900,7 +902,8 @@ function renderDemoPage(req, target) {
   .dwork-flag.err{color:var(--danger)}
   .dwork-spin{display:inline-block;width:13px;height:13px;border:2px solid var(--accent);border-top-color:transparent;
               border-radius:50%;animation:dspin .7s linear infinite}
-  .dwork-err{margin-top:14px;font-size:13px;line-height:1.55;color:var(--danger)}
+  .dwork-err{margin-top:14px;display:flex;align-items:flex-start;gap:8px;font-size:13px;line-height:1.55;color:var(--danger)}
+  .dwork-err svg{flex:none;margin-top:2px}
   .dwork-note{margin-top:16px;font-size:13px;line-height:1.6;color:var(--muted);background:var(--surface2);
               border:1px solid var(--border);border-radius:10px;padding:14px 16px}
   .dwork-note code{background:var(--panel);border:1px solid var(--border);border-radius:5px;padding:1px 6px;font-size:12px;color:var(--text)}
@@ -941,7 +944,7 @@ ${sidebar("demo", { isAdmin: true, demo: !!req.isDemo })}
   <div class="dest" id="estimate"></div>
 
   <div class="dsaved" id="savedWrap" style="display:none">
-    <div class="dsavedlbl">Saved demos — instant, no credits</div>
+    <div class="dsavedlbl">Saved demos, instant and free of credits</div>
     <div class="dchips" id="savedChips"></div>
   </div>
 
@@ -997,7 +1000,7 @@ function updateEstimate(){
   var el = $('estimate');
   if(!q.niche || !q.city){ el.innerHTML=''; return }
   if(CACHED[keyFor(q.niche,q.city,q.state,q.sources,q.limit)]){
-    el.innerHTML = 'Saved search \\u2014 <b>replays free</b>';
+    el.innerHTML = 'Saved search, <b>replays free</b>';
     return;
   }
   var places = q.sources.length * q.limit;
@@ -1008,7 +1011,7 @@ function updateEstimate(){
 // ── staged progress ────────────────────────────────────────────────────────
 function paintStages(){
   $('stages').innerHTML = STAGES.map(function(s,i){
-    return '<div class="dstage" id="stage-'+i+'"><span class="dmark">\\u2713</span><span>'+esc(s)+'</span></div>';
+    return '<div class="dstage" id="stage-'+i+'"><span class="dmark">${icon("check", 14)}</span><span>'+esc(s)+'</span></div>';
   }).join('');
   $('stages').style.display='';
 }
@@ -1020,7 +1023,7 @@ function startStages(step){
   stageIdx = 0;
   paintStages();
   markStage(0,'run');
-  // Hold on the last stage until the response lands — the machine is still working.
+  // Hold on the last stage until the response lands, because the machine is still working.
   stageTimer = setInterval(function(){
     if(stageIdx < STAGES.length-1){ markStage(stageIdx,'done'); stageIdx++; markStage(stageIdx,'run'); }
   }, step);
@@ -1044,7 +1047,7 @@ function countUp(el, to){
     if(t<1) requestAnimationFrame(frame); else settled = true;
   }
   requestAnimationFrame(frame);
-  // rAF is paused in a hidden/throttled tab — make sure the real number still lands.
+  // rAF is paused in a hidden/throttled tab, so make sure the real number still lands.
   setTimeout(function(){ if(!settled) el.textContent = nfmt(to) }, dur+400);
 }
 function statBox(label, cls){
@@ -1084,7 +1087,7 @@ async function reveal(r){
   note.innerHTML = leads
     ? '<b>'+nfmt(leads)+'</b> business'+(leads===1?'':'es')+' in '+esc(tc(val('city'))||'this city')+' with no website of their own'+
       (r.cached ? ' &nbsp;\\u00b7&nbsp; saved demo, no credits used' : '')
-    : 'No no-website leads this time \\u2014 try another trade or a nearby city.';
+    : 'No no-website leads this time. Try another trade or a nearby city.';
   note.style.display='';
 
   $('leads').innerHTML = prospects.map(leadCard).join('');
@@ -1136,7 +1139,7 @@ async function runDemo(preset){
     if(!resp.ok && !r) failed = true;
   }catch(e){ failed = true }
 
-  // A cached replay answers in milliseconds — hold the animation to ~2s so the room
+  // A cached replay answers in milliseconds, so hold the animation to ~2s and the room
   // still sees the machine work.
   if(cached){ var wait = 1800-(Date.now()-t0); if(wait>0) await sleep(wait) }
   await finishStages();
@@ -1148,7 +1151,7 @@ async function runDemo(preset){
   if(failed || !r || !r.ok){
     $('stages').style.display='none';
     var err = (r && r.error) ? String(r.error) : '';
-    // Only the "no Apify credentials" family gets the canned line — a plan/cap 429
+    // Only the "no Apify credentials" family gets the canned line, because a plan/cap 429
     // already carries a clean, specific sentence of its own.
     var apify = !err || /apify_token|apify token|apify key|actor|authentication/i.test(err);
     showMsg(apify
@@ -1181,8 +1184,8 @@ async function loadSaved(){
 }
 
 // ── demo workspace ─────────────────────────────────────────────────────────
-// Reset reports what it actually wrote, and on failure names the step that broke —
-// enough to diagnose it from the projector without opening a log.
+// Reset reports what it actually wrote, and on failure names the step that broke,
+// which is enough to diagnose it from the projector without opening a log.
 async function resetDemoData(btn){
   var flag = $('dwFlag');
   btn.disabled = true;
@@ -1194,16 +1197,16 @@ async function resetDemoData(btn){
     if(j && j.ok){
       var s = j.seeded || {};
       flag.className = 'dwork-flag ok';
-      flag.textContent = '\\u2713 ' + nfmt(s.leads) + ' leads \\u00b7 ' + nfmt(s.saved) + ' tracked \\u00b7 ' +
+      flag.textContent = 'Reseeded. ' + nfmt(s.leads) + ' leads \\u00b7 ' + nfmt(s.saved) + ' tracked \\u00b7 ' +
         nfmt(s.followups) + ' follow-ups \\u00b7 ' + nfmt(s.checked) + ' remembered \\u00b7 ' +
         nfmt(s.tokensUsed) + ' tokens used';
     }else{
       flag.className = 'dwork-flag err';
-      flag.textContent = '\\u2715 ' + ((j && j.step) ? j.step + ': ' : '') + ((j && j.error) || 'Reset failed');
+      flag.textContent = 'Reset failed. ' + ((j && j.step) ? j.step + ': ' : '') + ((j && j.error) || 'Try again.');
     }
   }catch(e){
     flag.className = 'dwork-flag err';
-    flag.textContent = '\\u2715 Reset failed \\u2014 the server did not answer.';
+    flag.textContent = 'Reset failed. The server did not answer.';
   }
   btn.disabled = false;
 }
@@ -1223,15 +1226,15 @@ async function getClaimLink(btn){
       $('clLink').value = j.link;
       wrap.hidden = false;
       flag.className = 'dwork-flag ok';
-      flag.textContent = '\\u2713 Link ready for ' + (j.email || 'the prospect');
+      flag.textContent = 'Link ready for ' + (j.email || 'the prospect');
       $('clLink').focus(); $('clLink').select();
     }else{
       flag.className = 'dwork-flag err';
-      flag.textContent = '\\u2715 ' + ((j && j.error) || 'Could not create the link');
+      flag.textContent = (j && j.error) || 'Could not create the link.';
     }
   }catch(e){
     flag.className = 'dwork-flag err';
-    flag.textContent = '\\u2715 Could not create the link \\u2014 the server did not answer.';
+    flag.textContent = 'Could not create the link. The server did not answer.';
   }
   btn.disabled = false;
 }
@@ -1245,7 +1248,7 @@ function copyClaimLink(btn){
   try{ done = document.execCommand('copy') }catch(e){}
   var finish = function(ok){
     var was = btn.textContent;
-    btn.textContent = ok ? '\\u2713 Copied' : 'Press \\u2318C';
+    btn.textContent = ok ? 'Copied' : 'Press \\u2318C';
     setTimeout(function(){ btn.textContent = was }, 1600);
   };
   if(done){ finish(true); return }

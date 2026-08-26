@@ -6,6 +6,29 @@
 // `<head>` / `</style>` / header / footer wiring below) so all pages match.
 // ─────────────────────────────────────────────────────────────────────────────
 
+// ── icons ───────────────────────────────────────────────────────────────────
+// One keyed set of inline SVG marks so every page draws from the same visual
+// language: a 24x24 grid, no fill, currentColor stroke, round caps and joins.
+// Exported because admin.js / demo.js / server.js render buttons and notices that
+// need the same marks: a shared key beats each page inventing its own glyph.
+export function icon(key, size = 18) {
+  const s = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="${size}" height="${size}" aria-hidden="true">`;
+  if (key === "search") return s + '<circle cx="11" cy="11" r="7"></circle><path d="M21 21l-4.2-4.2"></path></svg>';
+  // "leads" is the merged CRM + Brain page; it reuses the original CRM table icon.
+  if (key === "leads" || key === "crm") return s + '<rect x="3" y="4" width="18" height="16" rx="2"></rect><path d="M3 10h18M9 4v16"></path></svg>';
+  if (key === "brain") return s + '<path d="M9 4a3 3 0 0 0-3 3 3 3 0 0 0-1.5 5.6V17a2 2 0 0 0 2 2h1"></path><path d="M15 4a3 3 0 0 1 3 3 3 3 0 0 1 1.5 5.6V17a2 2 0 0 1-2 2h-1"></path><path d="M12 4v15"></path></svg>';
+  // "wins" is the closed-deal trophy case, drawn as a trophy cup.
+  if (key === "wins") return s + '<path d="M8 21h8M12 17v4M7 4h10v4a5 5 0 0 1-10 0z"></path><path d="M7 6H4v1a4 4 0 0 0 3 3.9M17 6h3v1a4 4 0 0 1-3 3.9"></path></svg>';
+  if (key === "demo") return s + '<circle cx="12" cy="12" r="9"></circle><path d="M10 8.5l6 3.5-6 3.5z"></path></svg>';
+  if (key === "admin") return s + '<path d="M12 3l7 4v5c0 4.4-3 8.4-7 9-4-.6-7-4.6-7-9V7z"></path><path d="M9.5 12l2 2 3.5-3.5"></path></svg>';
+  if (key === "sun") return s + '<circle cx="12" cy="12" r="4"></circle><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"></path></svg>';
+  if (key === "moon") return s + '<path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"></path></svg>';
+  if (key === "warning") return s + '<path d="M10.3 3.9L1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"></path><path d="M12 9v4M12 17h.01"></path></svg>';
+  if (key === "check") return s + '<path d="M20 6L9 17l-5-5"></path></svg>';
+  if (key === "arrow-right") return s + '<path d="M5 12h14M12 5l7 7-7 7"></path></svg>';
+  return s + "</svg>";
+}
+
 // Sets the theme on <html> BEFORE first paint (no flash). Stored choice wins;
 // otherwise follows the OS. Defaults to dark (the app's original identity).
 export const THEME_INIT_SCRIPT = `<script>(function(){try{var t=localStorage.getItem('lm-theme');if(t!=='light'&&t!=='dark'){t=(window.matchMedia&&matchMedia('(prefers-color-scheme: light)').matches)?'light':'dark';}document.documentElement.setAttribute('data-theme',t);}catch(e){document.documentElement.setAttribute('data-theme','dark');}})();</script>`;
@@ -13,7 +36,8 @@ export const THEME_INIT_SCRIPT = `<script>(function(){try{var t=localStorage.get
 // Runs at end of <body>: syncs the theme toggle + keeps the header's token counter fresh
 // from /api/usage (which is per-user, so it shows THIS account's plan usage).
 export const SHELL_TAIL_SCRIPT = `<script>
-function lmSyncTheme(){var dark=document.documentElement.getAttribute('data-theme')!=='light';var b=document.getElementById('themeBtn');if(b){var ti=b.querySelector('.ti'),tl=b.querySelector('.tl');if(ti)ti.textContent=dark?'☀':'☾';if(tl)tl.textContent=dark?'Light mode':'Dark mode';}}
+var LM_ICON_SUN=${JSON.stringify(icon("sun", 16))},LM_ICON_MOON=${JSON.stringify(icon("moon", 16))};
+function lmSyncTheme(){var dark=document.documentElement.getAttribute('data-theme')!=='light';var b=document.getElementById('themeBtn');if(b){var ti=b.querySelector('.ti'),tl=b.querySelector('.tl');if(ti)ti.innerHTML=dark?LM_ICON_SUN:LM_ICON_MOON;if(tl)tl.textContent=dark?'Light mode':'Dark mode';}}
 function lmToggleTheme(){var light=document.documentElement.getAttribute('data-theme')==='light';var next=light?'dark':'light';document.documentElement.setAttribute('data-theme',next);try{localStorage.setItem('lm-theme',next);}catch(e){}lmSyncTheme();}
 lmSyncTheme();
 (function(){async function u(){try{var r=await(await fetch('/api/usage')).json();if(!r.ok)return;var t=document.getElementById('sbTok'),s=document.getElementById('sbSearches'),w=document.getElementById('sbBarWrap'),bar=document.getElementById('sbBar');
@@ -25,17 +49,9 @@ else{if(t)t.textContent=(Number(r.tokens)||0).toLocaleString()+' tokens';if(s)s.
 // Favicon: the wordmark's gem, inlined as SVG so there is no image file to keep in sync.
 export const FAVICON = `<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%230f6e56' stroke-width='2' stroke-linejoin='round'><path d='M6 3h12l3 6-9 12L3 9z'/><path d='M3 9h18M9 3l-2 6 5 12 5-12-2-6'/></svg>">`;
 
+// The sidebar draws its marks at 18px.
 function navIcon(key) {
-  const s = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="18" height="18" aria-hidden="true">';
-  if (key === "search") return s + '<circle cx="11" cy="11" r="7"></circle><path d="M21 21l-4.2-4.2"></path></svg>';
-  // "leads" is the merged CRM + Brain page; it reuses the original CRM table icon.
-  if (key === "leads" || key === "crm") return s + '<rect x="3" y="4" width="18" height="16" rx="2"></rect><path d="M3 10h18M9 4v16"></path></svg>';
-  if (key === "brain") return s + '<path d="M9 4a3 3 0 0 0-3 3 3 3 0 0 0-1.5 5.6V17a2 2 0 0 0 2 2h1"></path><path d="M15 4a3 3 0 0 1 3 3 3 3 0 0 1 1.5 5.6V17a2 2 0 0 1-2 2h-1"></path><path d="M12 4v15"></path></svg>';
-  // "wins" is the closed-deal trophy case — a trophy cup.
-  if (key === "wins") return s + '<path d="M8 21h8M12 17v4M7 4h10v4a5 5 0 0 1-10 0z"></path><path d="M7 6H4v1a4 4 0 0 0 3 3.9M17 6h3v1a4 4 0 0 1-3 3.9"></path></svg>';
-  if (key === "demo") return s + '<circle cx="12" cy="12" r="9"></circle><path d="M10 8.5l6 3.5-6 3.5z"></path></svg>';
-  if (key === "admin") return s + '<path d="M12 3l7 4v5c0 4.4-3 8.4-7 9-4-.6-7-4.6-7-9V7z"></path><path d="M9.5 12l2 2 3.5-3.5"></path></svg>';
-  return s + "</svg>";
+  return icon(key, 18);
 }
 
 // The demo-workspace banner: every page the operator shows a prospect says, quietly,
@@ -58,7 +74,7 @@ export function sidebar(active, { isAdmin = false, demo = false } = {}) {
   ${isAdmin ? link("/admin", "admin", "Admin") : ""}
   <div class="grow"></div>
   <div class="foot">
-    <button class="themebtn" id="themeBtn" onclick="lmToggleTheme()" aria-label="Toggle light or dark mode"><span class="ti">&#9788;</span><span class="tl">Light mode</span></button>
+    <button class="themebtn" id="themeBtn" onclick="lmToggleTheme()" aria-label="Toggle light or dark mode"><span class="ti">${icon("sun", 16)}</span><span class="tl">Light mode</span></button>
   </div>
 </nav><main class="main">${demo ? DEMO_BANNER : ""}`;
 }
@@ -85,6 +101,7 @@ a{color:var(--accent)}
 .side .foot{border-top:1px solid var(--sidebar-border);padding-top:12px;display:flex;flex-direction:column;gap:10px}
 .themebtn{display:flex;align-items:center;gap:8px;padding:8px 12px;border-radius:9px;border:1px solid var(--border-strong);background:var(--surface);color:var(--muted);font-weight:600;font-size:13px;cursor:pointer}
 .themebtn:hover{color:var(--text)}
+.themebtn .ti{display:inline-flex;align-items:center;color:currentColor}
 .main{flex:1;min-width:0;padding:24px 30px;max-width:1180px}
 .pagehead{display:flex;align-items:center;gap:14px;margin-bottom:20px}
 .pagehead h1{font-size:22px;font-weight:800;letter-spacing:.2px;color:var(--text)}

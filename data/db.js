@@ -48,6 +48,16 @@ addCol("activity_verdict", "TEXT"); // your ✓/✗ on whether our "last active"
 addCol("activity_verdict_at", "TEXT"); // when you gave that verdict
 addCol("activity_seen", "TEXT"); // what we SHOWED you (epoch+status) when you judged — for calibration
 addCol("dedup_key", "TEXT"); // canonical business key (phone, else name+city) for cross-source dedup
+addCol("bucket", "TEXT NOT NULL DEFAULT 'qualified'"); // qualified | inactive | has_website
+addCol("follow_up_at", "TEXT"); // null = in that bucket's working list; set = in its follow-up list
+
+// The three buckets a search result gets sorted into, and the CRM lists that mirror them.
+// Anything unrecognized falls back to 'qualified' so a bad value can never hide a lead.
+export const CRM_BUCKETS = ["qualified", "inactive", "has_website"];
+const BUCKET_SET = new Set(CRM_BUCKETS);
+export function normalizeBucket(b) {
+  return BUCKET_SET.has(b) ? b : "qualified";
+}
 
 // Canonical key identifying the SAME real business across sources (Google/FB/IG). Prefers the
 // phone number (last 10 digits, so +1 / formatting don't matter); falls back to name+city.
@@ -329,6 +339,165 @@ export function listCrm(stage) {
 export function crmCounts() {
   return db.prepare(`SELECT crm_stage, COUNT(*) n FROM leads WHERE saved=1 GROUP BY crm_stage`).all();
 }
+
+// ── CRM buckets: moving search results into the CRM, per bucket ──
+// A search-result prospect can arrive either as a raw scraped lead (externalId, camelCase)
+// or as a lead ROW that discover() already stored (external_id). Accept both shapes.
+function crmRowFrom(p, bucket) {
+  if (!p) return null;
+  const source = p.source ?? "";
+  const externalId = String(p.external_id ?? p.externalId ?? p.id ?? p.name ?? "");
+  if (!source || !externalId) return null;
+  return {
+    source,
+    external_id: externalId,
+    name: p.name ?? "",
+    category: p.category ?? "",
+    city: p.city ?? "",
+    state: p.state ?? "",
+    phone: p.phone ?? "",
+    email: p.email ?? "",
+    website: p.website ?? "",
+    // A stored row carries lead_json as a JSON string already; a raw prospect is the object itself.
+    lead_json: typeof p.lead_json === "string" ? p.lead_json : JSON.stringify(p.lead_json ?? p),
+    dedup_key: dedupKeyFor(p),
+    bucket,
+  };
+}
+
+const crmInsertStmt = db.prepare(`
+  INSERT OR IGNORE INTO leads
+    (source, external_id, name, category, city, state, phone, email, website, lead_json, dedup_key,
+     saved, saved_at, crm_stage, status, bucket, follow_up_at)
+  VALUES
+    (@source, @external_id, @name, @category, @city, @state, @phone, @email, @website, @lead_json, @dedup_key,
+     1, datetime('now'), 'New', 'new', @bucket, NULL)
+`);
+const crmExistingStmt = db.prepare(`SELECT id, saved FROM leads WHERE source=? AND external_id=?`);
+// Adopting an already-known lead touches ONLY its CRM membership. crm_stage, status and notes
+// are left exactly as they are, so a lead the user has already worked is never reset.
+const crmAdoptStmt = db.prepare(`
+  UPDATE leads SET saved=1, saved_at=COALESCE(saved_at, datetime('now')), bucket=?, follow_up_at=NULL WHERE id=?
+`);
+
+// Move search-result prospects into the CRM under one bucket. Returns { added, skipped }:
+// skipped counts prospects already in the CRM (plus unusable/duplicate entries in the batch),
+// so added + skipped always equals prospects.length.
+export const moveToCrm = db.transaction((prospects = [], bucket = "qualified") => {
+  const b = normalizeBucket(bucket);
+  let added = 0;
+  let skipped = 0;
+  const seen = new Set(); // collapse duplicates inside the batch
+  for (const p of prospects || []) {
+    const row = crmRowFrom(p, b);
+    if (!row) { skipped++; continue; }
+    const key = `${row.source}|${row.external_id}`;
+    if (seen.has(key)) { skipped++; continue; }
+    seen.add(key);
+    if (crmInsertStmt.run(row).changes > 0) { added++; continue; }
+    const existing = crmExistingStmt.get(row.source, row.external_id);
+    if (!existing || existing.saved) { skipped++; continue; } // already in the CRM: leave it alone
+    crmAdoptStmt.run(b, existing.id);
+    added++;
+  }
+  return { added, skipped };
+});
+
+// whenISO = an ISO timestamp to schedule the follow-up, or null to clear it (back to working).
+export function setFollowUp(leadId, whenISO) {
+  db.prepare(`UPDATE leads SET follow_up_at=? WHERE id=?`).run(whenISO || null, Number(leadId));
+}
+
+export function setLeadBucket(leadId, bucket) {
+  db.prepare(`UPDATE leads SET bucket=? WHERE id=?`).run(normalizeBucket(bucket), Number(leadId));
+}
+
+// { qualified: {working, followups}, inactive: {...}, has_website: {...} }
+// working  = saved, not dismissed, no follow-up date, newest saved first.
+// followups = saved, not dismissed, has a follow-up date, soonest first.
+export function listCrmBuckets() {
+  const out = {};
+  for (const b of CRM_BUCKETS) out[b] = { working: [], followups: [] };
+  const working = db
+    .prepare(`SELECT * FROM leads WHERE saved=1 AND dismissed=0 AND follow_up_at IS NULL ORDER BY saved_at DESC, id DESC`)
+    .all();
+  const followups = db
+    .prepare(`SELECT * FROM leads WHERE saved=1 AND dismissed=0 AND follow_up_at IS NOT NULL ORDER BY follow_up_at ASC, id ASC`)
+    .all();
+  for (const r of working) out[normalizeBucket(r.bucket)].working.push(r);
+  for (const r of followups) out[normalizeBucket(r.bucket)].followups.push(r);
+  return out;
+}
+
+// ── Global business directory: EVERY business ever scanned, across all users ──
+// Deliberately has no user_id. In Supabase this table is service-role only; the SQLite
+// mirror exists so the same store code runs locally.
+db.exec(`CREATE TABLE IF NOT EXISTS business_directory (
+  source      TEXT NOT NULL,
+  external_id TEXT NOT NULL,
+  name        TEXT,
+  niche       TEXT,
+  city        TEXT,
+  state       TEXT,
+  phone       TEXT,
+  email       TEXT,
+  website     TEXT,
+  has_website INTEGER,
+  first_seen  TEXT NOT NULL DEFAULT (datetime('now')),
+  last_seen   TEXT NOT NULL DEFAULT (datetime('now')),
+  PRIMARY KEY (source, external_id)
+)`);
+db.exec(`CREATE INDEX IF NOT EXISTS directory_site_idx ON business_directory (has_website)`);
+db.exec(`CREATE INDEX IF NOT EXISTS directory_place_idx ON business_directory (city, state)`);
+
+function directoryRowFrom(b) {
+  if (!b) return null;
+  const source = b.source ?? "";
+  const externalId = String(b.external_id ?? b.externalId ?? b.id ?? b.name ?? "");
+  if (!source || !externalId) return null;
+  const site = b.has_website ?? b.hasWebsite;
+  return {
+    source,
+    external_id: externalId,
+    name: b.name ?? null,
+    niche: b.niche ?? null,
+    city: b.city ?? null,
+    state: b.state ?? null,
+    phone: b.phone ?? null,
+    email: b.email ?? null,
+    website: b.website ?? null,
+    has_website: site === undefined || site === null ? null : site ? 1 : 0,
+  };
+}
+
+// first_seen is never moved; last_seen always refreshes; a field only overwrites the stored
+// value when the new scrape actually has something (so a thinner re-scan can't wipe a phone).
+const directoryStmt = db.prepare(`
+  INSERT INTO business_directory
+    (source, external_id, name, niche, city, state, phone, email, website, has_website)
+  VALUES
+    (@source, @external_id, @name, @niche, @city, @state, @phone, @email, @website, @has_website)
+  ON CONFLICT(source, external_id) DO UPDATE SET
+    name        = COALESCE(NULLIF(excluded.name, ''), name),
+    niche       = COALESCE(NULLIF(excluded.niche, ''), niche),
+    city        = COALESCE(NULLIF(excluded.city, ''), city),
+    state       = COALESCE(NULLIF(excluded.state, ''), state),
+    phone       = COALESCE(NULLIF(excluded.phone, ''), phone),
+    email       = COALESCE(NULLIF(excluded.email, ''), email),
+    website     = COALESCE(NULLIF(excluded.website, ''), website),
+    has_website = COALESCE(excluded.has_website, has_website),
+    last_seen   = datetime('now')
+`);
+
+export const recordDirectory = db.transaction((businesses = []) => {
+  const byKey = new Map(); // one row per (source, external_id), last one wins
+  for (const b of businesses || []) {
+    const row = directoryRowFrom(b);
+    if (row) byKey.set(`${row.source}|${row.external_id}`, row);
+  }
+  for (const row of byKey.values()) directoryStmt.run(row);
+  return { upserted: byKey.size };
+});
 
 // ── Manual follow-ups: your OWN reminders (e.g. people you called on your own), separate from leads ──
 db.exec(`CREATE TABLE IF NOT EXISTS manual_followups (

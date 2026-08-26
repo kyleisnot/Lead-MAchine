@@ -51,11 +51,15 @@ create table if not exists public.leads (
   activity_verdict_at timestamptz,
   activity_seen  text,
   dedup_key      text,
+  bucket         text not null default 'qualified', -- qualified | inactive | has_website
+  follow_up_at   timestamptz,                       -- null = the bucket's working list
   unique (user_id, source, external_id)            -- dedup is PER user, not global
 );
 create index if not exists leads_user_status_idx on public.leads (user_id, status);
 create index if not exists leads_user_dedup_idx  on public.leads (user_id, dedup_key);
 create index if not exists leads_user_saved_idx  on public.leads (user_id, saved);
+create index if not exists leads_user_bucket_idx on public.leads (user_id, bucket);
+create index if not exists leads_user_followup_idx on public.leads (user_id, follow_up_at);
 
 -- ── checked_businesses: the "brain" — everything ever scanned, so we never re-check ──
 create table if not exists public.checked_businesses (
@@ -169,3 +173,68 @@ create index if not exists wins_user_idx on public.wins (user_id, created_at des
 alter table public.wins enable row level security;
 create policy "own wins" on public.wins
   for all using (user_id = auth.uid()) with check (user_id = auth.uid());
+
+-- ============================================================================
+-- business_directory: the operator's mega directory.
+-- ----------------------------------------------------------------------------
+-- EVERY business ever scanned by ANY user, deduped on (source, external_id).
+-- It has NO user_id on purpose: this is one global list the operator owns, so other
+-- services can be sold into it later. RLS is ON with ZERO policies, which denies every
+-- client JWT outright; only the service-role key (which bypasses RLS) can read or write it.
+-- ============================================================================
+create table if not exists public.business_directory (
+  source       text not null,
+  external_id  text not null,
+  name         text,
+  niche        text,
+  city         text,
+  state        text,
+  phone        text,
+  email        text,
+  website      text,
+  has_website  boolean,
+  first_seen   timestamptz not null default now(),
+  last_seen    timestamptz not null default now(),
+  primary key (source, external_id)
+);
+create index if not exists directory_site_idx  on public.business_directory (has_website);
+create index if not exists directory_place_idx on public.business_directory (city, state);
+
+alter table public.business_directory enable row level security;
+-- No policies here, and none should ever be added. RLS with zero policies = deny all.
+
+-- Belt and braces on top of RLS: no table grants for the client roles either.
+-- Guarded because those roles only exist on a Supabase project.
+do $$
+begin
+  if exists (select 1 from pg_roles where rolname = 'anon') then
+    execute 'revoke all on public.business_directory from anon';
+  end if;
+  if exists (select 1 from pg_roles where rolname = 'authenticated') then
+    execute 'revoke all on public.business_directory from authenticated';
+  end if;
+end $$;
+
+-- Re-scan merge. PostgREST upserts always send the full column list, so without this a
+-- thinner re-scan would null out a phone or email we already had. Running it as a BEFORE
+-- UPDATE trigger keeps that logic in the DB, where a plain .upsert() picks it up for free.
+create or replace function public.business_directory_merge()
+returns trigger language plpgsql as $$
+begin
+  new.name        := coalesce(nullif(new.name, ''), old.name);
+  new.niche       := coalesce(nullif(new.niche, ''), old.niche);
+  new.city        := coalesce(nullif(new.city, ''), old.city);
+  new.state       := coalesce(nullif(new.state, ''), old.state);
+  new.phone       := coalesce(nullif(new.phone, ''), old.phone);
+  new.email       := coalesce(nullif(new.email, ''), old.email);
+  new.website     := coalesce(nullif(new.website, ''), old.website);
+  new.has_website := coalesce(new.has_website, old.has_website);
+  new.first_seen  := old.first_seen;   -- first_seen never moves
+  new.last_seen   := now();
+  return new;
+end; $$;
+
+drop trigger if exists business_directory_merge_trg on public.business_directory;
+create trigger business_directory_merge_trg
+  before update on public.business_directory
+  for each row execute function public.business_directory_merge();

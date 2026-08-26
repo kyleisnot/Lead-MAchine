@@ -394,12 +394,15 @@ export async function updateCrm(userId, id, { stage, notes } = {}) {
   must(await c.from("leads").update(patch).eq("user_id", userId).eq("id", Number(id)), "updateCrm");
 }
 
-export async function listCrm(userId, stage) {
+// The old flat CRM listing: every saved lead (optionally one stage), newest first.
+// listCrm() now returns the bucketed shape below, so callers that want one plain array
+// call this instead.
+export async function listCrmFlat(userId, stage) {
   if (!isSupabase()) return (await db()).listCrm(stage);
   const c = await getSupabase();
   let q = c.from("leads").select("*").eq("user_id", userId).eq("saved", true);
   if (stage) q = q.eq("crm_stage", stage);
-  const data = must(await q.order("saved_at", { ascending: false }).range(0, BIG), "listCrm");
+  const data = must(await q.order("saved_at", { ascending: false }).range(0, BIG), "listCrmFlat");
   return (data || []).map(leadRow);
 }
 
@@ -425,6 +428,222 @@ export async function crmCounts(userId) {
     )
   );
   return results.filter((r) => r.n);
+}
+
+// ── CRM buckets ──────────────────────────────────────────────────────────────
+// A search sorts its results into three buckets; each one has a working list and a
+// follow-up list. A lead's bucket lives on leads.bucket, and leads.follow_up_at decides
+// which of the two lists it sits in (null = working).
+//
+// CRM_BUCKETS / normalizeBucket mirror data/db.js, duplicated (not imported) for the same
+// reason dedupKeyFor is: the Supabase path must never load better-sqlite3.
+export const CRM_BUCKETS = ["qualified", "inactive", "has_website"];
+const BUCKET_SET = new Set(CRM_BUCKETS);
+function normalizeBucket(b) {
+  return BUCKET_SET.has(b) ? b : "qualified";
+}
+
+// lead_json is jsonb in Postgres but a JSON string on a row that came back from the store.
+// Never let a malformed string throw: fall back to the prospect object itself.
+function leadJsonOf(p) {
+  if (typeof p.lead_json !== "string") return p.lead_json ?? p;
+  try {
+    return JSON.parse(p.lead_json) ?? p;
+  } catch {
+    return p;
+  }
+}
+
+// A search-result prospect arrives either as a raw scraped lead (externalId, camelCase) or
+// as the lead ROW discover() already stored (external_id). Accept both.
+function crmRowFrom(p, bucket, userId) {
+  if (!p) return null;
+  const source = p.source ?? "";
+  const externalId = String(p.external_id ?? p.externalId ?? p.id ?? p.name ?? "");
+  if (!source || !externalId) return null;
+  return {
+    user_id: userId,
+    source,
+    external_id: externalId,
+    name: p.name ?? "",
+    category: p.category ?? "",
+    city: p.city ?? "",
+    state: p.state ?? "",
+    phone: p.phone ?? "",
+    email: p.email ?? "",
+    website: p.website ?? "",
+    lead_json: leadJsonOf(p),
+    dedup_key: dedupKeyFor(p),
+    saved: true,
+    saved_at: nowIso(),
+    crm_stage: "New",
+    status: "new",
+    bucket,
+    follow_up_at: null,
+  };
+}
+
+// Move search-result prospects into this user's CRM under one bucket.
+// Returns { added, skipped }; added + skipped always equals prospects.length.
+// A prospect the user already has in the CRM is SKIPPED, never rewritten, so its stage,
+// status and notes survive. A lead that exists but was never saved is adopted into the
+// CRM (counted as added) with its stage/status/notes left untouched.
+export async function moveToCrm(userId, prospects, bucket) {
+  const b = normalizeBucket(bucket);
+  const total = (prospects || []).length;
+  if (!isSupabase()) return (await db()).moveToCrm(prospects || [], b);
+  if (!total) return { added: 0, skipped: 0 };
+
+  const byKey = new Map(); // collapse duplicates inside the batch
+  for (const p of prospects || []) {
+    const row = crmRowFrom(p, b, userId);
+    if (row) byKey.set(`${row.source}|${row.external_id}`, row);
+  }
+  const rows = [...byKey.values()];
+  if (!rows.length) return { added: 0, skipped: total };
+
+  const c = await getSupabase();
+
+  // Which of these does the user already have? PostgREST can't filter on a composite key,
+  // so ask for the union of sources and external_ids and match the exact pairs here.
+  const existing = new Map();
+  const ids = [...new Set(rows.map((r) => r.external_id))];
+  const sources = [...new Set(rows.map((r) => r.source))];
+  for (let i = 0; i < ids.length; i += 200) {
+    const data = must(
+      await c
+        .from("leads")
+        .select("id,source,external_id,saved,saved_at")
+        .eq("user_id", userId)
+        .in("source", sources)
+        .in("external_id", ids.slice(i, i + 200))
+        .range(0, BIG),
+      "moveToCrm lookup"
+    );
+    for (const r of data || []) existing.set(`${r.source}|${r.external_id}`, r);
+  }
+
+  const toInsert = [];
+  const adoptFresh = []; // never saved before: stamp saved_at now
+  const adoptAgain = []; // saved once before: keep the original saved_at
+  for (const row of rows) {
+    const hit = existing.get(`${row.source}|${row.external_id}`);
+    if (!hit) toInsert.push(row);
+    else if (hit.saved) continue; // already in the CRM
+    else (hit.saved_at ? adoptAgain : adoptFresh).push(hit.id);
+  }
+
+  let added = 0;
+  // ignoreDuplicates maps to ON CONFLICT DO NOTHING, so a lead created between the lookup
+  // and here is left alone rather than clobbered; the returned rows are the real inserts.
+  for (let i = 0; i < toInsert.length; i += 200) {
+    const data = must(
+      await c
+        .from("leads")
+        .upsert(toInsert.slice(i, i + 200), { onConflict: "user_id,source,external_id", ignoreDuplicates: true })
+        .select("id"),
+      "moveToCrm insert"
+    );
+    added += (data || []).length;
+  }
+  for (const [list, patch] of [
+    [adoptFresh, { saved: true, saved_at: nowIso(), bucket: b, follow_up_at: null }],
+    [adoptAgain, { saved: true, bucket: b, follow_up_at: null }],
+  ]) {
+    for (let i = 0; i < list.length; i += 200) {
+      must(
+        await c.from("leads").update(patch).eq("user_id", userId).in("id", list.slice(i, i + 200)),
+        "moveToCrm adopt"
+      );
+      added += list.slice(i, i + 200).length;
+    }
+  }
+  return { added, skipped: total - added };
+}
+
+// whenISO = an ISO timestamp to schedule the follow-up, or null to clear it (back to working).
+export async function setFollowUp(userId, leadId, whenISO) {
+  if (!isSupabase()) return (await db()).setFollowUp(leadId, whenISO);
+  const c = await getSupabase();
+  must(
+    await c.from("leads").update({ follow_up_at: whenISO || null }).eq("user_id", userId).eq("id", Number(leadId)),
+    "setFollowUp"
+  );
+}
+
+export async function setLeadBucket(userId, leadId, bucket) {
+  if (!isSupabase()) return (await db()).setLeadBucket(leadId, bucket);
+  const c = await getSupabase();
+  must(
+    await c.from("leads").update({ bucket: normalizeBucket(bucket) }).eq("user_id", userId).eq("id", Number(leadId)),
+    "setLeadBucket"
+  );
+}
+
+// { qualified: {working, followups}, inactive: {...}, has_website: {...} }
+// working   = saved, not dismissed, no follow-up date, newest saved first.
+// followups = saved, not dismissed, has a follow-up date, soonest first.
+export async function listCrm(userId) {
+  if (!isSupabase()) return (await db()).listCrmBuckets();
+  const c = await getSupabase();
+  const base = () => c.from("leads").select("*").eq("user_id", userId).eq("saved", true).eq("dismissed", false);
+  const [working, followups] = await Promise.all([
+    base().is("follow_up_at", null).order("saved_at", { ascending: false }).range(0, BIG),
+    base().not("follow_up_at", "is", null).order("follow_up_at", { ascending: true }).range(0, BIG),
+  ]);
+  const out = {};
+  for (const b of CRM_BUCKETS) out[b] = { working: [], followups: [] };
+  for (const r of must(working, "listCrm working") || []) out[normalizeBucket(r.bucket)].working.push(leadRow(r));
+  for (const r of must(followups, "listCrm followups") || []) out[normalizeBucket(r.bucket)].followups.push(leadRow(r));
+  return out;
+}
+
+// ── Global business directory (operator-owned, cross-user) ───────────────────
+// EVERY business ever scanned by ANY user, deduped on (source, external_id). No user_id:
+// this is deliberately global. In Supabase the table has RLS on with ZERO policies, so it
+// is unreachable from any client JWT; only the service-role client below can touch it.
+function directoryRowFrom(b) {
+  if (!b) return null;
+  const source = b.source ?? "";
+  const externalId = String(b.external_id ?? b.externalId ?? b.id ?? b.name ?? "");
+  if (!source || !externalId) return null;
+  const site = b.has_website ?? b.hasWebsite;
+  return {
+    source,
+    external_id: externalId,
+    name: b.name ?? null,
+    niche: b.niche ?? null,
+    city: b.city ?? null,
+    state: b.state ?? null,
+    phone: b.phone ?? null,
+    email: b.email ?? null,
+    website: b.website ?? null,
+    has_website: site === undefined || site === null ? null : !!site,
+  };
+}
+
+// Upsert into the global directory. Returns { upserted } (distinct keys written).
+// On conflict Postgres refreshes last_seen and only overwrites name/phone/email/website/
+// has_website when the new value is non-null; first_seen never moves. That merge lives in
+// the business_directory_merge() BEFORE UPDATE trigger, because PostgREST can't express a
+// custom ON CONFLICT SET clause.
+export async function recordDirectory(businesses) {
+  if (!isSupabase()) return (await db()).recordDirectory(businesses || []);
+  const byKey = new Map();
+  for (const b of businesses || []) {
+    const row = directoryRowFrom(b);
+    if (row) byKey.set(`${row.source}|${row.external_id}`, row);
+  }
+  const all = [...byKey.values()];
+  if (!all.length) return { upserted: 0 };
+  const c = await getSupabase(); // service-role: the only client RLS lets near this table
+  for (let i = 0; i < all.length; i += 200) {
+    must(
+      await c.from("business_directory").upsert(all.slice(i, i + 200), { onConflict: "source,external_id" }),
+      "recordDirectory"
+    );
+  }
+  return { upserted: all.length };
 }
 
 // ── Manual follow-ups (the user's own reminders) ─────────────────────────────

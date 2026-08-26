@@ -1,5 +1,5 @@
 // server.js — the Prospector dashboard: find local businesses with no website (Search)
-// and work them on one Leads page (found · tracked · follow-up).
+// and work them on one Leads page (three buckets, each with a working + follow-up list).
 //
 // Multi-user: ./auth.js resolves WHO is asking (req.userId / req.userEmail / req.isAdmin)
 // and every data call goes through ../data/store.js scoped to that user. In sqlite (local
@@ -14,6 +14,7 @@ import { NICHES } from "../lib/niches.js";
 import { lastActiveLabel, activityStatus, activitySignal, cutoffLabel, freshnessConfig } from "../lib/freshness.js";
 import { spendCapState, RATE_PER_1K } from "../lib/spend.js";
 import { detectLicenseSignal, licenseSearchUrl } from "../lib/license.js";
+import { isRealWebsiteUrl } from "../scrapers/filter.js";
 import { THEME_INIT_SCRIPT, SHELL_TAIL_SCRIPT, SHARED_CSS, sidebar, FAVICON } from "./shell.js";
 import { authRouter, requireUser } from "./auth.js";
 import { adminRouter } from "./admin.js";
@@ -27,6 +28,58 @@ const PORT = process.env.PORT || 4000;
 // Express 4 doesn't await handlers, so an async route that throws would become an
 // unhandled rejection. Wrap them so failures become normal 500s.
 const route = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
+
+// ── Inline icons ──
+// Same drawing style as shell.js's sidebar icons (lucide-like, 24x24, currentColor) but
+// defined here so this file stays self-contained. Used server-side in templates and
+// handed to the page scripts as ICONS (see iconScript below).
+function icon(key, size = 15) {
+  const s = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="${size}" height="${size}" aria-hidden="true">`;
+  const paths = {
+    clock: '<circle cx="12" cy="12" r="9"></circle><path d="M12 7.5V12l3 1.8"></path>',
+    check: '<polyline points="20 6 9 17 4 12"></polyline>',
+    x: '<path d="M18 6L6 18"></path><path d="M6 6l12 12"></path>',
+    warn: '<path d="M10.3 3.9 1.9 18.3A2 2 0 0 0 3.6 21h16.8a2 2 0 0 0 1.7-2.7L13.7 3.9a2 2 0 0 0-3.4 0z"></path><path d="M12 9v4.5"></path><path d="M12 17.5h.01"></path>',
+    // The leads/CRM table motif, reused from the sidebar so "move to leads" reads as one idea.
+    crm: '<rect x="3" y="4" width="18" height="16" rx="2"></rect><path d="M3 10h18M9 4v16"></path>',
+    search: '<circle cx="11" cy="11" r="7"></circle><path d="M21 21l-4.2-4.2"></path>',
+    mail: '<rect x="3" y="5" width="18" height="14" rx="2"></rect><path d="m3.5 6.5 8.5 6 8.5-6"></path>',
+    plus: '<path d="M12 5v14M5 12h14"></path>',
+    undo: '<path d="M3 10h11a5 5 0 0 1 0 10h-4"></path><polyline points="7 6 3 10 7 14"></polyline>',
+    dot: '<circle cx="12" cy="12" r="5"></circle>',
+    badge: '<rect x="2" y="5" width="20" height="14" rx="2"></rect><circle cx="8.5" cy="12" r="2.5"></circle><path d="M14 10.5h4M14 14h4"></path>',
+    calendar: '<rect x="3" y="5" width="18" height="16" rx="2"></rect><path d="M3 10h18M8 3v4M16 3v4"></path>',
+    refresh: '<path d="M21 12a9 9 0 1 1-2.6-6.4"></path><polyline points="21 3 21 9 15 9"></polyline>',
+  };
+  return s + (paths[key] || "") + "</svg>";
+}
+// The same icons, as a JS object the page scripts can splice into strings.
+function iconScript(keys, size = 15) {
+  const map = {};
+  for (const k of keys) map[k] = icon(k, size);
+  return `var ICONS=${JSON.stringify(map)};`;
+}
+
+// ── Buckets ──
+// Every CRM lead lives in exactly one of these, set when it is moved over from a search.
+// The list itself is the store's (../data/store.js owns what a valid bucket is); the
+// copy below is this file's.
+const CRM_BUCKETS = store.CRM_BUCKETS;
+const BUCKET_META = {
+  qualified: {
+    title: "No-website leads",
+    sub: "no website and still active, the ones worth calling first",
+  },
+  inactive: {
+    title: "Not active",
+    sub: "no website, but nothing posted lately, backups to work later",
+  },
+  has_website: {
+    title: "Has a website",
+    sub: "already online, worth a rebuild pitch when you have room",
+  },
+};
+const isBucket = (b) => CRM_BUCKETS.includes(String(b || ""));
 
 app.use(express.json());
 app.use(express.static(join(__dirname, "public"))); // serves /logo.png, /mark.png
@@ -81,7 +134,7 @@ async function blockedByAllotment(req, res, { live }) {
   if (allotment === 0) {
     res.status(402).json({
       ok: false,
-      error: "Your account isn't active yet — reach out to have your monthly tokens set up.",
+      error: "Your account isn't active yet. Reach out to have your monthly tokens set up.",
     });
     return true;
   }
@@ -90,7 +143,7 @@ async function blockedByAllotment(req, res, { live }) {
     res.status(429).json({
       ok: false,
       error: `You've used all ${allotment.toLocaleString()} tokens in your plan this month. ` +
-             `They refill on ${planResetLabel()} — or ask for a top-up to keep searching now.`,
+             `They refill on ${planResetLabel()}, or ask for a top-up to keep searching now.`,
     });
     return true;
   }
@@ -115,6 +168,11 @@ async function blockedBySpendCap(res, { live }) {
   return false;
 }
 
+// Note: the global business directory (every business any scan touches, with and without
+// a website) is fed from inside discover() in ../lib/pipeline.js, which is the only place
+// that sees the FULL scanned set. discover() hands this handler the qualifying prospects
+// only, so recording it here would miss most of what we scanned.
+
 // ── SEARCH API: run a live lookup (Google + Facebook) for a niche + city ──
 app.post("/api/search", async (req, res) => {
   const { niche, city, state, sources, limit, forceRefresh } = req.body;
@@ -127,7 +185,7 @@ app.post("/api/search", async (req, res) => {
     const willSpend = await willSearchSpend({ userId: req.userId, niche, city, state, sources: resolvedSources, limit: limit || 30, forceRefresh: !!forceRefresh });
     if (await blockedBySpendCap(res, { live: willSpend })) return;
     if (await blockedByAllotment(req, res, { live: willSpend })) return;
-    const { prospects, stats, cached, cachedAt } = await discover({
+    const { prospects, stats, cached, cachedAt, alsoSeen } = await discover({
       userId: req.userId,
       niche,
       city,
@@ -136,7 +194,16 @@ app.post("/api/search", async (req, res) => {
       limit: limit || 30,
       forceRefresh: !!forceRefresh,
     });
-    res.json({ ok: true, stats, cached: !!cached, cachedAt: cachedAt || null, prospects: prospects.map(slimProspect) });
+    // The qualifying leads plus the in-niche businesses the scan saw but skipped (the ones
+    // that already have a website). They arrive pre-slimmed and carry hasWebsite, so the
+    // page's own grouping drops each into the right section.
+    res.json({
+      ok: true,
+      stats,
+      cached: !!cached,
+      cachedAt: cachedAt || null,
+      prospects: prospects.map(slimProspect).concat(alsoSeen || []),
+    });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
@@ -153,7 +220,7 @@ app.post("/api/search-batch", async (req, res) => {
   try {
     if (await blockedBySpendCap(res, { live: true })) return;
     if (await blockedByAllotment(req, res, { live: true })) return;
-    const { prospects, stats } = await discoverMany({
+    const { prospects, stats, alsoSeen } = await discoverMany({
       userId: req.userId,
       niches: nicheList,
       cities: cityList,
@@ -162,13 +229,76 @@ app.post("/api/search-batch", async (req, res) => {
       limit: limit || 30,
       forceRefresh: !!forceRefresh,
     });
-    res.json({ ok: true, stats, prospects: prospects.map(slimProspect) });
+    res.json({ ok: true, stats, prospects: prospects.map(slimProspect).concat(alsoSeen || []) });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
 });
 
 // ── CRM API ──
+// Move search results into the CRM under one bucket. Takes the whole prospect objects the
+// search page is already holding, so a group can be moved in one request.
+app.post("/api/crm/move", route(async (req, res) => {
+  const { prospects, bucket } = req.body || {};
+  if (!isBucket(bucket)) {
+    return res.status(400).json({ ok: false, error: "Pick one of: qualified, inactive, has_website." });
+  }
+  const list = (Array.isArray(prospects) ? prospects : []).filter((p) => p && typeof p === "object");
+  if (!list.length) return res.status(400).json({ ok: false, error: "Nothing to move." });
+  const { added = 0, skipped = 0 } = (await store.moveToCrm(req.userId, list, bucket)) || {};
+  res.json({ ok: true, added, skipped });
+}));
+
+// Follow-up shorthands the UI sends. "1 month" is a real calendar month, not 30 days.
+const FOLLOWUP_SHORTHAND = {
+  "3d": (d) => d.setDate(d.getDate() + 3),
+  "1w": (d) => d.setDate(d.getDate() + 7),
+  "2w": (d) => d.setDate(d.getDate() + 14),
+  "1m": (d) => d.setMonth(d.getMonth() + 1),
+};
+// "3d" | "1w" | "2w" | "1m" | an ISO date → an ISO timestamp. "" / null → null (clear it).
+// Returns undefined for anything we can't read, so the caller can answer 400.
+function followUpIso(when) {
+  if (when === null || when === undefined) return null;
+  const raw = String(when).trim();
+  if (!raw) return null;
+  const shift = FOLLOWUP_SHORTHAND[raw.toLowerCase()];
+  if (shift) {
+    const d = new Date();
+    shift(d);
+    return d.toISOString();
+  }
+  // A bare date from the picker is anchored at midday UTC, so it reads as the same
+  // calendar day whether it's rendered on a UTC server or in the user's own timezone.
+  if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) return `${raw}T12:00:00.000Z`;
+  const t = Date.parse(raw);
+  return isNaN(t) ? undefined : new Date(t).toISOString();
+}
+
+// Set (or clear) a lead's follow-up date. Setting one is the "I did something here, come
+// back to me later" gesture: the lead leaves the working list until that date.
+app.post("/api/leads/:id/followup", route(async (req, res) => {
+  const followUpAt = followUpIso(req.body?.when);
+  if (followUpAt === undefined) {
+    return res.status(400).json({ ok: false, error: "Use 3d, 1w, 2w, 1m, or a date." });
+  }
+  await store.setFollowUp(req.userId, req.params.id, followUpAt);
+  res.json({ ok: true, followUpAt });
+}));
+
+// Move a lead to a different bucket (e.g. a "not active" one turned out to be alive).
+app.post("/api/leads/:id/bucket", route(async (req, res) => {
+  const { bucket } = req.body || {};
+  if (!isBucket(bucket)) {
+    return res.status(400).json({ ok: false, error: "Pick one of: qualified, inactive, has_website." });
+  }
+  await store.setLeadBucket(req.userId, req.params.id, bucket);
+  res.json({ ok: true, bucket });
+}));
+
+// Save one already-stored lead. Superseded in the UI by /api/crm/move (which also sets the
+// bucket); kept so any older caller still works. A lead saved this way takes the default
+// bucket and lands in the no-website working list.
 app.post("/api/crm/save/:id", route(async (req, res) => {
   await store.saveToCrm(req.userId, req.params.id);
   res.json({ ok: true });
@@ -183,7 +313,7 @@ app.post("/api/dismiss/:id", route(async (req, res) => {
   res.json({ ok: true });
 }));
 
-// Your ✓/✗ on whether our "last active" tag was right (trains/validates the dating).
+// Your yes/no on whether our "last active" tag was right (trains/validates the dating).
 app.post("/api/activity-feedback/:id", route(async (req, res) => {
   const { verdict, seen } = req.body || {};
   await store.setActivityFeedback(req.userId, req.params.id, verdict, seen || "");
@@ -194,16 +324,19 @@ app.post("/api/crm/update/:id", route(async (req, res) => {
   res.json({ ok: true });
 }));
 
-// ── LEADS: one page, three tabs (tracked · found · follow-up) ──
-// `tracked` is the old CRM table, `found` is every lead the machine has surfaced
-// (the old Brain "Your leads" tab, now actionable), `followup` is the old CRM tab.
-app.get("/leads", route(async (req, res) => res.send(await renderLeadsPage(req, req.query.view))));
+// ── LEADS: one page, three bucket sections, each with a working + follow-up list ──
+// The old tabs (?view=tracked / found / followup) are gone; the whole lifecycle is on the
+// one page now. Those links still land somewhere sensible instead of rendering an empty tab.
+app.get("/leads", route(async (req, res) => {
+  if (req.query.view) {
+    return res.redirect(302, req.query.view === "followup" ? "/leads#followups" : "/leads");
+  }
+  res.send(await renderLeadsPage(req));
+}));
 
-// Old URLs keep working: /crm and /brain are now tabs of /leads.
-app.get("/crm", (req, res) =>
-  res.redirect(302, req.query.view === "followup" ? "/leads?view=followup" : "/leads")
-);
-app.get("/brain", (req, res) => res.redirect(302, "/leads?view=found"));
+// Old URLs keep working: /crm and /brain both landed on the leads page.
+app.get("/crm", (req, res) => res.redirect(302, req.query.view === "followup" ? "/leads#followups" : "/leads"));
+app.get("/brain", (req, res) => res.redirect(302, "/leads"));
 
 // ── Manual follow-ups (your own reminders) ──
 app.post("/api/followup/add", route(async (req, res) => {
@@ -251,6 +384,7 @@ function slimProspect(l) {
   try { lj = l.lead_json ? JSON.parse(l.lead_json) : {}; } catch {}
   return {
     id: l.id,
+    external_id: l.external_id || "", // travels with the prospect so /api/crm/move can dedup on it
     name: l.name,
     category: l.category,
     city: l.city,
@@ -259,12 +393,14 @@ function slimProspect(l) {
     email: l.email || "",
     source: l.source,
     website: l.website || "",
+    // Same rule the search filter uses: a Facebook/Yelp/free-builder page is NOT a website.
+    hasWebsite: isRealWebsiteUrl(l.website || ""),
     reviews: l.reviews ?? null,
     rating: l.rating ?? null,
     lastActive: lastActiveLabel(lj), // "Mar 2025" or "" when unknown
     activeStatus: activityStatus(lj), // "active" | "stale" | "unknown"
     activeSignal: activitySignal(lj), // "FB post" | "IG post" | "Google review"
-    verdict: l.activity_verdict || "", // your ✓/✗ on the activity tag, if given
+    verdict: l.activity_verdict || "", // your yes/no on the activity tag, if given
     license: detectLicenseSignal(lj), // { status, number, evidence } — best-effort license/registration signal
     licenseUrl: licenseSearchUrl(lj), // one-click official-search link to confirm
     saved: !!l.saved,
@@ -276,11 +412,14 @@ app.get("/api/last-search", route(async (req, res) => {
   const ls = await store.getState(req.userId, "last_search");
   if (!ls) return res.json({ ok: true, empty: true });
   const rows = await store.getLeadsByIds(req.userId, ls.ids || []);
+  // Also-seen businesses have no lead rows to reload from, so they were stored with the
+  // search itself. A search remembered before they existed just has none.
+  const alsoSeen = Array.isArray(ls.alsoSeen) ? ls.alsoSeen : [];
   res.json({
     ok: true,
     query: { niche: ls.niche, city: ls.city, state: ls.state, sources: ls.sources, limit: ls.limit },
     stats: ls.stats,
-    prospects: rows.map(slimProspect),
+    prospects: rows.map(slimProspect).concat(alsoSeen),
   });
 }));
 
@@ -322,7 +461,7 @@ app.use(demoRouter);
 // must NOT bind a port there.
 if (!process.env.VERCEL) {
   app.listen(PORT, process.env.BIND_HOST || "127.0.0.1", () => {
-    console.log(`\n🛰  Prospector → http://localhost:${PORT}\n`);
+    console.log(`\nProspector ready at http://localhost:${PORT}\n`);
   });
 }
 
@@ -335,18 +474,19 @@ function esc(s = "") {
 }
 
 // License/registration badge (server-rendered) for the CRM table. Best-effort signal
-// from the lead's own profile text + a one-click official-verify link. Inline-styled so it
-// works on every page with no extra CSS.
+// from the lead's own profile text + a one-click official-verify link. Styled with the
+// shared .lic-* classes (colours live in SHARED_CSS, layout in each page's own <style>).
 function licenseBadgeHtml(l) {
   let lj = {};
   try { lj = l.lead_json ? JSON.parse(l.lead_json) : {}; } catch {}
   const sig = detectLicenseSignal(lj);
   const url = licenseSearchUrl(lj);
   const on = sig.status === "mentioned";
-  const label = on ? `🪪 ${esc(sig.evidence || "licensed/registered")}` : "🪪 no license info";
-  const bg = on ? "rgba(40,200,100,.14)" : "rgba(255,255,255,.06)";
-  const color = on ? "#28c864" : "#7b8499";
-  return `<span title="${on ? "What the business advertises — confirm with Verify" : "Nothing found in their profile — check the official search"}" style="display:inline-flex;align-items:center;gap:4px;font-size:12px;font-weight:600;padding:2px 8px;border-radius:6px;background:${bg};color:${color}">${label}</span> <a href="${url}" target="_blank" rel="noopener" style="color:#14FFB9;font-size:12px;text-decoration:none">verify ↗</a>`;
+  const label = on ? esc(sig.evidence || "licensed/registered") : "no license info";
+  const title = on
+    ? "What the business advertises. Confirm it with Verify."
+    : "Nothing found in their profile. Check the official search.";
+  return `<span class="lic-badge ${on ? "lic-yes" : "lic-no"}" title="${title}">${icon("badge", 13)}${label}</span> <a class="lic-verify" href="${url}" target="_blank" rel="noopener">Verify</a>`;
 }
 
 // ── SEARCH / PROSPECTOR PAGE ──
@@ -359,8 +499,8 @@ async function renderSearchPage(req) {
   const fcfg = freshnessConfig();
   const activeExplain = !fcfg.enabled
     ? "This check is currently off, so businesses are kept no matter how long ago they were last active."
-    : `We look at each business's newest Facebook or Instagram post (or Google review). If the most recent one is older than <b>${esc(cutoffLabel())}</b>, we skip them &mdash; a business that's gone quiet probably isn't taking new customers.`;
-  return `<!doctype html><html><head>${THEME_INIT_SCRIPT}<meta charset="utf-8">${FAVICON}<title>Prospector — Search</title>
+    : `We look at each business's newest Facebook or Instagram post (or Google review). If the most recent one is older than <b>${esc(cutoffLabel())}</b>, we file them under <b>not active</b>: a business that's gone quiet probably isn't taking new customers.`;
+  return `<!doctype html><html><head>${THEME_INIT_SCRIPT}<meta charset="utf-8">${FAVICON}<title>Prospector · Search</title>
 <style>
   :root{--gold:#14FFB9;--bg:#0a1124;--panel:#0f1a30;--border:rgba(20,255,185,.22);--text:#e8eaf0;--muted:#7b8499}
   *{box-sizing:border-box;margin:0;padding:0}
@@ -413,12 +553,41 @@ async function renderSearchPage(req) {
   .lic-verify{color:var(--gold);font-size:12px;text-decoration:none;margin-left:6px}
   .spinner{display:inline-block;width:14px;height:14px;border:2px solid var(--gold);border-top-color:transparent;border-radius:50%;animation:spin .7s linear infinite;vertical-align:-2px;margin-right:6px}
   @keyframes spin{to{transform:rotate(360deg)}}
+  /* ── Result groups: qualified / not active / has a website ── */
+  .scanline{font-size:14px;color:var(--muted);margin:2px 0 14px}
+  .scanline b{color:var(--text)}
+  .grp{background:var(--panel);border:1px solid var(--border);border-radius:12px;margin-bottom:14px;overflow:hidden}
+  .grp>summary{list-style:none;cursor:pointer;padding:15px 18px;display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+  .grp>summary::-webkit-details-marker{display:none}
+  .grp>summary::after{content:"";flex:none;width:9px;height:9px;margin-left:6px;border-right:2px solid var(--muted);border-bottom:2px solid var(--muted);transform:rotate(45deg) translateY(-2px);transition:transform .15s;order:1}
+  .grp[open]>summary::after{transform:rotate(225deg) translateY(-2px)}
+  .grp-ttl{font-weight:700;font-size:15px;color:var(--text)}
+  .grp-n{font-size:12px;font-weight:700;padding:2px 9px;border-radius:20px;background:var(--surface2);color:var(--muted)}
+  .grp-lead .grp-n{background:var(--accent-weak);color:var(--accent-ink)}
+  .grp-sub{font-size:13px;color:var(--muted);flex:1 1 100%;margin:-4px 0 0;order:2}
+  .grp-body{padding:0 14px 14px}
+  .grp-act{margin-left:auto;display:flex;gap:8px;align-items:center}
+  .moveall{display:inline-flex;align-items:center;gap:7px;font-family:inherit;background:var(--accent);color:var(--on-accent);border:none;border-radius:8px;padding:9px 16px;font-weight:700;font-size:13px;cursor:pointer;white-space:nowrap}
+  .moveall:hover{filter:brightness(.96)}
+  .moveall:disabled{opacity:.6;cursor:wait}
+  .moveall.ghost{background:transparent;border:1px solid var(--border-strong);color:var(--text)}
+  .moveall.ghost:hover{background:var(--surface2);filter:none}
+  .grp-done{display:flex;align-items:center;gap:10px;background:var(--panel);border:1px solid var(--border);border-left:3px solid var(--accent);border-radius:12px;padding:14px 18px;margin-bottom:14px;font-size:14px;color:var(--text)}
+  .grp-done .ok{display:inline-flex;color:var(--accent)}
+  .grp-done a{font-weight:700;margin-left:auto;text-decoration:none;white-space:nowrap}
+  .statuserr{display:inline-flex;align-items:center;gap:7px;color:var(--danger)}
+  .grp .lead{margin:10px 0 0}
+  .save{display:inline-flex;align-items:center;gap:6px}
+  .fresh-badge svg,.lic-badge svg,.save svg,.hide svg{flex:none}
+  .lic-badge{display:inline-flex;align-items:center;gap:5px}
+  .fresh-badge{display:inline-flex;align-items:center;gap:5px}
+  .fresh-stale{background:var(--surface2);color:var(--muted)}
 ${SHARED_CSS}</style></head><body>
 ${sidebar("search", { isAdmin: req.isAdmin, demo: req.isDemo })}<div class="pagehead"><div class="titlewrap"><h1>Search</h1><div class="pagesub">Find local businesses that don't have a website yet</div></div><div class="spacer"></div>
   <div class="statbox">
-    <div class="cell"><span class="k"><svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="vertical-align:-1px;margin-right:4px"><ellipse cx="12" cy="6" rx="8" ry="3"/><path d="M4 6v6c0 1.7 3.6 3 8 3s8-1.3 8-3V6"/><path d="M4 12v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6"/></svg>Remembered</span><span class="v" id="sbMem">—</span><span class="s2" id="sbMemSub"></span></div>
+    <div class="cell"><span class="k"><svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="vertical-align:-1px;margin-right:4px"><ellipse cx="12" cy="6" rx="8" ry="3"/><path d="M4 6v6c0 1.7 3.6 3 8 3s8-1.3 8-3V6"/><path d="M4 12v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6"/></svg>Remembered</span><span class="v" id="sbMem">&hellip;</span><span class="s2" id="sbMemSub"></span></div>
     <div class="sep"></div>
-    <div class="cell"><span class="k">Tokens used</span><span class="v" id="sbTok">—</span><span class="s2" id="sbSearches"></span><div class="tokbar" id="sbBarWrap"><div class="tokbar-fill" id="sbBar"></div></div></div>
+    <div class="cell"><span class="k">Tokens used</span><span class="v" id="sbTok">&hellip;</span><span class="s2" id="sbSearches"></span><div class="tokbar" id="sbBarWrap"><div class="tokbar-fill" id="sbBar"></div></div></div>
   </div>
 </div>
 
@@ -428,20 +597,20 @@ ${sidebar("search", { isAdmin: req.isAdmin, demo: req.isDemo })}<div class="page
      client-side from the fetch. -->
 <div id="prWelcome" class="welcome" style="display:none" role="region" aria-label="Getting started">
   <div id="prWelcomePending" class="welcome-card welcome-pending" style="display:none">
-    <div class="welcome-mark" aria-hidden="true">&#9670;</div>
+    <div class="welcome-mark">${icon("clock", 17)}</div>
     <div class="welcome-body">
-      <h2 class="welcome-h">You're all set up &mdash; activation pending</h2>
+      <h2 class="welcome-h">You're all set up, activation pending</h2>
       <p>Your account is ready to go, but a plan hasn't been assigned yet, so searching is locked for now.</p>
       <p>You'll be able to run searches the moment your tokens are added. Reach out to your account contact to activate.</p>
     </div>
   </div>
   <div id="prWelcomeActive" class="welcome-card" style="display:none">
-    <div class="welcome-mark" aria-hidden="true">&#9670;</div>
+    <div class="welcome-mark">${icon("search", 17)}</div>
     <div class="welcome-body">
       <h2 class="welcome-h">Welcome to Prospector</h2>
       <ul class="welcome-points">
-        <li><b>What it does.</b> Prospector finds local businesses that don't have a website yet &mdash; the ones you can offer to build one for.</li>
-        <li><b>Your plan this month.</b> You have <span id="prAllot">&mdash;</span> tokens this month &mdash; about <span id="prSearches">&mdash;</span> searches.</li>
+        <li><b>What it does.</b> Prospector finds local businesses that don't have a website yet, the ones you can offer to build one for.</li>
+        <li><b>Your plan this month.</b> You have <span id="prAllot">&hellip;</span> tokens this month, about <span id="prSearches">&hellip;</span> searches.</li>
         <li><b>When you run low.</b> Your tokens refill on the 1st, or reach out for more.</li>
       </ul>
       <div class="welcome-foot">
@@ -452,12 +621,12 @@ ${sidebar("search", { isAdmin: req.isAdmin, demo: req.isDemo })}<div class="page
 </div>
 
 <details class="explain">
-  <summary><span class="ex-ttl">What counts as a lead?</span><span class="ex-sub">a business must pass all 3 checks to show up here</span></summary>
+  <summary><span class="ex-ttl">What counts as a lead?</span><span class="ex-sub">a business must pass all 3 checks to be a top prospect</span></summary>
   <div class="ex-body">
     <div class="ex-item"><span class="ex-num">1</span><div><b>It's one of your trades</b><p>${explainNiches}</p></div></div>
-    <div class="ex-item"><span class="ex-num">2</span><div><b>It has no real website</b><p>A Facebook, Instagram, or Yelp page doesn't count &mdash; we're after businesses with no website of their own (so you can offer to build them one).</p></div></div>
+    <div class="ex-item"><span class="ex-num">2</span><div><b>It has no real website</b><p>A Facebook, Instagram, or Yelp page doesn't count. We're after businesses with no website of their own, so you can offer to build them one.</p></div></div>
     <div class="ex-item"><span class="ex-num">3</span><div><b>It's still active</b><p>${activeExplain}</p></div></div>
-    <p class="ex-foot">Miss any one of these and the business is skipped. Everything we've ever scanned is <b>remembered</b> so we never re-check it &mdash; but only the ones that pass all three land in <b>Leads</b>.</p>
+    <p class="ex-foot">Businesses that pass all three are your <b>qualified</b> results. The rest still show up, sorted into <b>not active</b> and <b>has a website</b>, so nothing we scanned goes to waste. Everything we've ever checked is <b>remembered</b>, so we never pay to re-check it.</p>
   </div>
 </details>
 
@@ -506,6 +675,8 @@ ${sidebar("search", { isAdmin: req.isAdmin, demo: req.isDemo })}<div class="page
   var NICHE_KEYS = ${JSON.stringify(NICHES.map((n) => n.key))};
   var RATE_PER_1K = ${RATE_PER_1K};
   var TOKENS_PER_USD = ${TOKENS_PER_USD};
+  ${iconScript(["crm", "check", "x", "warn", "clock", "mail", "dot", "badge", "refresh", "undo"], 14)}
+  var BUCKETS = ${JSON.stringify(BUCKET_META)};
 </script>
 
 <div id="status"></div>
@@ -516,6 +687,7 @@ ${sidebar("search", { isAdmin: req.isAdmin, demo: req.isDemo })}<div class="page
 function setNiche(n){document.getElementById('niche').value=n;updateEstimate()}
 async function post(url,data){const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data||{})});return r.json()}
 function st(html){document.getElementById('status').innerHTML=html}
+function stErr(msg){st('<span class="statuserr">'+ICONS.warn+' '+esc(msg||'Something went wrong.')+'</span>')}
 // Rough run-time model (measured: a 3-source Quick scan ~2.5 min). Per source there's
 // a startup cost plus per-place work; the dating pass adds a flat ~35s.
 function estSeconds(sources,depth){return Math.round(sources*(18+depth*1.1)+35);}
@@ -530,13 +702,13 @@ function startProgress(expSec){
   function tick(){
     var el=Math.round((Date.now()-t0)/1000);
     var stage=PROG_STAGES[Math.min(PROG_STAGES.length-1,Math.floor(el/per))];
-    st('<span class="spinner"></span> '+stage+' <span style="opacity:.7">\u2014 '+mmss(el)+' elapsed, usually about '+fmtMin(expSec)+'</span>');
+    st('<span class="spinner"></span> '+stage+' <span style="opacity:.7">('+mmss(el)+' elapsed, usually about '+fmtMin(expSec)+')</span>');
   }
   tick(); progTimer=setInterval(tick,1000);
 }
 function stopProgress(){clearInterval(progTimer);progTimer=null;}
 
-// "Knoxville, Maryville" → ["Knoxville","Maryville"]
+// "Knoxville, Maryville" becomes ["Knoxville","Maryville"]
 function parseCities(){return document.getElementById('city').value.split(',').map(s=>s.trim()).filter(Boolean)}
 function chosenSources(){const s=document.getElementById('source').value;return s==='all'?['google','facebook','instagram']:[s]}
 function chosenNiches(){return document.getElementById('allNiches').checked?NICHE_KEYS.slice():[document.getElementById('niche').value.trim()].filter(Boolean)}
@@ -552,17 +724,17 @@ function updateEstimate(){
   const big=totalSec>700; // near the server's run limit
   el.className='estimate'+(big?' big':'');
   if(cells>1){
-    el.innerHTML=(big?'⚠️ ':'')+'Batch of <b>'+cells+'</b> searches · scans <b>~'+places.toLocaleString()+' businesses</b> · about <b>'+fmtMin(totalSec)+'</b> · ~<b>'+tokens.toLocaleString()+' tokens</b>'+(big?' <span style="opacity:.85">— may be too big to finish in one run</span>':'');
+    el.innerHTML=(big?ICONS.warn+' ':'')+'Batch of <b>'+cells+'</b> searches · scans <b>~'+places.toLocaleString()+' businesses</b> · about <b>'+fmtMin(totalSec)+'</b> · ~<b>'+tokens.toLocaleString()+' tokens</b>'+(big?' <span style="opacity:.85">(may be too big to finish in one run)</span>':'');
     return;
   }
-  el.innerHTML='Scans <b>~'+places.toLocaleString()+' businesses</b> · about <b>'+fmtMin(totalSec)+'</b> · ~<b>'+tokens.toLocaleString()+' tokens</b> <span style="opacity:.65">\u2014 more than you could check by hand</span>';
+  el.innerHTML='Scans <b>~'+places.toLocaleString()+' businesses</b> · about <b>'+fmtMin(totalSec)+'</b> · ~<b>'+tokens.toLocaleString()+' tokens</b>, <span style="opacity:.65">more than you could check by hand</span>';
 }
 
 async function runSearch(force){
   const cities=parseCities();
-  if(!cities.length){st('❌ Enter at least one city.');return}
+  if(!cities.length){stErr('Enter at least one city.');return}
   const niches=chosenNiches();
-  if(!niches.length){st('❌ Enter a niche (or tick All trades).');return}
+  if(!niches.length){stErr('Enter a niche, or tick All trades.');return}
   const sources=chosenSources();
   const depth=parseInt(document.getElementById('limit').value);
   const multi=cities.length>1||niches.length>1;
@@ -585,7 +757,7 @@ async function runSearch(force){
   }
   stopProgress();
   btn.disabled=false;rb.disabled=false;
-  if(!r.ok){st('❌ '+r.error);return}
+  if(!r.ok){stErr(r.error);return}
   render(r.stats,r.prospects,multi?'batch':(r.cached?'cached':'fresh'));
   loadMemory();
 }
@@ -602,9 +774,9 @@ loadMemory();
 // Pure state pick, kept as its own function so it can be unit-tested in isolation.
 // Returns which variant (if any) to show, given the /api/usage payload and whether
 // this browser has already dismissed the welcome:
-//   'unassigned' → 0 tokens / no plan yet (can't search) — always shown, not dismissable
-//   'active'     → has a plan (allotment>0) and hasn't dismissed yet — the teaching card
-//   'hide'       → active user who already clicked "Got it" (or a bad/empty response)
+//   'unassigned' = 0 tokens / no plan yet (can't search). Always shown, not dismissable.
+//   'active'     = has a plan (allotment>0) and hasn't dismissed yet. The teaching card.
+//   'hide'       = active user who already clicked "Got it" (or a bad/empty response).
 function prPickWelcome(u,welcomed){
   if(!u||!u.ok) return 'hide';
   if(u.unassigned) return 'unassigned';
@@ -632,58 +804,152 @@ function prDismissWelcome(){
   box.style.display='block';
 })();
 
+// ── Result grouping ────────────────────────────────────────────────────────
+// Every result lands in exactly one of three groups, in the order you work them:
+//   qualified    no website, still active      call these today
+//   inactive     no website, but gone quiet    backups for later
+//   has_website  already online                grab-later rebuild pitches
+// GROUPS is kept around after render so "Move all to CRM" can post the whole group.
+var GROUP_KEYS=['qualified','inactive','has_website'];
+var GROUPS={qualified:[],inactive:[],has_website:[]};
+function bucketOf(p){
+  if(p.hasWebsite)return 'has_website';
+  return p.activeStatus==='active'?'qualified':'inactive';
+}
+function groupProspects(list){
+  var g={qualified:[],inactive:[],has_website:[]};
+  (list||[]).forEach(function(p){g[bucketOf(p)].push(p)});
+  return g;
+}
+function srcName(s){
+  s=String(s||'');
+  if(s.indexOf('facebook')===0)return 'Facebook';
+  if(s.indexOf('instagram')===0)return 'Instagram';
+  if(s.indexOf('google')===0)return 'Google';
+  return s||'source';
+}
+function groupSection(key){
+  var list=GROUPS[key]||[];
+  if(!list.length)return '';
+  var meta=BUCKETS[key]||{title:key,sub:''};
+  var first=key==='qualified';
+  return '<details class="grp'+(first?' grp-lead':'')+'" id="grp-'+key+'"'+(first?' open':'')+'>'+
+    '<summary>'+
+      '<span class="grp-ttl">'+esc(meta.title)+'</span>'+
+      '<span class="grp-n">'+list.length+'</span>'+
+      '<span class="grp-act"><button class="moveall'+(first?'':' ghost')+'" id="mv-'+key+'" onclick="moveGroup(event,\\''+key+'\\')">'+ICONS.crm+' Move all to CRM</button></span>'+
+      '<span class="grp-sub">'+esc(meta.sub)+'</span>'+
+    '</summary>'+
+    '<div class="grp-body">'+list.map(function(p){return card(p,key)}).join('')+'</div>'+
+  '</details>';
+}
+// Once a group has been moved, it shrinks to a single line so the eye moves on.
+function collapseGroup(key,added,skipped){
+  var el=document.getElementById('grp-'+key);
+  if(!el)return;
+  var meta=BUCKETS[key]||{title:key};
+  var extra=skipped?', <span class="muted"><b>'+skipped+'</b> already in your CRM</span>':'';
+  var done=document.createElement('div');
+  done.className='grp-done';
+  done.id='grp-'+key;
+  done.innerHTML='<span class="ok">'+ICONS.check+'</span><span>'+esc(meta.title)+': <b>'+added+'</b> moved to your leads'+extra+'</span><a href="/leads">Open leads</a>';
+  el.replaceWith(done);
+}
+async function moveGroup(e,key){
+  if(e){e.preventDefault();e.stopPropagation()}
+  var list=(GROUPS[key]||[]).filter(function(p){return !p.moved});
+  if(!list.length)return;
+  var b=document.getElementById('mv-'+key);
+  if(b){b.disabled=true;b.innerHTML=ICONS.clock+' Moving…'}
+  var r=await post('/api/crm/move',{prospects:list,bucket:key});
+  if(!r||!r.ok){if(b){b.disabled=false;b.innerHTML=ICONS.warn+' Try again'}return}
+  list.forEach(function(p){p.moved=true});
+  collapseGroup(key,r.added||0,r.skipped||0);
+}
+function findProspect(id){
+  for(var i=0;i<GROUP_KEYS.length;i++){
+    var l=GROUPS[GROUP_KEYS[i]]||[];
+    for(var j=0;j<l.length;j++)if(String(l[j].id)===String(id))return l[j];
+  }
+  return null;
+}
+async function addLead(id,bucket){
+  var p=findProspect(id);
+  if(!p)return;
+  var b=document.getElementById('s-'+id);
+  if(b)b.disabled=true;
+  var r=await post('/api/crm/move',{prospects:[p],bucket:bucket});
+  if(!r||!r.ok){if(b){b.disabled=false;b.innerHTML=ICONS.warn+' Try again'}return}
+  p.moved=true;
+  if(b){b.innerHTML=ICONS.check+' In your leads';b.classList.add('saved-on');b.onclick=null}
+}
+
 function render(s,prospects,mode){
   document.getElementById('statsWrap').innerHTML=
     '<div class="stats" style="grid-template-columns:repeat(3,1fr)">'+
-    stat(s.qualified,'No-website leads','good')+stat(s.scanned||'—','Scanned')+stat(s.hasWebsite!=null?s.hasWebsite:'—','Already had a site')+
+    stat(s.qualified,'No-website leads','good')+stat(s.scanned||0,'Scanned')+stat(s.hasWebsite!=null?s.hasWebsite:0,'Already had a site')+
     '</div>';
   // After a search the user just ran, glide down to the results so they don't have to
-  // scroll to find them. Skip on 'restored' (that fires on page load — jumping would jar).
+  // scroll to find them. Skip on 'restored' (that fires on page load, so jumping would jar).
   if(mode!=='restored'){var __sw=document.getElementById('statsWrap');if(__sw)setTimeout(function(){__sw.scrollIntoView({behavior:'smooth',block:'start'});},80);}
-  if(!prospects.length){st(mode==='fresh'||mode==='batch'?'No qualified (no-website) leads found. Try a higher Depth, more cities, or All trades.':'No saved leads here yet — hit Search to find some.');return}
-  var msg = mode==='cached' ? '💾 Saved results — <b>$0 credits used</b>. Hit 🔄 to re-scan for fresh data.'
-          : mode==='restored' ? '↩️ Restored your last search (no credits used).'
-          : mode==='batch' ? 'Batch scan done across <b>'+(s.cells||'?')+'</b> niche×city combos. Found <b>'+prospects.length+'</b> qualified leads.'
-          : 'Found <b>'+prospects.length+'</b> qualified leads. Save the ones you want to track.';
+  if(!prospects.length){st(mode==='fresh'||mode==='batch'?'Nothing came back. Try a higher Depth, more cities, or All trades.':'No results yet. Hit Search to find some.');return}
+  GROUPS=groupProspects(prospects);
+  var msg = mode==='cached' ? 'Saved results, <b>no credits used</b>. Hit Re-scan for fresh data.'
+          : mode==='restored' ? 'Restored your last search. No credits used.'
+          : mode==='batch' ? 'Batch scan done across <b>'+(s.cells||'?')+'</b> trade and city combos.'
+          : 'Scan finished.';
   // Show WHY leads were dropped (transparency), with the real cutoff label.
   var since=s.sinceLabel?(' since '+s.sinceLabel):'';
   var parts=[];
   if(s.staleSeen)parts.push('<b>'+s.staleSeen+'</b> too old');
   if(s.unknownSeen)parts.push('<b>'+s.unknownSeen+'</b> undated');
-  var hid = (s.inactive||parts.length) ? ' &nbsp;<span class="muted">· hid '+(s.inactive||0)+' inactive'+since+(parts.length?' ('+parts.join(', ')+')':'')+'</span>' : '';
+  var hid = s.inactive ? ' &nbsp;<span class="muted">· hid '+s.inactive+' inactive'+since+(parts.length?' ('+parts.join(', ')+')':'')+'</span>' : '';
   var merged = s.crossSourceMerged ? ' &nbsp;<span class="muted">· merged '+s.crossSourceMerged+' cross-source duplicate'+(s.crossSourceMerged===1?'':'s')+'</span>' : '';
   st(msg+' &nbsp;<span class="muted">('+prospects.length+' shown)</span>'+hid+merged);
-  document.getElementById('results').innerHTML='<h3 style="margin:6px 0 12px">Qualified prospects <span class="muted" style="font-weight:400;font-size:13px">— no website</span></h3>'+prospects.map(card).join('');
+  // The value story first: how much ground the scan covered for them.
+  var scanned=Number(s.scanned||0);
+  var head=scanned?'<div class="scanline">We scanned <b>'+scanned.toLocaleString()+' businesses</b> for you and sorted them into three lists.</div>':'';
+  document.getElementById('results').innerHTML=head+GROUP_KEYS.map(groupSection).join('');
 }
 function stat(n,l,cls){return '<div class="stat '+(cls||'')+'"><div class="n">'+n+'</div><div class="l">'+l+'</div></div>'}
-function card(p){
-  const email=p.email?'<span class="email">✉️ '+p.email+'</span>':'<span class="noemail">no email found</span>';
-  const src=p.source==='facebook'?'Facebook':p.source==='instagram'?'Instagram':'Google';
-  const saveBtn=p.saved
-    ? '<button class="save saved-on" id="s-'+p.id+'" disabled>✅ Saved to CRM</button>'
-    : '<button class="save" onclick="saveLead('+p.id+')" id="s-'+p.id+'">💾 Save</button>';
-  // Freshness badge: green when we have a dated signal, amber when we don't — shows the
-  // user WHY a lead qualified (e.g. "🟢 Active · Mar 2025 · FB post").
-  const fresh = p.lastActive
-    ? '<div><span class="fresh-badge fresh-active">🟢 Active · '+esc(p.lastActive)+(p.activeSignal?' · '+esc(p.activeSignal):'')+'</span></div>'
-    : '<div><span class="fresh-badge fresh-unknown">🟡 no dated activity</span></div>';
-  // License/registration signal (best-effort, from the business's own profile text) + a
-  // one-click link to verify it on an official search. Never hides a lead — just informs.
+function card(p,bucket){
+  var email=p.email?'<span class="email">'+ICONS.mail+' '+esc(p.email)+'</span>':'<span class="noemail">no email found</span>';
+  var saveBtn=p.saved||p.moved
+    ? '<button class="save saved-on" id="s-'+p.id+'" disabled>'+ICONS.check+' In your leads</button>'
+    : '<button class="save" id="s-'+p.id+'" onclick="addLead(\\''+p.id+'\\',\\''+bucket+'\\')">'+ICONS.crm+' Add</button>';
+  // Activity badge: why this business landed in the list it did.
+  var fresh = p.activeStatus==='active'
+    ? '<span class="fresh-badge fresh-active">'+ICONS.dot+' Active · '+esc(p.lastActive)+(p.activeSignal?' · '+esc(p.activeSignal):'')+'</span>'
+    : p.lastActive
+    ? '<span class="fresh-badge fresh-stale">'+ICONS.clock+' Last seen '+esc(p.lastActive)+'</span>'
+    : '<span class="fresh-badge fresh-unknown">'+ICONS.clock+' no dated activity</span>';
+  // License/registration signal (best-effort, from the business's own profile text) plus a
+  // one-click link to verify it on an official search. Never hides a lead, just informs.
   var lic=p.license||{};
   var licBadge = lic.status==='mentioned'
-    ? '<span class="lic-badge lic-yes" title="What the business advertises — confirm with Verify">🪪 '+esc(lic.evidence||'licensed/registered')+'</span>'
-    : '<span class="lic-badge lic-no" title="Nothing found in their profile text — check the official search">🪪 no license info</span>';
-  var lic_line = '<div style="margin-top:6px">'+licBadge+(p.licenseUrl?' <a class="lic-verify" href="'+p.licenseUrl+'" target="_blank" rel="noopener">verify ↗</a>':'')+'</div>';
+    ? '<span class="lic-badge lic-yes" title="What the business advertises. Confirm it with Verify.">'+ICONS.badge+' '+esc(lic.evidence||'licensed/registered')+'</span>'
+    : '<span class="lic-badge lic-no" title="Nothing found in their profile text. Check the official search.">'+ICONS.badge+' no license info</span>';
+  var lic_line = '<div style="margin-top:6px">'+licBadge+(p.licenseUrl?' <a class="lic-verify" href="'+p.licenseUrl+'" target="_blank" rel="noopener">Verify</a>':'')+'</div>';
+  var tag = bucket==='has_website' ? 'has a website' : 'no website';
+  // Marking a business off works on its lead row, and a browsable "also seen" business
+  // doesn't have one yet (it gets a "w3" style id instead of a numeric one). Those get no
+  // dismiss button rather than a button that quietly does nothing.
+  var hideBtn = isStored(p.id)
+    ? '<button class="hide" onclick="hideLead(\\''+p.id+'\\')" title="Mark off so it never shows in a future search">'+ICONS.x+'</button>'
+    : '';
   return '<div class="lead" id="lead-'+p.id+'">'+
-    '<div><h3>'+esc(p.name)+'<span class="badge">no website</span></h3>'+
+    '<div><h3>'+esc(p.name)+'<span class="badge">'+tag+'</span></h3>'+
     '<div class="meta">'+esc(p.category||'')+' · '+esc(p.city||'')+', '+esc(p.state||'')+' · '+esc(p.phone||'no phone')+'</div>'+
-    '<div class="meta"><span class="src">'+src+'</span> &nbsp; '+email+'</div>'+fresh+lic_line+'</div>'+
+    '<div class="meta"><span class="src">'+esc(srcName(p.source))+'</span> &nbsp; '+email+'</div>'+
+    '<div style="margin-top:6px">'+fresh+'</div>'+lic_line+'</div>'+
     '<div style="display:flex;gap:8px;align-items:center">'+
-      saveBtn+
-      '<button class="hide" onclick="hideLead('+p.id+')" title="Mark off — won&#39;t show in future searches">✕</button>'+
+      saveBtn+hideBtn+
     '</div>'+
     '</div>';
 }
+// A numeric id means the business is already a lead row in the database; anything else is a
+// scan result the user can browse but hasn't taken yet.
+function isStored(id){return /^\\d+$/.test(String(id))}
 // On load, bring back the last search (no re-scraping) so navigating away keeps results.
 async function restoreLast(){
   const r=await (await fetch('/api/last-search')).json();
@@ -700,11 +966,6 @@ restoreLast();
 // Keep the cost estimate live as the user changes city/niche/source/depth.
 ['city','niche','source'].forEach(function(id){var el=document.getElementById(id);if(el){el.addEventListener('input',updateEstimate);el.addEventListener('change',updateEstimate);}});
 updateEstimate();
-async function saveLead(id){
-  const b=document.getElementById('s-'+id);b.disabled=true;
-  const r=await post('/api/crm/save/'+id,{});
-  if(r.ok){b.textContent='✅ Saved to CRM';b.classList.add('saved-on')}else{b.disabled=false;b.textContent='⚠️ retry'}
-}
 async function hideLead(id){
   await post('/api/dismiss/'+id,{});
   const el=document.getElementById('lead-'+id);
@@ -714,291 +975,443 @@ function esc(s){return (s||'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>'
 </script>${SHELL_TAIL_SCRIPT}</main></div></body></html>`;
 }
 
-// ── CRM ROWS (the tracked + follow-up tabs of /leads) ──
+// ── LEADS PAGE ──────────────────────────────────────────────────────────────
+// One page for the whole working lifecycle. Every saved lead sits in exactly one bucket
+// (no-website / not active / has a website), and inside its bucket it is either in the
+// WORKING list (nothing scheduled) or the FOLLOW-UPS list (a date is set, soonest first).
+// Setting a follow-up is the "I did something here, remind me later" gesture, and it is
+// the only thing that moves a row between those two lists.
 const CRM_STAGES = ["New", "Contacted", "Interested", "Won", "Lost"];
 
 // Human "how long ago" from either a SQLite UTC datetime ("2026-06-09 14:03:00") or a
 // Postgres timestamptz ("2026-06-09T14:03:00+00:00") — the two providers differ.
 function daysAgo(dt) {
-  if (!dt) return "";
-  const s = String(dt);
-  const iso = /[TZ+]|\d{2}:\d{2}:\d{2}\.\d+/.test(s.slice(10)) ? s.replace(" ", "T") : s.replace(" ", "T") + "Z";
-  const then = new Date(iso).getTime();
-  if (isNaN(then)) return "";
+  const then = parseStamp(dt);
+  if (then == null) return "";
   const days = Math.floor((Date.now() - then) / 86400000);
   return days <= 0 ? "today" : days === 1 ? "yesterday" : `${days} days ago`;
 }
 
-function renderCrmRow(l, followup = false) {
-  const opts = CRM_STAGES.map(
-    (s) => `<option value="${s}"${l.crm_stage === s ? " selected" : ""}>${s}</option>`
-  ).join("");
-  const src = l.source === "facebook" ? "Facebook" : l.source === "instagram" ? "Instagram" : "Google";
-  // In the follow-up tab, show how long since they were contacted (older = nudge to chase).
-  const when = daysAgo(l.contacted_on);
-  const aged = when && when !== "today" && when !== "yesterday";
-  const followCell = followup
-    ? `<td><span class="ago ${aged ? "stale" : ""}">⏰ ${esc(when || "—")}</span></td>`
-    : "";
-  return `<tr id="crm-${l.id}">
-    <td><b>${esc(l.name)}</b><div class="sub">${esc(l.category || "")} · ${esc(l.city || "")}, ${esc(l.state || "")}</div><div class="sub" style="margin-top:5px">${licenseBadgeHtml(l)}</div></td>
-    <td>${esc(l.phone || "—")}<div class="sub">${l.email ? esc(l.email) : '<span class="warn">no email</span>'}</div></td>
-    <td><span class="src">${src}</span></td>
-    ${followCell}
-    <td><select class="stage" onchange="setStage(${l.id},this.value)">${opts}</select></td>
-    <td><input class="notes" value="${esc(l.notes || "")}" placeholder="notes…" onchange="setNotes(${l.id},this.value)"></td>
-    <td class="actions">
-      <button class="rm" onclick="removeCrm(${l.id})">Remove</button>
-    </td>
-  </tr>`;
+// Epoch ms from any stamp the two providers produce: an ISO timestamp, a SQLite UTC
+// datetime, or a plain "YYYY-MM-DD". Returns null when it can't be read.
+function parseStamp(dt) {
+  if (!dt) return null;
+  const s = String(dt).trim();
+  if (!s) return null;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) {
+    const local = new Date(`${s}T00:00:00`).getTime();
+    return isNaN(local) ? null : local;
+  }
+  const iso = /[TZ+]|\d{2}:\d{2}:\d{2}\.\d+/.test(s.slice(10)) ? s.replace(" ", "T") : s.replace(" ", "T") + "Z";
+  const t = new Date(iso).getTime();
+  return isNaN(t) ? null : t;
 }
 
-// Friendly "due in 3d / overdue 2d / due today" from a YYYY-MM-DD string.
-function dueInfo(due) {
-  if (!due) return { text: "no date", cls: "" };
-  const d = new Date(due + "T00:00:00").getTime();
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
-  const days = Math.round((d - today.getTime()) / 86400000);
-  if (days < 0) return { text: `overdue ${-days}d`, cls: "od" };
-  if (days === 0) return { text: "due today", cls: "soon" };
-  if (days === 1) return { text: "due tomorrow", cls: "soon" };
-  return { text: `due in ${days}d`, cls: "" };
-}
-
-function renderFollowupItem(f) {
-  const di = dueInfo(f.due);
-  const done = !!f.done;
-  return `<div class="fu-item${done ? " fu-done" : ""}" id="fu-${f.id}">
-    <div class="fu-main">
-      <div class="fu-title">${esc(f.title)} ${f.due ? `<span class="fu-due ${di.cls}">📅 ${di.text}</span>` : ""}</div>
-      ${f.note ? `<div class="fu-note">${esc(f.note)}</div>` : ""}
-    </div>
-    <div class="fu-actions">
-      <button class="fu-btn" onclick="fuDone(${f.id},${done ? 0 : 1})">${done ? "↩︎ Undo" : "✓ Done"}</button>
-      <button class="fu-btn fu-del" onclick="fuDel(${f.id})">Remove</button>
-    </div>
-  </div>`;
-}
-
-// ── LEADS PAGE (tracked · found · follow-up) ──
-// One page for the whole lead lifecycle. `tracked` and `followup` are the old CRM
-// tabs; `found` is every lead the machine has ever surfaced (the old Brain "Your
-// leads" tab) — now actionable, with Save and dismiss on each row.
-
-// Scrapers write a few variants ("google", "google_maps"), so match on the prefix —
-// this is the same label the tracked tab shows for the same lead.
+// Scrapers write a few variants ("google", "google_maps"), so match on the prefix.
 function srcLabel(s) {
   const v = String(s || "");
   if (v.startsWith("facebook")) return "Facebook";
   if (v.startsWith("instagram")) return "Instagram";
   if (v.startsWith("google")) return "Google";
-  return v || "—";
+  return v || "unknown";
 }
 
-// The found tab renders at most this many rows (newest first); the filter box
-// searches what's rendered, so the note tells the user when there's more behind it.
-const FOUND_LIMIT = 500;
+// "Sep 4 · in 3d" for a scheduled follow-up, with a class that flags overdue/soon.
+// Mirrored by fuLabel() in the page script so a row updated in place reads identically.
+function followUpInfo(dt) {
+  const ts = parseStamp(dt);
+  if (ts == null) return { label: "", cls: "", ts: 0 };
+  const day = new Date(ts);
+  day.setHours(0, 0, 0, 0);
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const days = Math.round((day.getTime() - today.getTime()) / 86400000);
+  const date = new Date(ts).toLocaleDateString("en-US", { month: "short", day: "numeric" });
+  if (days < 0) return { label: `${date} · overdue`, cls: "od", ts };
+  if (days === 0) return { label: `${date} · today`, cls: "soon", ts };
+  if (days === 1) return { label: `${date} · tomorrow`, cls: "soon", ts };
+  return { label: `${date} · in ${days}d`, cls: "", ts };
+}
 
-// A row on the `found` tab. Deliberately light: no lead_json, so no license badge —
-// that detail lives on the tracked tab, where the CRM query still loads it.
-function renderFoundRow(l) {
-  const saved = !!l.saved;
-  const stage = esc(l.crm_stage || "New");
-  const stageCell = saved ? `<span class="tag site">${stage}</span>` : `<span class="tag">not saved</span>`;
-  const saveBtn = saved
-    ? `<button class="save saved-on" id="fs-${l.id}" disabled>✅ Saved</button>`
-    : `<button class="save" id="fs-${l.id}" onclick="saveFound(${l.id})">💾 Save</button>`;
-  return `<tr id="found-${l.id}" data-stage="${stage}">
-    <td><b>${esc(l.name || "—")}</b><div class="sub">${esc(l.category || "")}</div></td>
-    <td>${esc([l.city, l.state].filter(Boolean).join(", ") || "—")}</td>
-    <td>${esc(l.phone || "—")}<div class="sub">${l.email ? esc(l.email) : '<span class="warn">no email</span>'}</div></td>
+// The per-row "Follow up" control: presets, a custom date, and a clear.
+function followMenu(id) {
+  const opt = (when, label) =>
+    `<button type="button" class="fu-opt" onclick="setFollowUp(${id},'${when}')">${label}</button>`;
+  return `<details class="fumenu">
+    <summary title="Set a follow-up and come back to this later">${icon("clock", 14)}<span>Follow up</span></summary>
+    <div class="fumenu-pop">
+      ${opt("3d", "In 3 days")}${opt("1w", "In 1 week")}${opt("2w", "In 2 weeks")}${opt("1m", "In 1 month")}
+      <label class="fu-custom">Pick a date<input type="date" onchange="setFollowUp(${id},this.value)"></label>
+      <button type="button" class="fu-opt fu-clear" onclick="setFollowUp(${id},'')">Clear, back to working</button>
+    </div>
+  </details>`;
+}
+
+// One CRM row. Identical in both lists so a row can move between them without the
+// columns shifting; only the follow-up cell changes.
+function renderCrmRow(l) {
+  const opts = CRM_STAGES.map(
+    (s) => `<option value="${s}"${l.crm_stage === s ? " selected" : ""}>${s}</option>`
+  ).join("");
+  const bucket = CRM_BUCKETS.includes(l.bucket) ? l.bucket : "qualified";
+  const fu = followUpInfo(l.follow_up_at);
+  const contacted = daysAgo(l.contacted_on);
+  const fuCell = fu.label
+    ? `<span class="fudate ${fu.cls}">${icon("clock", 13)}${esc(fu.label)}</span>`
+    : `<span class="muted">${contacted ? `contacted ${esc(contacted)}` : "not scheduled"}</span>`;
+  const moveOpts = CRM_BUCKETS.filter((b) => b !== bucket)
+    .map((b) => `<option value="${b}">${esc(BUCKET_META[b].title)}</option>`)
+    .join("");
+  return `<tr id="crm-${l.id}" data-bucket="${bucket}" data-fu="${fu.ts || 0}">
+    <td><b>${esc(l.name)}</b><div class="sub">${esc(l.category || "")} · ${esc(l.city || "")}, ${esc(l.state || "")}</div><div class="sub" style="margin-top:5px">${licenseBadgeHtml(l)}</div></td>
+    <td>${esc(l.phone || "no phone")}<div class="sub">${l.email ? esc(l.email) : '<span class="warn">no email</span>'}</div></td>
     <td><span class="src">${esc(srcLabel(l.source))}</span></td>
-    <td class="stagecell">${stageCell}</td>
+    <td class="fucell">${fuCell}</td>
+    <td><select class="stage" onchange="setStage(${l.id},this.value)">${opts}</select></td>
+    <td><input class="notes" value="${esc(l.notes || "")}" placeholder="notes…" onchange="setNotes(${l.id},this.value)"></td>
     <td class="actions">
-      ${saveBtn}
-      <button class="hide" onclick="dismissFound(${l.id})" title="Mark off — won&#39;t show in future searches">✕</button>
+      ${followMenu(l.id)}
+      <select class="movebucket" title="Move this lead to another list" onchange="moveBucket(${l.id},this.value,this)"><option value="">Move to…</option>${moveOpts}</select>
+      <button class="rm" onclick="removeCrm(${l.id})">Remove</button>
     </td>
   </tr>`;
 }
 
-async function renderLeadsPage(req, view = "tracked") {
-  const tab = view === "found" ? "found" : view === "followup" ? "followup" : "tracked";
-  const wantCrm = tab !== "found";
-  // Everything the page needs, in parallel. listAllLeads is the slim query (no
-  // lead_json/site_data), so fetching it for the tab count is cheap; the fat
-  // listCrm query is skipped entirely on the found tab.
-  const [crmLeads, counts, found, followups] = await Promise.all([
-    wantCrm ? store.listCrm(req.userId) : null,
-    store.crmCounts(req.userId),
-    store.listAllLeads(req.userId),
-    tab === "followup" ? store.listFollowups(req.userId) : [],
-  ]);
+const CRM_COLS = 7;
+function crmTable(bucket, list, rows) {
+  const empty = list === "working" ? "Nothing in this list right now." : "No follow-ups scheduled here.";
+  return `<div class="tblwrap"><table>
+    <thead><tr><th>Business</th><th>Contact</th><th>Source</th><th>Follow-up</th><th>Stage</th><th>Notes</th><th>Actions</th></tr></thead>
+    <tbody id="tb-${bucket}-${list}">${rows.map(renderCrmRow).join("")}<tr class="emptyrow"${
+      rows.length ? ' style="display:none"' : ""
+    }><td colspan="${CRM_COLS}">${empty}</td></tr></tbody>
+  </table></div>`;
+}
 
-  const stageCount = (s) => counts.find((c) => c.crm_stage === s)?.n || 0;
-  const contactedCount = stageCount("Contacted");
-  const trackedCount = crmLeads ? crmLeads.length : counts.reduce((a, c) => a + (Number(c.n) || 0), 0);
-  const foundCount = found.length;
-  const byStage = CRM_STAGES.map((s) => `${s}: ${stageCount(s)}`).join(" · ");
-  const openFollowups = followups.filter((f) => !f.done).length;
+// One bucket: its working list, then its follow-ups. The first bucket is the main
+// workflow and opens expanded; the other two start collapsed.
+function bucketSection(key, data, open) {
+  const meta = BUCKET_META[key];
+  const working = data.working || [];
+  const followups = data.followups || [];
+  const anchor = key === "qualified" ? ' id="followups"' : "";
+  return `<details class="bucket" id="sec-${key}"${open ? " open" : ""}>
+  <summary>
+    <span class="bk-ttl">${esc(meta.title)}</span>
+    <span class="bk-n" id="cnt-${key}-all">${working.length + followups.length}</span>
+    <span class="bk-sub">${esc(meta.sub)}</span>
+  </summary>
+  <div class="bk-body">
+    <div class="listhead">Working <span class="cnt" id="cnt-${key}-working">${working.length}</span></div>
+    ${crmTable(key, "working", working)}
+    <div class="listhead"${anchor}>Follow-ups <span class="cnt" id="cnt-${key}-followups">${followups.length}</span> <span class="listsub">soonest first</span></div>
+    ${crmTable(key, "followups", followups)}
+  </div>
+</details>`;
+}
 
-  const followup = tab === "followup";
-  const crmRows = wantCrm ? (followup ? crmLeads.filter((l) => l.crm_stage === "Contacted") : crmLeads) : [];
-  const foundRows = tab === "found" ? found.slice(0, FOUND_LIMIT) : [];
-  const capped = foundCount > FOUND_LIMIT;
+// Your own reminders (people you called off your own bat), separate from the lead rows.
+function renderFollowupItem(f) {
+  const info = followUpInfo(f.due);
+  const done = !!f.done;
+  return `<div class="fu-item${done ? " fu-done" : ""}" id="fu-${f.id}">
+    <div class="fu-main">
+      <div class="fu-title">${esc(f.title)} ${
+        f.due ? `<span class="fu-due ${info.cls}">${icon("calendar", 13)}${esc(info.label)}</span>` : ""
+      }</div>
+      ${f.note ? `<div class="fu-note">${esc(f.note)}</div>` : ""}
+    </div>
+    <div class="fu-actions">
+      <button class="fu-btn" onclick="fuDone(${f.id},${done ? 0 : 1})">${
+        done ? `${icon("undo", 13)} Undo` : `${icon("check", 13)} Done`
+      }</button>
+      <button class="fu-btn fu-del" onclick="fuDel(${f.id})">Remove</button>
+    </div>
+  </div>`;
+}
 
-  const stats =
-    tab === "found"
-      ? `Every business the machine has surfaced for you. <b>Save</b> the ones worth chasing — they move to <b>Tracked</b>. &nbsp;·&nbsp; ${
-          capped
-            ? `<b>showing newest ${FOUND_LIMIT}</b> of ${foundCount} — use the filter to reach the rest`
-            : `<b>${foundRows.length}</b> shown`
-        }`
-      : followup
-      ? `<b>${openFollowups}</b> personal follow-up${openFollowups === 1 ? "" : "s"} &nbsp;·&nbsp; <b>${contactedCount}</b> contacted lead${contactedCount === 1 ? "" : "s"}`
-      : `<b>${trackedCount}</b> saved leads &nbsp;·&nbsp; ${esc(byStage)}`;
+// store.listCrm() hands back { qualified:{working,followups}, inactive:{…}, has_website:{…} }
+// with followups already sorted soonest-first. This just guarantees every bucket and list
+// exists so the page can render a bucket the store had nothing for.
+function normalizeCrm(raw) {
+  const out = {};
+  for (const b of CRM_BUCKETS) {
+    const g = (raw && raw[b]) || {};
+    out[b] = {
+      working: Array.isArray(g.working) ? g.working : [],
+      followups: Array.isArray(g.followups) ? g.followups : [],
+    };
+  }
+  return out;
+}
 
-  const foundBody = foundRows.length
-    ? `<input class="search" id="q" placeholder="🔍 Filter by name, category, city, phone…" oninput="filterRows()" autofocus>
-<table id="tbl"><thead><tr><th>Business</th><th>Location</th><th>Contact</th><th>Source</th><th>Stage</th><th>Actions</th></tr></thead><tbody id="tb">${foundRows
-        .map(renderFoundRow)
-        .join("")}</tbody></table><div id="noMatch">No businesses match your filter.</div>`
-    : '<div class="empty">Nothing found yet.<br>Go to <a href="/">Search</a> and run a scan — everything it surfaces lands here.</div>';
+async function renderLeadsPage(req) {
+  const [crmRaw, reminders] = await Promise.all([store.listCrm(req.userId), store.listFollowups(req.userId)]);
+  const crm = normalizeCrm(crmRaw);
 
-  const crmBody = crmRows.length
-    ? `<table><thead><tr><th>Business</th><th>Contact</th><th>Source</th>${
-        followup ? "<th>Contacted</th>" : ""
-      }<th>Stage</th><th>Notes</th><th>Actions</th></tr></thead><tbody>${crmRows
-        .map((l) => renderCrmRow(l, followup))
-        .join("")}</tbody></table>`
-    : followup
-    ? '<div class="empty" style="margin-top:20px">No contacted leads yet.<br>Set a lead\'s stage to <b>Contacted</b> in <b>Tracked</b> and it\'ll show here.</div>'
-    : '<div class="empty">No saved leads yet.<br>Open the <a href="/leads?view=found">Found</a> tab and click <b>💾 Save</b> on the ones you want to track.</div>';
+  const endOfToday = new Date();
+  endOfToday.setHours(23, 59, 59, 999);
+  let total = 0;
+  let scheduled = 0;
+  let dueNow = 0;
+  for (const b of CRM_BUCKETS) {
+    total += crm[b].working.length + crm[b].followups.length;
+    scheduled += crm[b].followups.length;
+    for (const l of crm[b].followups) {
+      const ts = parseStamp(l.follow_up_at);
+      if (ts != null && ts <= endOfToday.getTime()) dueNow++;
+    }
+  }
+  const openReminders = reminders.filter((f) => !f.done).length;
+  const stats = total
+    ? `<b>${total}</b> lead${total === 1 ? "" : "s"} in play &nbsp;·&nbsp; <b>${scheduled}</b> scheduled follow-up${
+        scheduled === 1 ? "" : "s"
+      }${dueNow ? ` &nbsp;·&nbsp; <b class="duenow">${dueNow} due now</b>` : ""}`
+    : "Nothing here yet. Run a search and move the results over.";
 
-  return `<!doctype html><html><head>${THEME_INIT_SCRIPT}<meta charset="utf-8">${FAVICON}<title>Prospector — Leads</title>
+  const sections = CRM_BUCKETS.map((b, i) => bucketSection(b, crm[b], i === 0)).join("");
+  const empty = total
+    ? ""
+    : `<div class="empty">No leads yet.<br>Go to <a href="/">Search</a>, run a scan, then use <b>Move all to CRM</b> on the results.</div>`;
+
+  return `<!doctype html><html><head>${THEME_INIT_SCRIPT}<meta charset="utf-8">${FAVICON}<title>Prospector · Leads</title>
 <style>
   :root{--gold:#14FFB9;--bg:#0a1124;--panel:#0f1a30;--border:rgba(20,255,185,.22);--text:#e8eaf0;--muted:#7b8499}
   *{box-sizing:border-box;margin:0;padding:0}
   .brandlogo{height:40px;width:auto;display:block}
   body>*{position:relative;z-index:1}
   body{font-family:system-ui,sans-serif;background:var(--bg);color:var(--text);padding:24px;max-width:1200px;margin:auto}
-  header{display:flex;align-items:center;gap:16px;margin-bottom:8px}
   h1{color:var(--gold);font-size:24px;letter-spacing:1px}
-  .nav{margin-left:auto;display:flex;gap:16px;align-items:center;flex-wrap:wrap;row-gap:10px}.nav a{color:var(--gold);text-decoration:none;font-weight:600;font-size:14px}
-  .stats{color:var(--muted);font-size:13px;margin-bottom:18px}
+  .stats{color:var(--muted);font-size:13px;margin-bottom:16px}
+  .duenow{color:var(--warn)}
   table{width:100%;border-collapse:collapse;background:var(--panel);border:1px solid var(--border);border-radius:12px;overflow:hidden}
-  th{text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.5px;color:var(--muted);padding:12px 14px;border-bottom:1px solid var(--border)}
-  td{padding:12px 14px;border-bottom:1px solid rgba(255,255,255,.05);font-size:14px;vertical-align:top}
+  th{text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.5px;color:var(--muted);padding:11px 14px;border-bottom:1px solid var(--border)}
+  td{padding:11px 14px;border-bottom:1px solid rgba(255,255,255,.05);font-size:14px;vertical-align:top}
   tr:last-child td{border-bottom:none}
   .sub{color:var(--muted);font-size:12px;margin-top:3px}.warn{color:#e0a93b}
   .src{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px}
-  select.stage,input.notes{background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.12);border-radius:7px;padding:7px 9px;color:var(--text);font-size:13px}
-  input.notes{width:100%;min-width:160px}
-  .actions{display:flex;gap:8px;align-items:center;white-space:nowrap}
-  .actions a{color:var(--gold);text-decoration:none;font-size:13px}
-  .rm{background:transparent;border:1px solid var(--border);color:var(--muted);border-radius:6px;padding:5px 10px;cursor:pointer;font-size:12px}
+  select.stage,input.notes,select.movebucket{background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.12);border-radius:7px;padding:7px 9px;color:var(--text);font-size:13px}
+  input.notes{width:100%;min-width:150px}
+  select.movebucket{font-size:12px;padding:6px 8px;max-width:130px}
+  .actions{display:flex;gap:8px;align-items:flex-start;flex-wrap:wrap}
+  .rm{background:transparent;border:1px solid var(--border);color:var(--muted);border-radius:6px;padding:6px 10px;cursor:pointer;font-size:12px;font-family:inherit}
   .rm:hover{color:#e05b5b;border-color:#e05b5b}
-  .save{border-radius:7px;padding:6px 11px;font-weight:600;cursor:pointer;font-size:12px;white-space:nowrap;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.14);color:var(--text)}
-  .save:disabled{cursor:default}
-  .hide{border-radius:7px;padding:6px 10px;cursor:pointer;font-size:12px;background:transparent;border:1px solid rgba(255,255,255,.14);color:var(--muted)}
-  .hide:hover{color:#e05b5b;border-color:#e05b5b}
-  .search{width:100%;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.14);border-radius:10px;padding:12px 14px;color:var(--text);font-size:15px;margin-bottom:14px}
+  .search{width:100%;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.14);border-radius:10px;padding:11px 14px;color:var(--text);font-size:15px;margin-bottom:16px}
   .search::placeholder{color:var(--muted)}
-  .tag{display:inline-block;font-size:11px;font-weight:700;padding:2px 9px;border-radius:20px;background:rgba(255,255,255,.06);color:var(--muted)}
-  .tag.site{background:rgba(20,255,185,.16);color:var(--gold)}
-  #noMatch{display:none;color:var(--muted);text-align:center;margin-top:30px;font-size:14px}
-  .empty{color:var(--muted);text-align:center;margin-top:50px;font-size:15px}
-  .tabs{display:flex;gap:8px;margin:6px 0 16px;flex-wrap:wrap}
-  .tab{display:inline-flex;align-items:center;gap:6px;text-decoration:none;font-weight:700;font-size:14px;color:var(--muted);background:var(--panel);border:1px solid var(--border);border-radius:9px;padding:9px 16px}
-  .tab:hover{color:var(--text)}
-  .tab.active{color:#000;background:var(--gold);border-color:var(--gold)}
-  .tab .pill{background:rgba(0,0,0,.18);border-radius:20px;padding:1px 8px;font-size:12px}
-  .tab:not(.active) .pill{background:rgba(20,255,185,.16);color:var(--gold)}
-  .ago{font-size:13px;color:var(--muted);white-space:nowrap}
-  .ago.stale{color:#e0a93b;font-weight:700}
-  .fubox{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:16px;margin-bottom:16px}
-  .fubox h3{font-size:15px;margin-bottom:10px}
-  .fu-add{display:grid;grid-template-columns:1.4fr 1.6fr auto auto;gap:10px}
-  .fu-add input{background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.12);border-radius:8px;padding:10px 12px;color:var(--text);font-size:14px}
-  .fu-add button{background:var(--gold);color:#000;border:none;border-radius:8px;padding:10px 18px;font-weight:700;cursor:pointer;white-space:nowrap}
-  .fu-list{display:flex;flex-direction:column;gap:8px;margin-bottom:22px}
-  .fu-item{display:flex;justify-content:space-between;align-items:center;gap:12px;background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:12px 14px}
+  #noMatch{display:none;color:var(--muted);text-align:center;margin:20px 0;font-size:14px}
+  .empty{color:var(--muted);text-align:center;margin-top:40px;font-size:15px}
+  .lic-badge{display:inline-flex;align-items:center;gap:5px;font-size:12px;font-weight:600;padding:2px 8px;border-radius:6px}
+  .lic-verify{font-size:12px;text-decoration:none;margin-left:6px}
+  /* ── Bucket sections ── */
+  .bucket{background:var(--panel);border:1px solid var(--border);border-radius:12px;margin-bottom:14px;overflow:hidden}
+  .bucket>summary{list-style:none;cursor:pointer;padding:15px 18px;display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+  .bucket>summary::-webkit-details-marker{display:none}
+  .bucket>summary::after{content:"";flex:none;width:9px;height:9px;margin-left:auto;border-right:2px solid var(--muted);border-bottom:2px solid var(--muted);transform:rotate(45deg) translateY(-2px);transition:transform .15s;order:1}
+  .bucket[open]>summary::after{transform:rotate(225deg) translateY(-2px)}
+  .bk-ttl{font-weight:700;font-size:15px;color:var(--text)}
+  .bk-n{font-size:12px;font-weight:700;padding:2px 9px;border-radius:20px;background:var(--surface2);color:var(--muted)}
+  #sec-qualified .bk-n{background:var(--accent-weak);color:var(--accent-ink)}
+  .bk-sub{font-size:13px;color:var(--muted);flex:1 1 100%;margin-top:-4px;order:2}
+  .bk-body{padding:0 14px 16px}
+  .listhead{display:flex;align-items:center;gap:8px;font-size:12px;text-transform:uppercase;letter-spacing:.5px;color:var(--muted);font-weight:700;margin:10px 0 8px}
+  .listhead .cnt{background:var(--surface2);color:var(--muted);border-radius:20px;padding:1px 8px;font-size:11px}
+  .listhead .listsub{text-transform:none;letter-spacing:0;font-weight:400}
+  .tblwrap{overflow-x:auto}
+  .emptyrow td{color:var(--muted);font-size:13px;text-align:center;padding:16px}
+  tbody tr.justmoved{animation:pop 1.2s ease-out}
+  @keyframes pop{0%{background:var(--accent-weak)}100%{background:transparent}}
+  /* ── Follow-up control ── */
+  .fudate{display:inline-flex;align-items:center;gap:5px;font-size:13px;font-weight:600;white-space:nowrap;color:var(--muted)}
+  .fudate.soon{color:var(--warn)}.fudate.od{color:var(--danger)}
+  .fumenu{position:relative}
+  .fumenu>summary{list-style:none;cursor:pointer;display:inline-flex;align-items:center;gap:6px;border:1px solid var(--border);border-radius:6px;padding:6px 10px;font-size:12px;font-weight:600;color:var(--muted);white-space:nowrap}
+  .fumenu>summary::-webkit-details-marker{display:none}
+  .fumenu>summary:hover{color:var(--text)}
+  .fumenu-pop{position:absolute;z-index:20;right:0;top:calc(100% + 5px);min-width:190px;display:flex;flex-direction:column;gap:2px;background:var(--panel);border:1px solid var(--border-strong);border-radius:10px;padding:6px;box-shadow:0 12px 28px rgba(0,0,0,.22)}
+  .fu-opt{font-family:inherit;text-align:left;background:transparent;border:none;border-radius:6px;padding:8px 10px;font-size:13px;color:var(--text);cursor:pointer}
+  .fu-opt:hover{background:var(--surface2)}
+  .fu-clear{color:var(--muted);border-top:1px solid var(--border);border-radius:0 0 6px 6px;margin-top:2px}
+  .fu-custom{display:flex;flex-direction:column;gap:5px;padding:6px 10px 8px;font-size:12px;color:var(--muted)}
+  .fu-custom input{font-size:13px;border-radius:6px;padding:6px 8px}
+  /* ── Your reminders panel ── */
+  .fubox{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:16px 18px;margin-bottom:16px}
+  .fubox h3{font-size:14px;margin-bottom:12px;font-weight:700}
+  .fu-add{display:grid;grid-template-columns:minmax(0,1.4fr) minmax(0,1.6fr) auto auto;gap:10px}
+  .fu-add input{background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.12);border-radius:8px;padding:9px 12px;color:var(--text);font-size:14px}
+  .fu-add button{background:var(--gold);color:#000;border:none;border-radius:8px;padding:9px 18px;font-weight:700;cursor:pointer;white-space:nowrap;font-family:inherit}
+  .fu-list{display:flex;flex-direction:column;gap:8px;margin-top:12px}
+  .fu-item{display:flex;justify-content:space-between;align-items:center;gap:12px;background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:11px 14px}
   .fu-item.fu-done{opacity:.5}.fu-item.fu-done .fu-title{text-decoration:line-through}
   .fu-title{font-weight:700;font-size:14px}
   .fu-note{color:var(--muted);font-size:13px;margin-top:3px}
-  .fu-due{font-size:12px;font-weight:700;color:var(--muted);margin-left:6px}
-  .fu-due.soon{color:#e0a93b}.fu-due.od{color:#e05b5b}
+  .fu-due{display:inline-flex;align-items:center;gap:4px;font-size:12px;font-weight:700;color:var(--muted);margin-left:6px}
+  .fu-due.soon{color:var(--warn)}.fu-due.od{color:var(--danger)}
   .fu-actions{display:flex;gap:8px;white-space:nowrap}
-  .fu-btn{background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.14);color:var(--text);border-radius:7px;padding:7px 12px;cursor:pointer;font-size:13px;font-weight:600}
+  .fu-btn{display:inline-flex;align-items:center;gap:5px;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.14);color:var(--text);border-radius:7px;padding:6px 11px;cursor:pointer;font-size:13px;font-weight:600;font-family:inherit}
   .fu-del{color:var(--muted)}.fu-del:hover{color:#e05b5b;border-color:#e05b5b}
-  .sechead{font-size:13px;text-transform:uppercase;letter-spacing:.5px;color:var(--muted);margin:8px 0 10px;font-weight:700}
+  @media(max-width:820px){.fu-add{grid-template-columns:1fr}}
 ${SHARED_CSS}</style></head><body>
-${sidebar("leads", { isAdmin: req.isAdmin, demo: req.isDemo })}<div class="pagehead"><div class="titlewrap"><h1>Leads</h1><div class="pagesub">Everything the machine found — and the ones you're working</div></div><div class="spacer"></div></div>
-<div class="tabs">
-  <a class="tab ${tab === "tracked" ? "active" : ""}" href="/leads">Tracked <span class="pill">${trackedCount}</span></a>
-  <a class="tab ${tab === "found" ? "active" : ""}" href="/leads?view=found">Found <span class="pill">${foundCount}</span></a>
-  <a class="tab ${followup ? "active" : ""}" href="/leads?view=followup">⏰ Follow-up <span class="pill">${contactedCount}</span></a>
-</div>
+${sidebar("leads", { isAdmin: req.isAdmin, demo: req.isDemo })}<div class="pagehead"><div class="titlewrap"><h1>Leads</h1><div class="pagesub">The businesses you're working, and when to call them back</div></div><div class="spacer"></div></div>
 <div class="stats">${stats}</div>
-${
-  followup
-    ? `<div class="fubox">
-        <h3>➕ Add your own follow-up</h3>
-        <div class="fu-add">
-          <input id="fuTitle" placeholder="Who / business (e.g. Joe's Roofing)">
-          <input id="fuNote" placeholder="Note (optional) — e.g. called, wants a quote">
-          <input id="fuDue" type="date" title="Follow up on">
-          <button onclick="addFu()">Add</button>
-        </div>
-      </div>
-      <div class="sechead">Your follow-ups${openFollowups ? ` — ${openFollowups} open` : ""}</div>
-      <div class="fu-list" id="fuList">${
-        followups.length
-          ? followups.map(renderFollowupItem).join("")
-          : '<div class="empty" style="margin:6px 0;text-align:left">No personal follow-ups yet — add one above.</div>'
-      }</div>
-      <div class="sechead">Contacted leads${contactedCount ? ` — ${contactedCount}` : ""}</div>`
-    : ""
-}
-${tab === "found" ? foundBody : crmBody}
+
+<div class="fubox">
+  <h3>Your reminders</h3>
+  <div class="fu-add">
+    <input id="fuTitle" placeholder="Who or which business (e.g. Joe's Roofing)">
+    <input id="fuNote" placeholder="Note, optional (e.g. called, wants a quote)">
+    <input id="fuDue" type="date" title="Follow up on">
+    <button onclick="addFu()">Add reminder</button>
+  </div>
+  <div class="fu-list" id="fuList">${
+    reminders.length
+      ? reminders.map(renderFollowupItem).join("")
+      : '<div class="empty" style="margin:6px 0;text-align:left;font-size:13px">No reminders of your own yet. Add one above.</div>'
+  }</div>
+</div>
+
+<input class="search" id="q" placeholder="Filter every list by name, category, city, or phone" oninput="filterRows()">
+<div id="noMatch">No leads match your filter.</div>
+${sections}
+${empty}
 <script>
-const FOLLOWUP=${followup};
-async function post(url,data){const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data||{})});return r.json()}
-function dropRow(id){const r=document.getElementById('crm-'+id);if(r){r.style.transition='opacity .3s';r.style.opacity='0';setTimeout(()=>r.remove(),300)}}
-async function setStage(id,stage){await post('/api/crm/update/'+id,{stage});if(FOLLOWUP&&stage!=='Contacted')dropRow(id)}
-async function setNotes(id,notes){await post('/api/crm/update/'+id,{notes})}
-async function removeCrm(id){await post('/api/crm/remove/'+id,{});const r=document.getElementById('crm-'+id);if(r)r.remove()}
+${iconScript(["clock", "check", "warn"], 13)}
+function esc(s){return (s||'').replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]})}
+async function post(url,data){var r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data||{})});return r.json()}
+var BUCKET_KEYS=${JSON.stringify(CRM_BUCKETS)};
+var BUCKETS=${JSON.stringify(BUCKET_META)};
+
+// ── stage / notes / remove ──
+async function setStage(id,stage){await post('/api/crm/update/'+id,{stage:stage})}
+async function setNotes(id,notes){await post('/api/crm/update/'+id,{notes:notes})}
+async function removeCrm(id){
+  await post('/api/crm/remove/'+id,{});
+  var r=document.getElementById('crm-'+id);
+  if(r)r.remove();
+  paintCounts();
+}
+
+// ── follow-ups on a lead ──
+// Same wording the server renders, so a row updated in place reads identically.
+function fuLabel(iso){
+  if(!iso)return {label:'',cls:'',ts:0};
+  var ts=Date.parse(iso);
+  if(isNaN(ts))return {label:'',cls:'',ts:0};
+  var day=new Date(ts);day.setHours(0,0,0,0);
+  var today=new Date();today.setHours(0,0,0,0);
+  var days=Math.round((day.getTime()-today.getTime())/86400000);
+  var date=new Date(ts).toLocaleDateString('en-US',{month:'short',day:'numeric'});
+  if(days<0)return {label:date+' · overdue',cls:'od',ts:ts};
+  if(days===0)return {label:date+' · today',cls:'soon',ts:ts};
+  if(days===1)return {label:date+' · tomorrow',cls:'soon',ts:ts};
+  return {label:date+' · in '+days+'d',cls:'',ts:ts};
+}
+async function setFollowUp(id,when){
+  var r=await post('/api/leads/'+id+'/followup',{when:when});
+  closeMenus();
+  if(!r||!r.ok)return;
+  var row=document.getElementById('crm-'+id);
+  if(!row)return;
+  var info=fuLabel(r.followUpAt);
+  row.setAttribute('data-fu',info.ts||0);
+  var cell=row.querySelector('.fucell');
+  if(cell)cell.innerHTML=info.label
+    ? '<span class="fudate '+info.cls+'">'+ICONS.clock+esc(info.label)+'</span>'
+    : '<span class="muted">not scheduled</span>';
+  moveRowTo(row,row.getAttribute('data-bucket')||'qualified',r.followUpAt?'followups':'working');
+}
+async function moveBucket(id,bucket,sel){
+  if(sel)sel.selectedIndex=0;
+  if(!bucket)return;
+  var r=await post('/api/leads/'+id+'/bucket',{bucket:bucket});
+  if(!r||!r.ok)return;
+  var row=document.getElementById('crm-'+id);
+  if(!row)return;
+  row.setAttribute('data-bucket',bucket);
+  var sec=document.getElementById('sec-'+bucket);
+  if(sec)sec.open=true;
+  moveRowTo(row,bucket,Number(row.getAttribute('data-fu'))>0?'followups':'working');
+  rebuildMoveMenu(row,bucket,id);
+}
+function rebuildMoveMenu(row,bucket,id){
+  var sel=row.querySelector('.movebucket');
+  if(!sel)return;
+  var html='<option value="">Move to…</option>';
+  for(var i=0;i<BUCKET_KEYS.length;i++){
+    var b=BUCKET_KEYS[i];
+    if(b!==bucket)html+='<option value="'+b+'">'+esc(BUCKETS[b].title)+'</option>';
+  }
+  sel.innerHTML=html;
+}
+// Move a row between lists without reloading, then re-sort and re-count.
+function moveRowTo(row,bucket,list){
+  var tb=document.getElementById('tb-'+bucket+'-'+list);
+  if(!tb)return;
+  tb.appendChild(row);
+  if(list==='followups')sortFollowups(tb);
+  paintCounts();
+  row.classList.remove('justmoved');
+  void row.offsetWidth;
+  row.classList.add('justmoved');
+}
+function dataRows(tb){
+  return Array.prototype.filter.call(tb.children,function(r){return !r.classList.contains('emptyrow')});
+}
+function sortFollowups(tb){
+  var rows=dataRows(tb).sort(function(a,b){return (Number(a.getAttribute('data-fu'))||0)-(Number(b.getAttribute('data-fu'))||0)});
+  var blank=tb.querySelector('.emptyrow');
+  rows.forEach(function(r){tb.appendChild(r)});
+  if(blank)tb.appendChild(blank);
+}
+function paintCounts(){
+  BUCKET_KEYS.forEach(function(b){
+    var all=0;
+    ['working','followups'].forEach(function(list){
+      var tb=document.getElementById('tb-'+b+'-'+list);
+      if(!tb)return;
+      var n=dataRows(tb).length;
+      all+=n;
+      var c=document.getElementById('cnt-'+b+'-'+list);
+      if(c)c.textContent=n;
+      var blank=tb.querySelector('.emptyrow');
+      if(blank)blank.style.display=n?'none':'';
+    });
+    var t=document.getElementById('cnt-'+b+'-all');
+    if(t)t.textContent=all;
+  });
+}
+function closeMenus(){
+  document.querySelectorAll('details.fumenu[open]').forEach(function(d){d.open=false});
+}
+document.addEventListener('click',function(e){
+  document.querySelectorAll('details.fumenu[open]').forEach(function(d){if(!d.contains(e.target))d.open=false});
+});
+
+// ── your own reminders ──
 async function addFu(){
-  const t=document.getElementById('fuTitle'),n=document.getElementById('fuNote'),d=document.getElementById('fuDue');
+  var t=document.getElementById('fuTitle'),n=document.getElementById('fuNote'),d=document.getElementById('fuDue');
   if(!t.value.trim()){t.focus();return}
-  const r=await post('/api/followup/add',{title:t.value,note:n.value,due:d.value});
+  var r=await post('/api/followup/add',{title:t.value,note:n.value,due:d.value});
   if(r.ok)location.reload();
 }
 async function fuDone(id,done){await post('/api/followup/update/'+id,{done:!!done});location.reload()}
-async function fuDel(id){await post('/api/followup/remove/'+id,{});const r=document.getElementById('fu-'+id);if(r)r.remove()}
-// ── found tab ──
-async function saveFound(id){
-  var b=document.getElementById('fs-'+id);if(b)b.disabled=true;
-  var r=await post('/api/crm/save/'+id,{});
-  if(!r.ok){if(b){b.disabled=false;b.textContent='⚠️ retry'}return}
-  if(b){b.textContent='✅ Saved';b.classList.add('saved-on');b.onclick=null}
-  var row=document.getElementById('found-'+id);
-  if(row){var c=row.querySelector('.stagecell');if(c)c.innerHTML='<span class="tag site">'+(row.getAttribute('data-stage')||'New')+'</span>'}
-}
-async function dismissFound(id){
-  await post('/api/dismiss/'+id,{});
-  var r=document.getElementById('found-'+id);
-  if(r){r.style.transition='opacity .3s';r.style.opacity='0';setTimeout(function(){r.remove()},300)}
-}
+async function fuDel(id){await post('/api/followup/remove/'+id,{});var r=document.getElementById('fu-'+id);if(r)r.remove()}
+
+// ── filter ──
 function filterRows(){
-  var box=document.getElementById('q');if(!box)return;
+  var box=document.getElementById('q');
+  if(!box)return;
   var q=box.value.toLowerCase().trim(),shown=0;
-  document.querySelectorAll('#tb tr').forEach(function(r){
+  document.querySelectorAll('tbody tr').forEach(function(r){
+    if(r.classList.contains('emptyrow'))return;
     var hit=!q||r.textContent.toLowerCase().indexOf(q)>-1;
-    r.style.display=hit?'':'none';if(hit)shown++;
+    r.style.display=hit?'':'none';
+    if(hit)shown++;
   });
-  var nm=document.getElementById('noMatch');if(nm)nm.style.display=shown?'none':'block';
+  var nm=document.getElementById('noMatch');
+  if(nm)nm.style.display=(q&&!shown)?'block':'none';
+  if(q)document.querySelectorAll('details.bucket').forEach(function(d){d.open=true});
 }
+paintCounts();
 </script>${SHELL_TAIL_SCRIPT}</main></div></body></html>`;
 }
 
@@ -1022,12 +1435,12 @@ function winDate(dt) {
 
 function winRow(w) {
   const amt = w.amount === null || w.amount === undefined || w.amount === ""
-    ? '<span class="muted">—</span>'
+    ? '<span class="muted">no amount</span>'
     : esc(fmtMoney(w.amount));
   return `<tr id="win-${w.id}" data-amount="${Number(w.amount) || 0}">
     <td><b>${esc(w.client_name)}</b></td>
     <td class="amt">${amt}</td>
-    <td>${w.note ? esc(w.note) : '<span class="muted">—</span>'}</td>
+    <td>${w.note ? esc(w.note) : '<span class="muted">no note</span>'}</td>
     <td class="d">${winDate(w.created_at)}</td>
     <td class="actions"><button class="rm" onclick="removeWin(${w.id})">Remove</button></td>
   </tr>`;
@@ -1043,7 +1456,7 @@ async function renderWinsPage(req) {
   const rows = wins.map(winRow).join("");
   const statLine = `${count} win${count === 1 ? "" : "s"} · ${fmtMoney(total)} closed`;
 
-  return `<!doctype html><html><head>${THEME_INIT_SCRIPT}<meta charset="utf-8">${FAVICON}<title>Prospector — Wins</title>
+  return `<!doctype html><html><head>${THEME_INIT_SCRIPT}<meta charset="utf-8">${FAVICON}<title>Prospector · Wins</title>
 <style>
   *{box-sizing:border-box;margin:0;padding:0}
   body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
@@ -1087,7 +1500,7 @@ ${sidebar("wins", { isAdmin: req.isAdmin, demo: req.isDemo })}<div class="pagehe
     <thead><tr><th>Client / trade</th><th>Amount</th><th>Note</th><th>Date</th><th></th></tr></thead>
     <tbody id="winRows">${rows}</tbody>
   </table>
-  <div id="winsEmpty" class="empty"${count ? ' style="display:none"' : ""}>No wins logged yet — add your first closed deal.</div>
+  <div id="winsEmpty" class="empty"${count ? ' style="display:none"' : ""}>No wins logged yet. Add your first closed deal.</div>
 </div>
 
 <script>
@@ -1110,8 +1523,8 @@ async function addWin(){
   tr.id='win-'+r.id;
   tr.setAttribute('data-amount',amt||0);
   tr.innerHTML='<td><b>'+esc(body.clientName)+'</b></td>'+
-    '<td class="amt">'+(amt==null?'<span class="muted">—</span>':esc(fmtMoney(amt)))+'</td>'+
-    '<td>'+(body.note?esc(body.note):'<span class="muted">—</span>')+'</td>'+
+    '<td class="amt">'+(amt==null?'<span class="muted">no amount</span>':esc(fmtMoney(amt)))+'</td>'+
+    '<td>'+(body.note?esc(body.note):'<span class="muted">no note</span>')+'</td>'+
     '<td class="d">just now</td>'+
     '<td class="actions"><button class="rm" onclick="removeWin('+r.id+')">Remove</button></td>';
   winCount++;winTotal+=(amt||0);
