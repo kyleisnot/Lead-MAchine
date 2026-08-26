@@ -427,7 +427,7 @@ ${sidebar("search", { isAdmin: req.isAdmin, demo: req.isDemo })}<div class="page
       <div class="f"><label for="limit">Scan depth <span class="hint">more = more credits</span></label><select id="limit" onchange="updateEstimate()">
         <option value="20">Quick (20)</option><option value="40">Standard (40)</option>
         <option value="60">Deep (60)</option><option value="100">Deeper (100)</option>
-        <option value="150">Max (150)</option><option value="250">Firehose (250)</option>
+        <option value="150">Thorough (150)</option>
       </select></div>
     </div>
   </div>
