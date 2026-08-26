@@ -1,9 +1,11 @@
 {
+  "$schema": "https://openapi.vercel.sh/vercel.json",
   "version": 2,
+  "fluid": true,
   "rewrites": [{ "source": "/(.*)", "destination": "/api" }],
   "functions": {
     "api/index.js": {
-      "maxDuration": 300,
+      "maxDuration": 800,
       "includeFiles": "dashboard/public/**"
     }
   },
