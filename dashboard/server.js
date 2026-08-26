@@ -75,14 +75,22 @@ async function blockedByAllotment(req, res, { live }) {
   // by the TARGET account's plan — the gate applies to real customers only.
   if (req.isDemo) return false;
   const profile = await store.getProfile(req.userId);
-  const allotment = parseInt(profile?.monthly_token_allotment, 10) || 0;
-  if (!allotment) return false;
+  const raw = Number.parseInt(profile?.monthly_token_allotment, 10);
+  const allotment = Number.isFinite(raw) && raw > 0 ? raw : 0;
+  // 0 = account not yet given a plan. (New convention: 0 no longer means "unlimited".)
+  if (allotment === 0) {
+    res.status(402).json({
+      ok: false,
+      error: "Your account isn't active yet — reach out to have your monthly tokens set up.",
+    });
+    return true;
+  }
   const used = await monthTokensUsed(req.userId);
   if (used >= allotment) {
     res.status(429).json({
       ok: false,
       error: `You've used all ${allotment.toLocaleString()} tokens in your plan this month. ` +
-             `They refill on ${planResetLabel()} — or add a token pack to keep searching now.`,
+             `They refill on ${planResetLabel()} — or ask for a top-up to keep searching now.`,
     });
     return true;
   }
@@ -217,13 +225,15 @@ app.post("/api/followup/remove/:id", route(async (req, res) => {
 // (Our real operator cost, e.g. the Apify bill, lives in the admin panel instead.)
 app.get("/api/usage", route(async (req, res) => {
   const [u, profile] = await Promise.all([store.usageSummary(req.userId), store.getProfile(req.userId)]);
-  const allotment = parseInt(profile?.monthly_token_allotment, 10) || 0; // 0 = unlimited
+  const raw = Number.parseInt(profile?.monthly_token_allotment, 10);
+  const allotment = Number.isFinite(raw) && raw > 0 ? raw : 0; // 0 = no plan yet (blocked)
   const tokens = usdToTokens(u.aiUsd || 0);
   res.json({
     ok: true,
     tokens,
-    allotment: allotment || null,
-    planRemaining: allotment ? Math.max(0, allotment - tokens) : null,
+    allotment,
+    planRemaining: Math.max(0, allotment - tokens),
+    unassigned: allotment === 0,
     resetsOn: planResetLabel(),
     searches: u.searches,
     builds: u.builds,

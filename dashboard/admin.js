@@ -23,16 +23,16 @@ import { THEME_INIT_SCRIPT, SHELL_TAIL_SCRIPT, SHARED_CSS, sidebar, FAVICON } fr
 export const adminRouter = express.Router();
 
 // ── plans: the single source of truth for what the operator sells ────────────
-// `tokens` is the monthly allotment the plan implies; 0 means UNLIMITED (the
-// same convention profiles.monthly_token_allotment uses, and the one server.js
-// reads in blockedByAllotment). `price` is USD per month, 0 for non-paying
-// plans. `prospect` is the near-nothing plan demo-created accounts sit on.
+// `tokens` is the monthly allotment the plan implies. 0 means NO TOKENS (a
+// not-yet-activated account is blocked until an admin assigns a plan); "Unlimited"
+// is just a very high cap. `price` is USD per month, 0 for non-paying plans.
+// `prospect` is the near-nothing plan demo-created accounts sit on.
 const PLANS = {
   prospect: { label: "Prospect (demo)", tokens: 1, price: 0 },
   trial: { label: "Trial", tokens: 300, price: 0 },
   starter: { label: "Starter", tokens: 2000, price: 97 },
   pro: { label: "Pro", tokens: 6000, price: 297 },
-  unlimited: { label: "Unlimited", tokens: 0, price: 997 },
+  unlimited: { label: "Unlimited", tokens: 100000, price: 997 },
 };
 const PLAN_KEYS = Object.keys(PLANS);
 
@@ -327,9 +327,8 @@ function mixLine(mix) {
 // Its markup is mirrored by lmPaintUsage() in the inline script, which repaints
 // it in place after a top-up / reset instead of reloading the page.
 function usageCell(u) {
-  const unlimited = !u.allotment;
-  if (unlimited) {
-    return `<td class="usage"><div class="usenum">${num(u.tokens)} <span class="usealt">/ unlimited</span></div>
+  if (!u.allotment) { // 0 → account not given a plan yet
+    return `<td class="usage"><div class="usenum"><span class="usealt">no plan yet</span></div>
     <div class="tokbar" style="display:none"><div class="tokbar-fill" style="width:0%"></div></div></td>`;
   }
   const pct = Math.round((u.tokens / u.allotment) * 100);
@@ -372,7 +371,7 @@ function userRow(u, meEmail = "") {
     }" aria-label="Monthly token allotment for ${esc(
       u.email
     )}"><span class="sub muted allothint" style="margin-left:7px">${
-      u.allotment ? "" : "0 = unlimited"
+      u.allotment ? "" : "0 = no tokens (blocked)"
     }</span></div></td>
   ${usageCell(u)}
   <td class="n">${num(u.leads)}</td>
@@ -406,7 +405,7 @@ ${statCard(
       `<b>${esc(PLANS[k].label)}</b> — ${
         PLANS[k].price ? `$${PLANS[k].price}/mo` : "free"
       }, ${PLANS[k].tokens ? `${num(PLANS[k].tokens)} tokens` : "unlimited tokens"}`
-  ).join('<span class="lsep">·</span>')}<br>Picking a plan fills in its allotment — you can still override the number before saving. An allotment of <b>0</b> means unlimited. <b>Add</b> tops up this month's allotment when a customer runs out; <b>Reset month</b> clears their usage rows for the current calendar month only.</div>`;
+  ).join('<span class="lsep">·</span>')}<br>Picking a plan fills in its allotment — you can still override the number before saving. An allotment of <b>0</b> blocks the account (no tokens) — use it for signups you have not activated yet. <b>Add</b> tops up this month's allotment when a customer runs out; <b>Reset month</b> clears their usage rows for the current calendar month only.</div>`;
 
   const table = d.users.length
     ? `<div class="tblwrap"><table>
@@ -432,7 +431,7 @@ function lmPlanPick(id){
   var p=LM_PLANS[row.querySelector('select.tier').value]; if(!p)return;
   var inp=row.querySelector('input.allot'); if(!inp)return;
   inp.value=p.tokens;
-  var hint=row.querySelector('.allothint'); if(hint)hint.textContent=p.tokens?'':'0 = unlimited';
+  var hint=row.querySelector('.allothint'); if(hint)hint.textContent=p.tokens?'':'0 = no tokens (blocked)';
 }
 // Repaints the usage cell from the row's data-tokens / data-allot (mirrors usageCell()).
 function lmPaintUsage(row){
@@ -451,7 +450,7 @@ function lmPaintUsage(row){
     if(bar){bar.style.display='';bar.className='tokbar'+(hot?' warn':'')}
     if(fill)fill.style.width=Math.max(0,Math.min(100,pct))+'%';
   }
-  var hint=row.querySelector('.allothint'); if(hint)hint.textContent=allot?'':'0 = unlimited';
+  var hint=row.querySelector('.allothint'); if(hint)hint.textContent=allot?'':'0 = no tokens (blocked)';
 }
 async function lmPost(url,body){
   var r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});

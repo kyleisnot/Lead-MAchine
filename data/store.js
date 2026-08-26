@@ -521,7 +521,7 @@ export async function getProfile(userId) {
       id: "local",
       email: "local@dev",
       tier: "local",
-      monthly_token_allotment: parseInt(process.env.MONTHLY_TOKEN_ALLOTMENT || "0", 10) || 0,
+      monthly_token_allotment: parseInt(process.env.MONTHLY_TOKEN_ALLOTMENT || "1000000", 10) || 1000000,
     };
   }
   const c = await getSupabase();
@@ -529,7 +529,7 @@ export async function getProfile(userId) {
     await c.from("profiles").select("id,email,tier,monthly_token_allotment").eq("id", userId).maybeSingle(),
     "getProfile"
   );
-  // No row yet (signup trigger hasn't landed): fall back to unlimited rather than
-  // locking a brand-new user out of their first search.
+  // No profile row yet → an un-provisioned account: 0 tokens (blocked) until an admin
+  // assigns a plan. New signups get their tokens from the DB trigger.
   return data || { id: userId, email: "", tier: "trial", monthly_token_allotment: 0 };
 }

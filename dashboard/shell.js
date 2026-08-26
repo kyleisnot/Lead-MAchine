@@ -17,7 +17,8 @@ function lmSyncTheme(){var dark=document.documentElement.getAttribute('data-them
 function lmToggleTheme(){var light=document.documentElement.getAttribute('data-theme')==='light';var next=light?'dark':'light';document.documentElement.setAttribute('data-theme',next);try{localStorage.setItem('lm-theme',next);}catch(e){}lmSyncTheme();}
 lmSyncTheme();
 (function(){async function u(){try{var r=await(await fetch('/api/usage')).json();if(!r.ok)return;var t=document.getElementById('sbTok'),s=document.getElementById('sbSearches'),w=document.getElementById('sbBarWrap'),bar=document.getElementById('sbBar');
-if(r.allotment){if(t)t.textContent=(Number(r.tokens)||0).toLocaleString()+' / '+Number(r.allotment).toLocaleString();if(s)s.textContent='resets '+(r.resetsOn||'')+' · '+(r.searches||0)+' searches';if(w&&bar){var pct=Math.min(100,Math.round((Number(r.tokens)||0)/Number(r.allotment)*100));w.style.display='block';bar.style.width=pct+'%';w.className='tokbar'+(pct>=85?' warn':'');}}
+if(r.unassigned){if(t)t.textContent='No tokens yet';if(s)s.textContent='ask to activate your plan';if(w)w.style.display='none';}
+else if(Number(r.allotment)>0){if(t)t.textContent=(Number(r.tokens)||0).toLocaleString()+' / '+Number(r.allotment).toLocaleString();if(s)s.textContent='resets '+(r.resetsOn||'')+' · '+(r.searches||0)+' searches';if(w&&bar){var pct=Math.min(100,Math.round((Number(r.tokens)||0)/Number(r.allotment)*100));w.style.display='block';bar.style.width=pct+'%';w.className='tokbar'+(pct>=85?' warn':'');}}
 else{if(t)t.textContent=(Number(r.tokens)||0).toLocaleString()+' tokens';if(s)s.textContent=(r.searches||0)+' searches';if(w)w.style.display='none';}}catch(e){}}u();setInterval(u,30000);})();
 </script>`;
 
