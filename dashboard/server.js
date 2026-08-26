@@ -49,6 +49,8 @@ function icon(key, size = 15) {
     dot: '<circle cx="12" cy="12" r="5"></circle>',
     badge: '<rect x="2" y="5" width="20" height="14" rx="2"></rect><circle cx="8.5" cy="12" r="2.5"></circle><path d="M14 10.5h4M14 14h4"></path>',
     calendar: '<rect x="3" y="5" width="18" height="16" rx="2"></rect><path d="M3 10h18M8 3v4M16 3v4"></path>',
+    // A written-on page: the per-row notes toggle on the Leads table.
+    note: '<path d="M14.5 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8.5z"></path><path d="M14 3v6h6"></path><path d="M8.5 13h7M8.5 16.5h4.5"></path>',
     refresh: '<path d="M21 12a9 9 0 1 1-2.6-6.4"></path><polyline points="21 3 21 9 15 9"></polyline>',
     // A tall business tower with window ticks next to a small house: the mix of
     // local businesses a scan turns up, and the mark for the Companies table.
@@ -331,8 +333,8 @@ app.post("/api/crm/update/:id", route(async (req, res) => {
   res.json({ ok: true });
 }));
 
-// ── LEADS: one page, three bucket sections, each with a working + follow-up list ──
-// The old tabs (?view=tracked / found / followup) are gone; the whole lifecycle is on the
+// ── LEADS: one page, three bucket tabs, each with a working + follow-up list ──
+// The old views (?view=tracked / found / followup) are gone; the whole lifecycle is on the
 // one page now. Those links still land somewhere sensible instead of rendering an empty tab.
 app.get("/leads", route(async (req, res) => {
   if (req.query.view) {
@@ -496,6 +498,60 @@ function licenseBadgeHtml(l) {
   return `<span class="lic-badge ${on ? "lic-yes" : "lic-no"}" title="${title}">${icon("badge", 13)}${label}</span> <a class="lic-verify" href="${url}" target="_blank" rel="noopener">Verify</a>`;
 }
 
+// ── Shared table CSS (Search's Companies panel + the Leads page) ──
+// Both pages show the same object: a titled panel, an underline tab bar, a filter
+// toolbar, and one full-width table underneath. The rules that make that look live here
+// so the two pages can't drift; each page's own <style> adds only its column widths and
+// the trimmings its cells need. Spliced in before each page's own rules, so a page can
+// still override a shared declaration (e.g. table.cotable's min-width) by repeating it.
+const TABLE_CSS = `
+  .copanel{background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:18px 20px 20px}
+  .cohead{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  .cohead .co-ic{display:inline-flex;color:var(--muted);flex:none}
+  .cohead .co-ic svg{width:19px;height:19px}
+  .cohead .co-ttl{font-size:17px;font-weight:700;letter-spacing:-.2px;color:var(--text)}
+  .cohead .co-n{font-size:13px;font-weight:500;color:var(--muted)}
+
+  /* Bucket tabs: the selected one carries a dark underline sitting on the bar's hairline. */
+  .btabs{display:flex;flex-wrap:wrap;gap:24px;border-bottom:1px solid var(--border);margin:15px 0 0}
+  .btab{position:relative;display:inline-flex;align-items:center;gap:7px;font-family:inherit;background:none;border:0;padding:0 0 11px;font-size:14px;font-weight:600;color:var(--muted);cursor:pointer}
+  .btab:hover{color:var(--text)}
+  .btab.on{color:var(--text)}
+  .btab.zero{color:var(--faint)}
+  .btab.zero:hover{color:var(--muted)}
+  .btab .bt-n{font-size:13px;font-weight:600;color:var(--faint)}
+  .btab.on .bt-n{color:var(--muted)}
+  .btab .bt-u{position:absolute;left:0;right:0;bottom:-1px;height:3px;border-radius:2px;background:transparent}
+  .btab.on .bt-u{background:var(--text)}
+
+  /* Toolbar: a rounded live filter on the left, the page's own control on the right. */
+  .cotools{display:flex;align-items:center;flex-wrap:wrap;gap:12px;margin:16px 0 0}
+  .cofind{position:relative;flex:1 1 260px;min-width:190px;max-width:400px}
+  .cofind .cf-i{position:absolute;left:13px;top:50%;transform:translateY(-50%);display:inline-flex;color:var(--faint);pointer-events:none}
+  .cofind input{width:100%;border-radius:999px;padding:9px 14px 9px 37px;font-size:13.5px}
+
+  /* The table. Narrow screens scroll the table itself, never the whole page. */
+  .cotwrap{overflow-x:auto;margin-top:14px;border-top:1px solid var(--border)}
+  table.cotable{width:100%;border-collapse:collapse;background:transparent;border:0;table-layout:fixed}
+  table.cotable th{text-align:left;font-size:12px;font-weight:700;color:var(--muted);white-space:nowrap;padding:11px 14px 11px 0;border-bottom:1px solid var(--border);background:transparent;position:static}
+  table.cotable td{height:52px;vertical-align:middle;padding:8px 14px;padding-left:0;border-bottom:1px solid var(--border);font-size:13.5px;color:var(--muted)}
+  table.cotable tbody tr:nth-child(even){background:transparent}
+  table.cotable tbody tr:hover{background:var(--surface2)}
+  table.cotable tbody tr.norow:hover{background:transparent}
+  table.cotable tr.gone{display:none}
+  .cotable .c-name{line-height:1.35}
+  .cotable .c-nm{font-size:14px;font-weight:700;color:var(--text)}
+  .cotable .c-tags{display:flex;align-items:center;flex-wrap:wrap;gap:6px;margin-top:5px}
+  .cotable .c-tags .badge{margin-left:0;font-size:10.5px;padding:2px 7px}
+  .cotable .c-tags .lic-badge{font-size:10.5px;padding:1px 7px;max-width:118px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+  .cotable .c-mut{color:var(--muted)}
+  .cotable .c-ic{display:inline-flex;align-items:center;gap:5px;color:var(--muted)}
+  .cotable .c-em{color:var(--accent)}
+  .cotable .c-act{text-align:right;white-space:nowrap;padding-right:0}
+  .co-empty{padding:24px 0;color:var(--muted);font-size:14px}
+  @media (max-width:760px){.copanel{padding:16px 14px}.btabs{gap:18px}}
+`;
+
 // ── SEARCH / PROSPECTOR PAGE ──
 async function renderSearchPage(req) {
   const nicheButtons = NICHES.map(
@@ -594,42 +650,11 @@ async function renderSearchPage(req) {
   .srchbar .sb-go:hover{border-color:var(--accent);color:var(--accent)}
 
   /* ── Companies: one full-width table, one bucket on screen at a time ── */
-  .copanel{background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:18px 20px 20px}
-  .cohead{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
-  .cohead .co-ic{display:inline-flex;color:var(--muted);flex:none}
-  .cohead .co-ic svg{width:19px;height:19px}
-  .cohead .co-ttl{font-size:17px;font-weight:700;letter-spacing:-.2px;color:var(--text)}
-  .cohead .co-n{font-size:13px;font-weight:500;color:var(--muted)}
+  /* The panel, tabs, toolbar and table styling are shared with the Leads page. */
+${TABLE_CSS}
   .copanel .scanline{margin:8px 0 0}
-
-  /* Bucket tabs: the selected one carries a dark underline sitting on the bar's hairline. */
-  .btabs{display:flex;flex-wrap:wrap;gap:24px;border-bottom:1px solid var(--border);margin:15px 0 0}
-  .btab{position:relative;display:inline-flex;align-items:center;gap:7px;font-family:inherit;background:none;border:0;padding:0 0 11px;font-size:14px;font-weight:600;color:var(--muted);cursor:pointer}
-  .btab:hover{color:var(--text)}
-  .btab.on{color:var(--text)}
-  .btab.zero{color:var(--faint)}
-  .btab.zero:hover{color:var(--muted)}
-  .btab .bt-n{font-size:13px;font-weight:600;color:var(--faint)}
-  .btab.on .bt-n{color:var(--muted)}
-  .btab .bt-u{position:absolute;left:0;right:0;bottom:-1px;height:3px;border-radius:2px;background:transparent}
-  .btab.on .bt-u{background:var(--text)}
-
-  /* Toolbar: filter what's on screen, or move the whole list over in one go. */
-  .cotools{display:flex;align-items:center;flex-wrap:wrap;gap:12px;margin:16px 0 0}
-  .cofind{position:relative;flex:1 1 260px;min-width:190px;max-width:400px}
-  .cofind .cf-i{position:absolute;left:13px;top:50%;transform:translateY(-50%);display:inline-flex;color:var(--faint);pointer-events:none}
-  .cofind input{width:100%;border-radius:999px;padding:9px 14px 9px 37px;font-size:13.5px}
   .cotools .moveall{margin-left:auto}
-
-  /* The table. Narrow screens scroll the table itself, never the whole page. */
-  .cotwrap{overflow-x:auto;margin-top:14px;border-top:1px solid var(--border)}
-  table.cotable{width:100%;min-width:940px;border-collapse:collapse;background:transparent;border:0;table-layout:fixed}
-  table.cotable th{text-align:left;font-size:12px;font-weight:700;color:var(--muted);white-space:nowrap;padding:11px 14px 11px 0;border-bottom:1px solid var(--border);background:transparent;position:static}
-  table.cotable td{height:52px;vertical-align:middle;padding:8px 14px;padding-left:0;border-bottom:1px solid var(--border);font-size:13.5px;color:var(--muted)}
-  table.cotable tbody tr:nth-child(even){background:transparent}
-  table.cotable tbody tr:hover{background:var(--surface2)}
-  table.cotable tbody tr.norow:hover{background:transparent}
-  table.cotable tr.gone{display:none}
+  table.cotable{min-width:940px}
   /* Fixed column widths, sized so nothing needs a scrollbar at a normal desktop width.
      The action column is budgeted for its widest state: "In your leads" plus dismiss. */
   table.cotable th:nth-child(1),table.cotable td:nth-child(1){width:22%}
@@ -640,22 +665,11 @@ async function renderSearchPage(req) {
   table.cotable th:nth-child(6),table.cotable td:nth-child(6){width:8%}
   table.cotable th:nth-child(7),table.cotable td:nth-child(7){width:9%}
   table.cotable th:nth-child(8),table.cotable td:nth-child(8){width:17%}
-  .cotable .c-name{line-height:1.35}
-  .cotable .c-nm{font-size:14px;font-weight:700;color:var(--text)}
-  .cotable .c-tags{display:flex;align-items:center;flex-wrap:wrap;gap:6px;margin-top:5px}
-  .cotable .c-tags .badge{margin-left:0;font-size:10.5px;padding:2px 7px}
-  .cotable .c-tags .lic-badge{font-size:10.5px;padding:1px 7px;max-width:118px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
-  .cotable .c-mut{color:var(--muted)}
-  .cotable .c-ic{display:inline-flex;align-items:center;gap:5px;color:var(--muted)}
-  .cotable .c-em{color:var(--accent)}
   .cotable .c-actv{display:inline-flex;align-items:center;flex-wrap:wrap;gap:4px 8px}
   .cotable .fresh-badge{margin:0;font-size:11.5px;padding:2px 8px}
-  .cotable .c-act{text-align:right;white-space:nowrap;padding-right:0}
   .cotable .c-act .save{padding:6px 11px;font-size:12px}
   .cotable .c-act .hide{padding:6px 9px;font-size:12px;margin-left:6px}
-  .co-empty{padding:24px 0;color:var(--muted);font-size:14px}
   .copanel .grp-done{margin:16px 0 0}
-  @media (max-width:760px){.copanel{padding:16px 14px}.btabs{gap:18px}}
   .save{display:inline-flex;align-items:center;gap:6px}
   .fresh-badge svg,.lic-badge svg,.save svg,.hide svg{flex:none}
   .lic-badge{display:inline-flex;align-items:center;gap:5px}
@@ -1233,12 +1247,14 @@ function followUpInfo(dt) {
   return { label: `${date} · in ${days}d`, cls: "", ts };
 }
 
-// The per-row "Follow up" control: presets, a custom date, and a clear.
+// The per-row "Follow up" control: presets, a custom date, and a clear. The table sits
+// in a horizontal scroll box (.cotwrap), which would clip a popup laid out inside the
+// row, so the panel is position:fixed and placed against its button by posFu() on open.
 function followMenu(id) {
   const opt = (when, label) =>
     `<button type="button" class="fu-opt" onclick="setFollowUp(${id},'${when}')">${label}</button>`;
-  return `<details class="fumenu">
-    <summary title="Set a follow-up and come back to this later">${icon("clock", 14)}<span>Follow up</span></summary>
+  return `<details class="fumenu" ontoggle="posFu(this)">
+    <summary title="Set a follow-up and come back to this later">${icon("clock", 13)}<span>Follow up</span></summary>
     <div class="fumenu-pop">
       ${opt("3d", "In 3 days")}${opt("1w", "In 1 week")}${opt("2w", "In 2 weeks")}${opt("1m", "In 1 month")}
       <label class="fu-custom">Pick a date<input type="date" onchange="setFollowUp(${id},this.value)"></label>
@@ -1247,8 +1263,27 @@ function followMenu(id) {
   </details>`;
 }
 
-// One CRM row. Identical in both lists so a row can move between them without the
-// columns shifting; only the follow-up cell changes.
+// The compact license tag for the name cell, the same shape the Search table uses: a
+// badge only when the business actually advertises one. The full signal (including the
+// "nothing found" case) and the official-search link live in the row's notes panel.
+function licenseTagHtml(l) {
+  let lj = {};
+  try { lj = l.lead_json ? JSON.parse(l.lead_json) : {}; } catch {}
+  const sig = detectLicenseSignal(lj);
+  if (sig.status !== "mentioned") return "";
+  const label = esc(sig.evidence || "licensed/registered");
+  return `<span class="lic-badge lic-yes" title="Advertises: ${label}. Confirm it with Verify in the notes panel.">${icon("badge", 12)}${label}</span>`;
+}
+
+const dashCell = () => '<span class="c-mut">--</span>';
+const mutedCell = (v) => (v ? `<span class="c-mut">${esc(String(v))}</span>` : dashCell());
+
+const CRM_COLS = 7;
+
+// One lead: the table row, plus the notes row that expands underneath it. Notes, the
+// contact details and the license signal don't fit a 52px row, so they live in that
+// expansion instead of being dropped. Both lists render identical rows so a row can
+// move between them without the columns shifting; only the follow-up cell changes.
 function renderCrmRow(l) {
   const opts = CRM_STAGES.map(
     (s) => `<option value="${s}"${l.crm_stage === s ? " selected" : ""}>${s}</option>`
@@ -1258,56 +1293,94 @@ function renderCrmRow(l) {
   const contacted = daysAgo(l.contacted_on);
   const fuCell = fu.label
     ? `<span class="fudate ${fu.cls}">${icon("clock", 13)}${esc(fu.label)}</span>`
-    : `<span class="muted">${contacted ? `contacted ${esc(contacted)}` : "not scheduled"}</span>`;
+    : '<span class="c-mut">not scheduled</span>';
   const moveOpts = CRM_BUCKETS.filter((b) => b !== bucket)
     .map((b) => `<option value="${b}">${esc(BUCKET_META[b].title)}</option>`)
     .join("");
-  return `<tr id="crm-${l.id}" data-bucket="${bucket}" data-fu="${fu.ts || 0}">
-    <td><b>${esc(l.name)}</b><div class="sub">${esc(l.category || "")} · ${esc(l.city || "")}, ${esc(l.state || "")}</div><div class="sub" style="margin-top:5px">${licenseBadgeHtml(l)}</div></td>
-    <td>${esc(l.phone || "no phone")}<div class="sub">${l.email ? esc(l.email) : '<span class="warn">no email</span>'}</div></td>
-    <td><span class="src">${esc(srcLabel(l.source))}</span></td>
+  const place = [l.city, l.state].filter(Boolean).join(", ");
+  const notes = l.notes || "";
+  const stage = l.crm_stage || "";
+  const tag = bucket === "has_website" ? "" : '<span class="badge">no website</span>';
+  const lic = licenseTagHtml(l);
+  const tags = tag || lic ? `<span class="c-tags">${tag}${lic}</span>` : "";
+  // What the toolbar filter matches on. Stage and notes are in here too, so the page
+  // script rewrites data-k whenever either of them changes.
+  const base = [l.name, l.category, l.city, l.state, l.phone, l.email].filter(Boolean).join(" ").toLowerCase();
+  const meta = [
+    l.category ? esc(l.category) : "",
+    `from ${esc(srcLabel(l.source))}`,
+    l.email ? `<span class="c-em">${esc(l.email)}</span>` : '<span class="warn">no email</span>',
+    contacted ? `contacted ${esc(contacted)}` : "",
+  ]
+    .filter(Boolean)
+    .join(' <span class="ndot">·</span> ');
+  return `<tr class="crmrow" id="crm-${l.id}" data-bucket="${bucket}" data-fu="${fu.ts || 0}" data-base="${esc(base)}" data-stage="${esc(stage)}" data-notes="${esc(notes)}" data-k="${esc(`${base} ${stage} ${notes}`.toLowerCase())}">
+    <td class="c-name"><span class="c-nm">${esc(l.name)}</span>${tags}</td>
+    <td>${mutedCell(place)}</td>
+    <td>${mutedCell(l.phone)}</td>
+    <td><select class="stage" title="Where this lead stands" onchange="setStage(${l.id},this.value)">${opts}</select></td>
     <td class="fucell">${fuCell}</td>
-    <td><select class="stage" onchange="setStage(${l.id},this.value)">${opts}</select></td>
-    <td><input class="notes" value="${esc(l.notes || "")}" placeholder="notes…" onchange="setNotes(${l.id},this.value)"></td>
-    <td class="actions">
-      ${followMenu(l.id)}
-      <select class="movebucket" title="Move this lead to another list" onchange="moveBucket(${l.id},this.value,this)"><option value="">Move to…</option>${moveOpts}</select>
-      <button class="rm" onclick="removeCrm(${l.id})">Remove</button>
-    </td>
-  </tr>`;
+    <td class="c-note"><button type="button" class="notebtn${notes ? " on" : ""}" id="nb-${l.id}" aria-expanded="false" aria-controls="note-${l.id}" title="${notes ? "Notes on this lead" : "Add notes"}" onclick="toggleNote(${l.id})">${icon("note", 14)}</button></td>
+    <td class="c-act"><div class="actwrap">${followMenu(l.id)}<select class="movebucket" title="Move this lead to another list" onchange="moveBucket(${l.id},this.value,this)"><option value="">Move to</option>${moveOpts}</select><button class="rm" onclick="removeCrm(${l.id})">Remove</button></div></td>
+  </tr>
+  <tr class="noterow" id="note-${l.id}" hidden><td class="notecell" colspan="${CRM_COLS}">
+    <div class="notepanel">
+      <div class="nmeta">${meta} <span class="ndot">·</span> ${licenseBadgeHtml(l)}</div>
+      <textarea class="notes" id="nt-${l.id}" rows="2" placeholder="What happened on this one" onchange="saveNote(${l.id})">${esc(notes)}</textarea>
+      <div class="nact"><button type="button" class="nsave" onclick="saveNote(${l.id})">Save notes</button><span class="nok" id="nok-${l.id}"></span></div>
+    </div>
+  </td></tr>`;
 }
 
-const CRM_COLS = 7;
+// One list as a table, in the same wrapper and with the same header the Search page uses.
+// Two tail rows ride along: the empty-state line, and the no-match line the filter shows.
 function crmTable(bucket, list, rows) {
-  const empty = list === "working" ? "Nothing in this list right now." : "No follow-ups scheduled here.";
-  return `<div class="tblwrap"><table>
-    <thead><tr><th>Business</th><th>Contact</th><th>Source</th><th>Follow-up</th><th>Stage</th><th>Notes</th><th>Actions</th></tr></thead>
+  const empty =
+    list === "working" ? "Nothing in the working list right now." : "No follow-ups scheduled here yet.";
+  return `<div class="cotwrap"><table class="cotable">
+    <thead><tr><th>Company name</th><th>City, state</th><th>Phone</th><th>Stage</th><th>Follow up</th><th>Notes</th><th class="c-act"></th></tr></thead>
     <tbody id="tb-${bucket}-${list}">${rows.map(renderCrmRow).join("")}<tr class="emptyrow"${
       rows.length ? ' style="display:none"' : ""
-    }><td colspan="${CRM_COLS}">${empty}</td></tr></tbody>
+    }><td colspan="${CRM_COLS}">${empty}</td></tr><tr class="norow gone"><td colspan="${CRM_COLS}" class="co-empty">No leads here match that search.</td></tr></tbody>
   </table></div>`;
 }
 
-// One bucket: its working list, then its follow-ups. The first bucket is the main
-// workflow and opens expanded; the other two start collapsed.
-function bucketSection(key, data, open) {
-  const meta = BUCKET_META[key];
+function sumText(working, followups) {
+  return `${working} working, ${followups} follow-up${followups === 1 ? "" : "s"}`;
+}
+
+// One bucket's whole content: the filter toolbar, then the working table, then the
+// follow-ups table. Every bucket is rendered, and all but the selected one is hidden, so
+// a row can move to another bucket's list without a reload and the counts still add up.
+function bucketPane(key, data, active) {
   const working = data.working || [];
   const followups = data.followups || [];
-  const anchor = key === "qualified" ? ' id="followups"' : "";
-  return `<details class="bucket" id="sec-${key}"${open ? " open" : ""}>
-  <summary>
-    <span class="bk-ttl">${esc(meta.title)}</span>
-    <span class="bk-n" id="cnt-${key}-all">${working.length + followups.length}</span>
-    <span class="bk-sub">${esc(meta.sub)}</span>
-  </summary>
-  <div class="bk-body">
-    <div class="listhead">Working <span class="cnt" id="cnt-${key}-working">${working.length}</span></div>
+  const all = working.length + followups.length;
+  return `<div class="lpane" id="pane-${key}" role="tabpanel" aria-labelledby="bt-${key}"${active ? "" : " hidden"}>
+  <div id="body-${key}"${all ? "" : " hidden"}>
+    <div class="cotools">
+      <div class="cofind"><span class="cf-i">${icon("search", 14)}</span><input id="find-${key}" type="text" autocomplete="off" placeholder="Search these leads" oninput="filterRows('${key}')"></div>
+      <div class="cosum" id="sum-${key}">${sumText(working.length, followups.length)}</div>
+    </div>
+    <div class="lsub">Working <span class="cnt" id="cnt-${key}-working">${working.length}</span></div>
     ${crmTable(key, "working", working)}
-    <div class="listhead"${anchor}>Follow-ups <span class="cnt" id="cnt-${key}-followups">${followups.length}</span> <span class="listsub">soonest first</span></div>
+    <div class="lsub" id="fus-${key}">Follow-ups <span class="cnt" id="cnt-${key}-followups">${followups.length}</span> <span class="lsubnote">soonest first</span></div>
     ${crmTable(key, "followups", followups)}
   </div>
-</details>`;
+  <div class="co-empty" id="none-${key}"${all ? " hidden" : ""}>Nothing in this list yet. Move companies over from a search.</div>
+</div>`;
+}
+
+// The bucket tab bar, same idiom as the Search page's: live counts, a dark underline on
+// the selected one, faint when a bucket is empty.
+function bucketTabs(crm, active) {
+  return `<div class="btabs" role="tablist">${CRM_BUCKETS.map((k) => {
+    const meta = BUCKET_META[k];
+    const n = crm[k].working.length + crm[k].followups.length;
+    return `<button type="button" class="btab${k === active ? " on" : ""}${n ? "" : " zero"}" id="bt-${k}" role="tab" aria-selected="${
+      k === active ? "true" : "false"
+    }" aria-controls="pane-${k}" title="${esc(meta.sub)}" onclick="pickTab('${k}')">${esc(meta.title)}<span class="bt-n">${n}</span><span class="bt-u"></span></button>`;
+  }).join("")}</div>`;
 }
 
 // Your own reminders (people you called off your own bat), separate from the lead rows.
@@ -1363,16 +1436,18 @@ async function renderLeadsPage(req) {
     }
   }
   const openReminders = reminders.filter((f) => !f.done).length;
+  // The header carries the total, so this line covers only what's scheduled.
   const stats = total
-    ? `<b>${total}</b> lead${total === 1 ? "" : "s"} in play &nbsp;·&nbsp; <b>${scheduled}</b> scheduled follow-up${
-        scheduled === 1 ? "" : "s"
-      }${dueNow ? ` &nbsp;·&nbsp; <b class="duenow">${dueNow} due now</b>` : ""}`
+    ? `<b>${scheduled}</b> scheduled follow-up${scheduled === 1 ? "" : "s"}${
+        dueNow ? ` &nbsp;·&nbsp; <b class="duenow">${dueNow} due now</b>` : ""
+      }`
     : "Nothing here yet. Run a search and move the results over.";
 
-  const sections = CRM_BUCKETS.map((b, i) => bucketSection(b, crm[b], i === 0)).join("");
-  const empty = total
-    ? ""
-    : `<div class="empty">No leads yet.<br>Go to <a href="/">Search</a>, run a scan, then use <b>Move all to CRM</b> on the results.</div>`;
+  // Open on the first bucket that actually has something in it.
+  const activeTab =
+    CRM_BUCKETS.find((b) => crm[b].working.length + crm[b].followups.length) || CRM_BUCKETS[0];
+  const tabs = bucketTabs(crm, activeTab);
+  const panes = CRM_BUCKETS.map((b) => bucketPane(b, crm[b], b === activeTab)).join("");
 
   return `<!doctype html><html><head>${THEME_INIT_SCRIPT}<meta charset="utf-8">${FAVICON}<title>Prospector · Leads</title>
 <style>
@@ -1382,65 +1457,79 @@ async function renderLeadsPage(req) {
   body>*{position:relative;z-index:1}
   body{font-family:system-ui,sans-serif;background:var(--bg);color:var(--text);padding:24px;max-width:1200px;margin:auto}
   h1{color:var(--gold);font-size:24px;letter-spacing:1px}
-  .stats{color:var(--muted);font-size:13px;margin-bottom:16px}
   .duenow{color:var(--warn)}
-  table{width:100%;border-collapse:collapse;background:var(--panel);border:1px solid var(--border);border-radius:12px;overflow:hidden}
-  th{text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.5px;color:var(--muted);padding:11px 14px;border-bottom:1px solid var(--border)}
-  td{padding:11px 14px;border-bottom:1px solid rgba(255,255,255,.05);font-size:14px;vertical-align:top}
-  tr:last-child td{border-bottom:none}
-  .sub{color:var(--muted);font-size:12px;margin-top:3px}.warn{color:#e0a93b}
-  .src{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px}
-  select.stage,input.notes,select.movebucket{background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.12);border-radius:7px;padding:7px 9px;color:var(--text);font-size:13px}
-  input.notes{width:100%;min-width:150px}
-  select.movebucket{font-size:12px;padding:6px 8px;max-width:130px}
-  .actions{display:flex;gap:8px;align-items:flex-start;flex-wrap:wrap}
-  .rm{background:transparent;border:1px solid var(--border);color:var(--muted);border-radius:6px;padding:6px 10px;cursor:pointer;font-size:12px;font-family:inherit}
-  .rm:hover{color:#e05b5b;border-color:#e05b5b}
-  .search{width:100%;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.14);border-radius:10px;padding:11px 14px;color:var(--text);font-size:15px;margin-bottom:16px}
-  .search::placeholder{color:var(--muted)}
-  #noMatch{display:none;color:var(--muted);text-align:center;margin:20px 0;font-size:14px}
-  .empty{color:var(--muted);text-align:center;margin-top:40px;font-size:15px}
+  .empty{color:var(--muted);font-size:15px}
+  .warn{color:var(--warn)}
   .lic-badge{display:inline-flex;align-items:center;gap:5px;font-size:12px;font-weight:600;padding:2px 8px;border-radius:6px}
   .lic-verify{font-size:12px;text-decoration:none;margin-left:6px}
-  /* ── Bucket sections ── */
-  .bucket{background:var(--panel);border:1px solid var(--border);border-radius:12px;margin-bottom:14px;overflow:hidden}
-  .bucket>summary{list-style:none;cursor:pointer;padding:15px 18px;display:flex;align-items:center;gap:12px;flex-wrap:wrap}
-  .bucket>summary::-webkit-details-marker{display:none}
-  .bucket>summary::after{content:"";flex:none;width:9px;height:9px;margin-left:auto;border-right:2px solid var(--muted);border-bottom:2px solid var(--muted);transform:rotate(45deg) translateY(-2px);transition:transform .15s;order:1}
-  .bucket[open]>summary::after{transform:rotate(225deg) translateY(-2px)}
-  .bk-ttl{font-weight:700;font-size:15px;color:var(--text)}
-  .bk-n{font-size:12px;font-weight:700;padding:2px 9px;border-radius:20px;background:var(--surface2);color:var(--muted)}
-  #sec-qualified .bk-n{background:var(--accent-weak);color:var(--accent-ink)}
-  .bk-sub{font-size:13px;color:var(--muted);flex:1 1 100%;margin-top:-4px;order:2}
-  .bk-body{padding:0 14px 16px}
-  .listhead{display:flex;align-items:center;gap:8px;font-size:12px;text-transform:uppercase;letter-spacing:.5px;color:var(--muted);font-weight:700;margin:10px 0 8px}
-  .listhead .cnt{background:var(--surface2);color:var(--muted);border-radius:20px;padding:1px 8px;font-size:11px}
-  .listhead .listsub{text-transform:none;letter-spacing:0;font-weight:400}
-  .tblwrap{overflow-x:auto}
-  .emptyrow td{color:var(--muted);font-size:13px;text-align:center;padding:16px}
-  tbody tr.justmoved{animation:pop 1.2s ease-out}
+
+  /* ── Leads: the same panel, tabs, toolbar and table the Search page uses ── */
+${TABLE_CSS}
+  .leadline{font-size:14px;color:var(--muted);margin:8px 0 0}
+  .leadline b{color:var(--text)}
+  /* The toolbar's right-hand side is a read-out here, not a button. */
+  .cosum{margin-left:auto;font-size:13px;color:var(--muted);white-space:nowrap}
+  /* The two lists inside one bucket. */
+  .lsub{display:flex;align-items:center;gap:8px;margin:20px 0 0;font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;color:var(--muted)}
+  .lsub .cnt{background:var(--surface2);color:var(--muted);border-radius:20px;padding:1px 8px;font-size:11px;letter-spacing:0}
+  .lsub .lsubnote{text-transform:none;letter-spacing:0;font-weight:500;color:var(--faint)}
+  /* Wider than the Search table: these rows carry three live controls, and the action
+     column is budgeted for all three of them side by side. */
+  table.cotable{min-width:1040px}
+  table.cotable th:nth-child(1),table.cotable td:nth-child(1){width:22%}
+  table.cotable th:nth-child(2),table.cotable td:nth-child(2){width:10%}
+  table.cotable th:nth-child(3),table.cotable td:nth-child(3){width:11%}
+  table.cotable th:nth-child(4),table.cotable td:nth-child(4){width:10%}
+  table.cotable th:nth-child(5),table.cotable td:nth-child(5){width:12%;white-space:nowrap}
+  table.cotable th:nth-child(6),table.cotable td:nth-child(6){width:5%}
+  table.cotable th:nth-child(7),table.cotable td:nth-child(7){width:30%}
+  .cotable tr.emptyrow td,.cotable tr.norow td{height:auto;padding:16px 0;color:var(--muted);font-size:13px;border-bottom:0}
+  .cotable tbody tr.emptyrow:hover{background:transparent}
+  .cotable tbody tr.justmoved{animation:pop 1.2s ease-out}
   @keyframes pop{0%{background:var(--accent-weak)}100%{background:transparent}}
+  /* ── Row controls, sized to sit inside a 52px row ── */
+  select.stage{width:100%;height:34px;background:var(--surface);border:1px solid var(--border-strong);border-radius:8px;padding:4px 7px;color:var(--text);font-size:13px;font-family:inherit}
+  select.movebucket{height:34px;max-width:112px;background:var(--surface);border:1px solid var(--border-strong);border-radius:8px;padding:4px 7px;color:var(--muted);font-size:12.5px;font-family:inherit}
+  .actwrap{display:flex;align-items:center;justify-content:flex-end;gap:7px}
+  .rm{height:34px;background:transparent;border:1px solid var(--border);color:var(--muted);border-radius:8px;padding:0 11px;cursor:pointer;font-size:12.5px;font-family:inherit}
+  .rm:hover{color:var(--danger);border-color:var(--danger)}
+  /* ── Notes: a button in the row, the editor in a full-width row underneath ── */
+  .cotable td.c-note{padding-right:8px}
+  .notebtn{display:inline-flex;align-items:center;justify-content:center;width:32px;height:32px;background:transparent;border:1px solid var(--border);border-radius:8px;color:var(--faint);cursor:pointer;font-family:inherit}
+  .notebtn:hover{color:var(--text);border-color:var(--border-strong)}
+  .notebtn.on{background:var(--accent-weak);border-color:transparent;color:var(--accent-ink)}
+  .crmrow.noteon .notebtn{color:var(--text);border-color:var(--border-strong)}
+  .cotable td.notecell{height:auto;padding:0 0 14px}
+  .cotable tbody tr.noterow:hover{background:transparent}
+  .notepanel{display:flex;flex-direction:column;gap:9px;background:var(--surface2);border:1px solid var(--border);border-radius:10px;padding:12px 14px}
+  .nmeta{display:flex;align-items:center;flex-wrap:wrap;gap:6px;font-size:12.5px;color:var(--muted)}
+  .nmeta .ndot{color:var(--faint)}
+  textarea.notes{width:100%;min-height:58px;resize:vertical;background:var(--surface);border:1px solid var(--border-strong);border-radius:8px;padding:9px 11px;color:var(--text);font-size:13.5px;font-family:inherit;line-height:1.45}
+  .nact{display:flex;align-items:center;gap:10px}
+  .nsave{font-family:inherit;background:var(--accent);color:var(--on-accent);border:none;border-radius:8px;padding:7px 15px;font-size:13px;font-weight:700;cursor:pointer}
+  .nok{font-size:12.5px;font-weight:600;color:var(--accent-ink)}
   /* ── Follow-up control ── */
   .fudate{display:inline-flex;align-items:center;gap:5px;font-size:13px;font-weight:600;white-space:nowrap;color:var(--muted)}
   .fudate.soon{color:var(--warn)}.fudate.od{color:var(--danger)}
-  .fumenu{position:relative}
-  .fumenu>summary{list-style:none;cursor:pointer;display:inline-flex;align-items:center;gap:6px;border:1px solid var(--border);border-radius:6px;padding:6px 10px;font-size:12px;font-weight:600;color:var(--muted);white-space:nowrap}
+  .fumenu{position:relative;flex:none}
+  .fumenu>summary{list-style:none;cursor:pointer;display:inline-flex;align-items:center;gap:6px;height:34px;padding:0 11px;border:1px solid var(--border);border-radius:8px;font-size:12.5px;font-weight:600;color:var(--muted);white-space:nowrap}
   .fumenu>summary::-webkit-details-marker{display:none}
-  .fumenu>summary:hover{color:var(--text)}
-  .fumenu-pop{position:absolute;z-index:20;right:0;top:calc(100% + 5px);min-width:190px;display:flex;flex-direction:column;gap:2px;background:var(--panel);border:1px solid var(--border-strong);border-radius:10px;padding:6px;box-shadow:0 12px 28px rgba(0,0,0,.22)}
+  .fumenu>summary:hover{color:var(--text);border-color:var(--border-strong)}
+  .fumenu[open]>summary{color:var(--text);border-color:var(--border-strong)}
+  .fumenu-pop{position:fixed;z-index:60;width:210px;display:flex;flex-direction:column;gap:2px;background:var(--panel);border:1px solid var(--border-strong);border-radius:10px;padding:6px;box-shadow:0 12px 28px rgba(0,0,0,.22)}
   .fu-opt{font-family:inherit;text-align:left;background:transparent;border:none;border-radius:6px;padding:8px 10px;font-size:13px;color:var(--text);cursor:pointer}
   .fu-opt:hover{background:var(--surface2)}
   .fu-clear{color:var(--muted);border-top:1px solid var(--border);border-radius:0 0 6px 6px;margin-top:2px}
   .fu-custom{display:flex;flex-direction:column;gap:5px;padding:6px 10px 8px;font-size:12px;color:var(--muted)}
   .fu-custom input{font-size:13px;border-radius:6px;padding:6px 8px}
   /* ── Your reminders panel ── */
-  .fubox{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:16px 18px;margin-bottom:16px}
-  .fubox h3{font-size:14px;margin-bottom:12px;font-weight:700}
+  .fubox{background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:18px 20px 20px;margin-top:16px}
+  .fubox .cohead{margin-bottom:14px}
   .fu-add{display:grid;grid-template-columns:minmax(0,1.4fr) minmax(0,1.6fr) auto auto;gap:10px}
-  .fu-add input{background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.12);border-radius:8px;padding:9px 12px;color:var(--text);font-size:14px}
-  .fu-add button{background:var(--gold);color:#000;border:none;border-radius:8px;padding:9px 18px;font-weight:700;cursor:pointer;white-space:nowrap;font-family:inherit}
-  .fu-list{display:flex;flex-direction:column;gap:8px;margin-top:12px}
-  .fu-item{display:flex;justify-content:space-between;align-items:center;gap:12px;background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:11px 14px}
+  .fu-add input{background:var(--surface);border:1px solid var(--border-strong);border-radius:9px;padding:9px 12px;color:var(--text);font-size:14px;font-family:inherit}
+  .fu-add button{background:var(--accent);color:var(--on-accent);border:none;border-radius:9px;padding:9px 18px;font-weight:700;cursor:pointer;white-space:nowrap;font-family:inherit}
+  .fu-list{display:flex;flex-direction:column;gap:8px;margin-top:14px}
+  .fubox .fu-item{display:flex;justify-content:space-between;align-items:center;gap:12px;background:var(--surface2);border:1px solid var(--border);border-radius:10px;padding:11px 14px}
   .fu-item.fu-done{opacity:.5}.fu-item.fu-done .fu-title{text-decoration:line-through}
   .fu-title{font-weight:700;font-size:14px}
   .fu-note{color:var(--muted);font-size:13px;margin-top:3px}
@@ -1452,10 +1541,20 @@ async function renderLeadsPage(req) {
   @media(max-width:820px){.fu-add{grid-template-columns:1fr}}
 ${SHARED_CSS}</style></head><body>
 ${sidebar("leads", { isAdmin: req.isAdmin, demo: req.isDemo })}<div class="pagehead"><div class="titlewrap"><h1>Leads</h1><div class="pagesub">The businesses you're working, and when to call them back</div></div><div class="spacer"></div></div>
-<div class="stats">${stats}</div>
 
-<div class="fubox">
-  <h3>Your reminders</h3>
+<section class="copanel" id="followups">
+  <div class="cohead"><span class="co-ic">${icon("companies")}</span>
+    <span class="co-ttl">Leads</span>
+    <span class="co-n" id="leadTotal">${total.toLocaleString()} lead${total === 1 ? "" : "s"}</span></div>
+  <div class="leadline">${stats}</div>
+  ${tabs}
+  ${panes}
+</section>
+
+<section class="fubox">
+  <div class="cohead"><span class="co-ic">${icon("calendar")}</span>
+    <span class="co-ttl">Your reminders</span>
+    <span class="co-n">${openReminders} open</span></div>
   <div class="fu-add">
     <input id="fuTitle" placeholder="Who or which business (e.g. Joe's Roofing)">
     <input id="fuNote" placeholder="Note, optional (e.g. called, wants a quote)">
@@ -1465,28 +1564,78 @@ ${sidebar("leads", { isAdmin: req.isAdmin, demo: req.isDemo })}<div class="pageh
   <div class="fu-list" id="fuList">${
     reminders.length
       ? reminders.map(renderFollowupItem).join("")
-      : '<div class="empty" style="margin:6px 0;text-align:left;font-size:13px">No reminders of your own yet. Add one above.</div>'
+      : '<div class="empty" style="margin:6px 0;font-size:13px">No reminders of your own yet. Add one above.</div>'
   }</div>
-</div>
-
-<input class="search" id="q" placeholder="Filter every list by name, category, city, or phone" oninput="filterRows()">
-<div id="noMatch">No leads match your filter.</div>
-${sections}
-${empty}
+</section>
 <script>
 ${iconScript(["clock", "check", "warn"], 13)}
 function esc(s){return (s||'').replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]})}
 async function post(url,data){var r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data||{})});return r.json()}
 var BUCKET_KEYS=${JSON.stringify(CRM_BUCKETS)};
 var BUCKETS=${JSON.stringify(BUCKET_META)};
+var TAB=${JSON.stringify(activeTab)};
+
+// ── bucket tabs ──
+// Every bucket's tables stay in the page, hidden, so a row can be sent to another
+// bucket's list without a reload and every count still adds up.
+function pickTab(key){
+  TAB=key;
+  BUCKET_KEYS.forEach(function(b){
+    var p=document.getElementById('pane-'+b);
+    if(p)p.hidden=b!==key;
+    var t=document.getElementById('bt-'+b);
+    if(t){t.classList.toggle('on',b===key);t.setAttribute('aria-selected',b===key?'true':'false')}
+  });
+  closeMenus();
+  filterRows(key);
+}
 
 // ── stage / notes / remove ──
-async function setStage(id,stage){await post('/api/crm/update/'+id,{stage:stage})}
+async function setStage(id,stage){
+  await post('/api/crm/update/'+id,{stage:stage});
+  var row=document.getElementById('crm-'+id);
+  if(row){row.setAttribute('data-stage',stage);refreshKey(row)}
+}
 async function setNotes(id,notes){await post('/api/crm/update/'+id,{notes:notes})}
+// The filter matches on data-k, which carries the stage and the notes, so it is rebuilt
+// whenever either of those changes.
+function refreshKey(row){
+  row.setAttribute('data-k',[row.getAttribute('data-base')||'',row.getAttribute('data-stage')||'',row.getAttribute('data-notes')||''].join(' ').toLowerCase());
+}
+function leadId(row){return String(row.id||'').slice(4)}
+function noteRow(row){return document.getElementById('note-'+leadId(row))}
+// Notes live in a row that expands under the lead's own row.
+function toggleNote(id){
+  var row=document.getElementById('crm-'+id);
+  if(!row)return;
+  var on=!row.classList.contains('noteon');
+  row.classList.toggle('noteon',on);
+  var b=document.getElementById('nb-'+id);
+  if(b)b.setAttribute('aria-expanded',on?'true':'false');
+  syncNote(row);
+  if(on){var t=document.getElementById('nt-'+id);if(t)t.focus()}
+}
+// That row shows only while its lead row is both expanded and past the filter.
+function syncNote(row){
+  var nr=noteRow(row);
+  if(nr)nr.hidden=!(row.classList.contains('noteon')&&!row.classList.contains('gone'));
+}
+async function saveNote(id){
+  var t=document.getElementById('nt-'+id);
+  if(!t)return;
+  var v=t.value;
+  await setNotes(id,v);
+  var row=document.getElementById('crm-'+id);
+  if(row){row.setAttribute('data-notes',v);refreshKey(row)}
+  var b=document.getElementById('nb-'+id);
+  if(b){b.classList.toggle('on',!!v.trim());b.title=v.trim()?'Notes on this lead':'Add notes'}
+  var ok=document.getElementById('nok-'+id);
+  if(ok){ok.textContent='Saved';clearTimeout(ok._t);ok._t=setTimeout(function(){ok.textContent=''},1600)}
+}
 async function removeCrm(id){
   await post('/api/crm/remove/'+id,{});
-  var r=document.getElementById('crm-'+id);
-  if(r)r.remove();
+  var row=document.getElementById('crm-'+id);
+  if(row){var nr=noteRow(row);if(nr)nr.remove();row.remove()}
   paintCounts();
 }
 
@@ -1516,7 +1665,7 @@ async function setFollowUp(id,when){
   var cell=row.querySelector('.fucell');
   if(cell)cell.innerHTML=info.label
     ? '<span class="fudate '+info.cls+'">'+ICONS.clock+esc(info.label)+'</span>'
-    : '<span class="muted">not scheduled</span>';
+    : '<span class="c-mut">not scheduled</span>';
   moveRowTo(row,row.getAttribute('data-bucket')||'qualified',r.followUpAt?'followups':'working');
 }
 async function moveBucket(id,bucket,sel){
@@ -1527,15 +1676,15 @@ async function moveBucket(id,bucket,sel){
   var row=document.getElementById('crm-'+id);
   if(!row)return;
   row.setAttribute('data-bucket',bucket);
-  var sec=document.getElementById('sec-'+bucket);
-  if(sec)sec.open=true;
+  paintTag(row,bucket);
   moveRowTo(row,bucket,Number(row.getAttribute('data-fu'))>0?'followups':'working');
   rebuildMoveMenu(row,bucket,id);
+  pickTab(bucket);
 }
 function rebuildMoveMenu(row,bucket,id){
   var sel=row.querySelector('.movebucket');
   if(!sel)return;
-  var html='<option value="">Move to…</option>';
+  var html='<option value="">Move to</option>';
   for(var i=0;i<BUCKET_KEYS.length;i++){
     var b=BUCKET_KEYS[i];
     if(b!==bucket)html+='<option value="'+b+'">'+esc(BUCKETS[b].title)+'</option>';
@@ -1546,45 +1695,110 @@ function rebuildMoveMenu(row,bucket,id){
 function moveRowTo(row,bucket,list){
   var tb=document.getElementById('tb-'+bucket+'-'+list);
   if(!tb)return;
-  tb.appendChild(row);
+  place(tb,row);
   if(list==='followups')sortFollowups(tb);
   paintCounts();
   row.classList.remove('justmoved');
   void row.offsetWidth;
   row.classList.add('justmoved');
 }
+// A lead row always travels with its notes row, and the two tail rows (empty state,
+// no-match line) stay at the bottom of the list.
+function place(tb,row){
+  tb.appendChild(row);
+  var nr=noteRow(row);
+  if(nr)tb.appendChild(nr);
+  keepTail(tb);
+}
+function keepTail(tb){
+  ['emptyrow','norow'].forEach(function(c){
+    var r=tb.querySelector('tr.'+c);
+    if(r)tb.appendChild(r);
+  });
+}
 function dataRows(tb){
-  return Array.prototype.filter.call(tb.children,function(r){return !r.classList.contains('emptyrow')});
+  return Array.prototype.filter.call(tb.children,function(r){return r.classList.contains('crmrow')});
 }
 function sortFollowups(tb){
-  var rows=dataRows(tb).sort(function(a,b){return (Number(a.getAttribute('data-fu'))||0)-(Number(b.getAttribute('data-fu'))||0)});
-  var blank=tb.querySelector('.emptyrow');
-  rows.forEach(function(r){tb.appendChild(r)});
-  if(blank)tb.appendChild(blank);
+  dataRows(tb).sort(function(a,b){return (Number(a.getAttribute('data-fu'))||0)-(Number(b.getAttribute('data-fu'))||0)})
+    .forEach(function(r){tb.appendChild(r);var nr=noteRow(r);if(nr)tb.appendChild(nr)});
+  keepTail(tb);
 }
+function sumText(w,f){return w+' working, '+f+' follow-up'+(f===1?'':'s')}
+// Repaint every bucket's counts and empty states, then re-apply each one's filter.
 function paintCounts(){
+  var grand=0;
   BUCKET_KEYS.forEach(function(b){
-    var all=0;
+    var n={working:0,followups:0};
     ['working','followups'].forEach(function(list){
       var tb=document.getElementById('tb-'+b+'-'+list);
       if(!tb)return;
-      var n=dataRows(tb).length;
-      all+=n;
+      n[list]=dataRows(tb).length;
       var c=document.getElementById('cnt-'+b+'-'+list);
-      if(c)c.textContent=n;
-      var blank=tb.querySelector('.emptyrow');
-      if(blank)blank.style.display=n?'none':'';
+      if(c)c.textContent=n[list];
     });
-    var t=document.getElementById('cnt-'+b+'-all');
-    if(t)t.textContent=all;
+    var all=n.working+n.followups;
+    grand+=all;
+    var t=document.getElementById('bt-'+b);
+    if(t){
+      var bn=t.querySelector('.bt-n');
+      if(bn)bn.textContent=all;
+      t.classList.toggle('zero',!all);
+    }
+    var s=document.getElementById('sum-'+b);
+    if(s)s.textContent=sumText(n.working,n.followups);
+    var body=document.getElementById('body-'+b);
+    if(body)body.hidden=!all;
+    var none=document.getElementById('none-'+b);
+    if(none)none.hidden=!!all;
+    filterRows(b);
   });
+  var tot=document.getElementById('leadTotal');
+  if(tot)tot.textContent=grand.toLocaleString()+' lead'+(grand===1?'':'s');
 }
-function closeMenus(){
-  document.querySelectorAll('details.fumenu[open]').forEach(function(d){d.open=false});
+// The "no website" tag is true of every bucket except "has a website", so it has to
+// follow a row that is moved between them.
+function paintTag(row,bucket){
+  var cell=row.querySelector('.c-name');
+  if(!cell)return;
+  var tags=cell.querySelector('.c-tags');
+  var badge=tags?tags.querySelector('.badge'):null;
+  if(bucket==='has_website'){
+    if(badge)badge.remove();
+    if(tags&&!tags.children.length)tags.remove();
+    return;
+  }
+  if(badge)return;
+  if(!tags){tags=document.createElement('span');tags.className='c-tags';cell.appendChild(tags)}
+  var b=document.createElement('span');
+  b.className='badge';
+  b.textContent='no website';
+  tags.insertBefore(b,tags.firstChild);
+}
+// The tables sit in a horizontal scroll box, so the follow-up panel is fixed-positioned
+// and placed against its button rather than flowing inside the row, where it would be
+// clipped. It flips above the button when there isn't room below.
+function posFu(d){
+  if(!d.open)return;
+  closeMenus(d);
+  var pop=d.querySelector('.fumenu-pop'),s=d.querySelector('summary');
+  if(!pop||!s)return;
+  var r=s.getBoundingClientRect(),w=pop.offsetWidth||210,h=pop.offsetHeight||250;
+  var left=Math.min(r.right-w,window.innerWidth-w-10);
+  if(left<10)left=10;
+  var top=r.bottom+6;
+  if(top+h>window.innerHeight-8)top=Math.max(8,r.top-h-6);
+  pop.style.left=left+'px';
+  pop.style.top=top+'px';
+}
+function closeMenus(keep){
+  document.querySelectorAll('details.fumenu[open]').forEach(function(d){if(d!==keep)d.open=false});
 }
 document.addEventListener('click',function(e){
   document.querySelectorAll('details.fumenu[open]').forEach(function(d){if(!d.contains(e.target))d.open=false});
 });
+// A fixed panel would drift away from its button, so scrolling closes it.
+window.addEventListener('scroll',function(){closeMenus()},true);
 
 // ── your own reminders ──
 async function addFu(){
@@ -1597,21 +1811,45 @@ async function fuDone(id,done){await post('/api/followup/update/'+id,{done:!!don
 async function fuDel(id){await post('/api/followup/remove/'+id,{});var r=document.getElementById('fu-'+id);if(r)r.remove()}
 
 // ── filter ──
-function filterRows(){
-  var box=document.getElementById('q');
-  if(!box)return;
-  var q=box.value.toLowerCase().trim(),shown=0;
-  document.querySelectorAll('tbody tr').forEach(function(r){
-    if(r.classList.contains('emptyrow'))return;
-    var hit=!q||r.textContent.toLowerCase().indexOf(q)>-1;
-    r.style.display=hit?'':'none';
-    if(hit)shown++;
+// Live filter over one bucket, across both of its lists: a plain case-insensitive
+// substring against the row's data-k (name, city, phone, stage, notes).
+function filterRows(key){
+  key=key||TAB;
+  var box=document.getElementById('find-'+key);
+  var q=box?box.value.trim().toLowerCase():'';
+  ['working','followups'].forEach(function(list){
+    var tb=document.getElementById('tb-'+key+'-'+list);
+    if(!tb)return;
+    var rows=dataRows(tb),shown=0;
+    rows.forEach(function(r){
+      var hit=!q||(r.getAttribute('data-k')||'').indexOf(q)>-1;
+      r.classList.toggle('gone',!hit);
+      syncNote(r);
+      if(hit)shown++;
+    });
+    var blank=tb.querySelector('tr.emptyrow');
+    if(blank)blank.style.display=rows.length?'none':'';
+    var nom=tb.querySelector('tr.norow');
+    if(nom)nom.classList.toggle('gone',!(q&&rows.length&&!shown));
   });
-  var nm=document.getElementById('noMatch');
-  if(nm)nm.style.display=(q&&!shown)?'block':'none';
-  if(q)document.querySelectorAll('details.bucket').forEach(function(d){d.open=true});
 }
 paintCounts();
+// /crm?view=followup and /leads?view=followup both land here. Open the first bucket that
+// actually has follow-ups and put that list on screen.
+if(location.hash==='#followups'){
+  var fuTab='';
+  for(var fi=0;fi<BUCKET_KEYS.length;fi++){
+    var fuTb=document.getElementById('tb-'+BUCKET_KEYS[fi]+'-followups');
+    if(fuTb&&dataRows(fuTb).length){fuTab=BUCKET_KEYS[fi];break}
+  }
+  if(fuTab){
+    pickTab(fuTab);
+    var fuHead=document.getElementById('fus-'+fuTab);
+    // The browser does its own jump to #followups as the page loads, so this one waits
+    // until that is done and then lands on the follow-ups list itself.
+    if(fuHead)window.addEventListener('load',function(){setTimeout(function(){fuHead.scrollIntoView({block:'start'})},0)});
+  }
+}
 </script>${SHELL_TAIL_SCRIPT}</main></div></body></html>`;
 }
 
