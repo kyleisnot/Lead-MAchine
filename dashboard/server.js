@@ -424,10 +424,10 @@ ${sidebar("search", { isAdmin: req.isAdmin, demo: req.isDemo })}<div class="page
         <option value="instagram">Instagram only</option>
         <option value="google">Google only</option>
       </select></div>
-      <div class="f"><label for="limit">Scan depth <span class="hint">more = more credits</span></label><select id="limit" onchange="updateEstimate()">
-        <option value="20">Quick (20)</option><option value="40">Standard (40)</option>
-        <option value="60">Deep (60)</option><option value="100">Deeper (100)</option>
-        <option value="150">Thorough (150)</option>
+      <div class="f"><label for="limit">Depth <span class="hint">deeper finds more, takes longer</span></label><select id="limit" onchange="updateEstimate()">
+        <option value="20">Quick</option>
+        <option value="60">Standard</option>
+        <option value="150">Thorough</option>
       </select></div>
     </div>
   </div>
@@ -454,6 +454,27 @@ ${sidebar("search", { isAdmin: req.isAdmin, demo: req.isDemo })}<div class="page
 function setNiche(n){document.getElementById('niche').value=n;updateEstimate()}
 async function post(url,data){const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data||{})});return r.json()}
 function st(html){document.getElementById('status').innerHTML=html}
+// Rough run-time model (measured: a 3-source Quick scan ~2.5 min). Per source there's
+// a startup cost plus per-place work; the dating pass adds a flat ~35s.
+function estSeconds(sources,depth){return Math.round(sources*(18+depth*1.1)+35);}
+function fmtMin(sec){return Math.max(1,Math.round(sec/60))+' min';}
+// Typical yield per city — a soft guide, NOT a promise (real count depends on the area).
+function leadRange(depth){return depth<=20?[5,15]:depth<=60?[12,25]:[20,40];}
+function mmss(s){var m=Math.floor(s/60),x=s%60;return m+':'+(x<10?'0':'')+x;}
+var PROG_STAGES=['Scanning Google Maps\u2026','Checking Facebook pages\u2026','Checking Instagram profiles\u2026','Dropping businesses that already have a website\u2026','Checking who is still active\u2026','Putting your leads together\u2026'];
+var progTimer=null;
+function startProgress(expSec){
+  var t0=Date.now();
+  clearInterval(progTimer);
+  var per=Math.max(4,expSec/PROG_STAGES.length);
+  function tick(){
+    var el=Math.round((Date.now()-t0)/1000);
+    var stage=PROG_STAGES[Math.min(PROG_STAGES.length-1,Math.floor(el/per))];
+    st('<span class="spinner"></span> '+stage+' <span style="opacity:.7">\u2014 '+mmss(el)+' elapsed, usually about '+fmtMin(expSec)+'</span>');
+  }
+  tick(); progTimer=setInterval(tick,1000);
+}
+function stopProgress(){clearInterval(progTimer);progTimer=null;}
 
 // "Knoxville, Maryville" → ["Knoxville","Maryville"]
 function parseCities(){return document.getElementById('city').value.split(',').map(s=>s.trim()).filter(Boolean)}
@@ -463,15 +484,19 @@ function chosenNiches(){return document.getElementById('allNiches').checked?NICH
 // Live "this will scan ≈ N places (≈ $X)" estimate. Multiplies cities × niches × sources × depth.
 function updateEstimate(){
   const cities=parseCities().length||1, niches=chosenNiches().length||1, sources=chosenSources().length, depth=parseInt(document.getElementById('limit').value)||0;
-  const places=cities*niches*sources*depth;
-  const usd=(places/1000)*RATE_PER_1K;
-  const tokens=Math.round(usd*TOKENS_PER_USD);
+  const cells=cities*niches;
+  const places=cells*sources*depth;
+  const tokens=Math.round((places/1000)*RATE_PER_1K*TOKENS_PER_USD);
+  const totalSec=cells*estSeconds(sources,depth);
   const el=document.getElementById('estimate');
-  const big=places>1500;
+  const big=totalSec>700; // near the server's run limit
   el.className='estimate'+(big?' big':'');
-  el.innerHTML=(big?'⚠️ ':'')+'This scan ≈ <b>'+places.toLocaleString()+'</b> places'+
-    ' &nbsp;·&nbsp; est. <b>~'+tokens.toLocaleString()+' tokens</b>'+
-    ' &nbsp;<span style="opacity:.7">('+cities+' city × '+niches+' niche × '+sources+' src × '+depth+' deep)</span>';
+  if(cells>1){
+    el.innerHTML=(big?'⚠️ ':'')+'Batch of <b>'+cells+'</b> searches · about <b>'+fmtMin(totalSec)+'</b> · ~<b>'+tokens.toLocaleString()+' tokens</b>'+(big?' <span style="opacity:.85">— may be too big to finish in one run</span>':'');
+    return;
+  }
+  const lr=leadRange(depth);
+  el.innerHTML='Usually <b>~'+lr[0]+'\u2013'+lr[1]+' leads</b> · about <b>'+fmtMin(totalSec)+'</b> · ~<b>'+tokens.toLocaleString()+' tokens</b> <span style="opacity:.65">\u2014 varies by city</span>';
 }
 
 async function runSearch(force){
@@ -484,20 +509,22 @@ async function runSearch(force){
   const multi=cities.length>1||niches.length>1;
   const places=cities.length*niches.length*sources.length*depth;
 
-  // Confirm before a genuinely large (credit-spending) batch.
-  if(multi&&places>1500&&!confirm('This will scan ≈ '+places.toLocaleString()+' places across '+cities.length+' city × '+niches.length+' niche. Est. ~'+Math.round((places/1000)*RATE_PER_1K*TOKENS_PER_USD).toLocaleString()+' tokens. Continue?')) return;
+  // A single search must finish inside the server's run limit. Warn before one whose
+  // estimate is long enough to risk timing out.
+  const expSec=(cities.length*niches.length)*estSeconds(sources.length,depth);
+  if(expSec>700&&!confirm('This search could take about '+Math.round(expSec/60)+' minutes, which may be too big to finish in one run. Try fewer trades/cities or a lower depth. Run it anyway?')) return;
 
   const btn=document.getElementById('goBtn'),rb=document.getElementById('rescanBtn');btn.disabled=true;rb.disabled=true;
   document.getElementById('results').innerHTML='';document.getElementById('statsWrap').innerHTML='';
 
+  startProgress(expSec);
   let r;
   if(multi){
-    st('<span class="spinner"></span> Scanning '+niches.length+' niche(s) × '+cities.length+' city(ies)… this can take a few minutes.');
     r=await post('/api/search-batch',{niches,cities,state:document.getElementById('state').value,sources,limit:depth,forceRefresh:!!force});
   }else{
-    st('<span class="spinner"></span> '+(force?'Re-scanning ':'Searching ')+document.getElementById('source').value+'… (saved searches are instant; new ones take 30–90s)');
     r=await post('/api/search',{niche:niches[0],city:cities[0],state:document.getElementById('state').value,sources,limit:depth,forceRefresh:!!force});
   }
+  stopProgress();
   btn.disabled=false;rb.disabled=false;
   if(!r.ok){st('❌ '+r.error);return}
   render(r.stats,r.prospects,multi?'batch':(r.cached?'cached':'fresh'));
