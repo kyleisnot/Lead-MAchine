@@ -577,6 +577,38 @@ async function renderSearchPage(req) {
   .grp-done a{font-weight:700;margin-left:auto;text-decoration:none;white-space:nowrap}
   .statuserr{display:inline-flex;align-items:center;gap:7px;color:var(--danger)}
   .grp .lead{margin:10px 0 0}
+
+  /* Collapsed search bar: once results are on screen the form folds into one line. */
+  .srchbar{display:flex;align-items:center;gap:12px;background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:12px 16px;margin-bottom:16px}
+  .srchbar .sb-i{display:inline-flex;color:var(--muted);flex:none}
+  .srchbar .sb-q{font-size:14px;font-weight:600;color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .srchbar .sb-q .muted{font-weight:500}
+  .srchbar .sb-go{display:inline-flex;align-items:center;gap:7px;font-family:inherit;margin-left:auto;background:transparent;border:1px solid var(--border);color:var(--text);border-radius:8px;padding:8px 15px;font-size:13px;font-weight:600;cursor:pointer;white-space:nowrap;flex:none}
+  .srchbar .sb-go:hover{border-color:var(--accent);color:var(--accent)}
+
+  /* Jump buttons: pick a list and the page glides to that column. */
+  .colnav{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 14px}
+  .colnav .cn{display:inline-flex;align-items:center;gap:8px;font-family:inherit;background:var(--panel);border:1px solid var(--border);color:var(--text);border-radius:999px;padding:8px 15px;font-size:13px;font-weight:600;cursor:pointer}
+  .colnav .cn:hover:not(:disabled){border-color:var(--accent)}
+  .colnav .cn.on{border-color:var(--accent);background:var(--accent-weak);color:var(--accent-ink)}
+  .colnav .cn:disabled{opacity:.45;cursor:default}
+  .colnav .cn-n{background:var(--bg);border-radius:999px;padding:1px 9px;font-size:12px;font-weight:700}
+  .colnav .cn.on .cn-n{background:var(--panel)}
+
+  /* The three result columns. */
+  .cols{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px;align-items:start}
+  .col{background:var(--panel);border:1px solid var(--border);border-radius:14px;overflow:hidden;scroll-margin-top:16px;transition:border-color .25s}
+  .col.flash{border-color:var(--accent)}
+  .colhead{padding:14px 16px;border-bottom:1px solid var(--border)}
+  .colhead .ch-top{display:flex;align-items:center;gap:10px}
+  .colhead .col-ttl{font-size:14px;font-weight:700;color:var(--text)}
+  .colhead .col-n{background:var(--surface);color:var(--muted);border-radius:999px;padding:1px 9px;font-size:12px;font-weight:700}
+  .col-lead .colhead .col-n{background:var(--accent-weak);color:var(--accent-ink)}
+  .colhead .col-sub{margin:6px 0 11px;font-size:12px;color:var(--muted);line-height:1.45}
+  .colhead .moveall{width:100%;justify-content:center}
+  .col-body{padding:12px;display:flex;flex-direction:column;gap:10px;max-height:70vh;overflow-y:auto}
+  .col-body .lead{margin:0;grid-template-columns:1fr;gap:10px}
+  @media (max-width:1150px){.cols{grid-template-columns:1fr}.col-body{max-height:none}}
   .save{display:inline-flex;align-items:center;gap:6px}
   .fresh-badge svg,.lic-badge svg,.save svg,.hide svg{flex:none}
   .lic-badge{display:inline-flex;align-items:center;gap:5px}
@@ -630,7 +662,8 @@ ${sidebar("search", { isAdmin: req.isAdmin, demo: req.isDemo })}<div class="page
   </div>
 </details>
 
-<div class="panel searchpanel">
+<div class="srchbar" id="srchbar" hidden></div>
+<div class="panel searchpanel" id="searchpanel">
   <div class="fgroup">
     <div class="glabel">Where</div>
     <div class="frow where">
@@ -675,7 +708,7 @@ ${sidebar("search", { isAdmin: req.isAdmin, demo: req.isDemo })}<div class="page
   var NICHE_KEYS = ${JSON.stringify(NICHES.map((n) => n.key))};
   var RATE_PER_1K = ${RATE_PER_1K};
   var TOKENS_PER_USD = ${TOKENS_PER_USD};
-  ${iconScript(["crm", "check", "x", "warn", "clock", "mail", "dot", "badge", "refresh", "undo"], 14)}
+  ${iconScript(["crm", "check", "x", "warn", "clock", "mail", "dot", "badge", "refresh", "undo", "search"], 14)}
   var BUCKETS = ${JSON.stringify(BUCKET_META)};
 </script>
 
@@ -828,20 +861,78 @@ function srcName(s){
   if(s.indexOf('google')===0)return 'Google';
   return s||'source';
 }
-function groupSection(key){
+// ── The collapsed search bar ──
+// Once results are on screen the form has done its job, so it folds into a one-line
+// summary and hands the whole viewport to the three columns.
+function searchSummary(){
+  var cities=parseCities().join(', ')||'anywhere';
+  var stv=(document.getElementById('state').value||'').trim();
+  var all=document.getElementById('allNiches').checked;
+  var trade=all?'All trades':((document.getElementById('niche').value||'').trim()||'any trade');
+  var dsel=document.getElementById('limit');
+  var depth=dsel?dsel.options[dsel.selectedIndex].text:'';
+  var src=document.getElementById('source');
+  var srcTxt=src&&src.value!=='all'?srcName(src.value):'all sources';
+  return esc(trade)+' in '+esc(cities)+(stv?', '+esc(stv):'')+
+    ' <span class="muted">'+esc(depth)+', '+esc(srcTxt)+'</span>';
+}
+function collapseSearch(){
+  var p=document.getElementById('searchpanel'),b=document.getElementById('srchbar');
+  if(!p||!b)return;
+  b.innerHTML='<span class="sb-i">'+ICONS.search+'</span><span class="sb-q">'+searchSummary()+
+    '</span><button class="sb-go" onclick="openSearch()">'+ICONS.refresh+' New search</button>';
+  p.hidden=true;b.hidden=false;
+}
+function openSearch(){
+  var p=document.getElementById('searchpanel'),b=document.getElementById('srchbar');
+  if(!p||!b)return;
+  p.hidden=false;b.hidden=true;
+  p.scrollIntoView({behavior:'smooth',block:'start'});
+}
+
+// ── The three columns ──
+// One column per bucket, side by side, so the whole scan is visible at a glance
+// instead of buried in stacked accordions.
+function colNav(){
+  var btns=GROUP_KEYS.map(function(k){
+    var n=(GROUPS[k]||[]).length;
+    var meta=BUCKETS[k]||{title:k};
+    return '<button class="cn'+(k===firstFilled()?' on':'')+'" id="cn-'+k+'" '+
+      (n?'onclick="jumpCol(\\''+k+'\\')"':'disabled')+'>'+
+      esc(meta.title)+' <span class="cn-n">'+n+'</span></button>';
+  });
+  return '<div class="colnav">'+btns.join('')+'</div>';
+}
+function firstFilled(){
+  for(var i=0;i<GROUP_KEYS.length;i++){var k=GROUP_KEYS[i];if((GROUPS[k]||[]).length)return k}
+  return GROUP_KEYS[0];
+}
+function jumpCol(key){
+  var el=document.getElementById('grp-'+key);
+  if(!el)return;
+  GROUP_KEYS.forEach(function(k){
+    var b=document.getElementById('cn-'+k);
+    if(b)b.classList.toggle('on',k===key);
+  });
+  el.scrollIntoView({behavior:'smooth',block:'start'});
+  el.classList.add('flash');
+  setTimeout(function(){el.classList.remove('flash')},900);
+}
+function colSection(key){
   var list=GROUPS[key]||[];
   if(!list.length)return '';
   var meta=BUCKETS[key]||{title:key,sub:''};
   var first=key==='qualified';
-  return '<details class="grp'+(first?' grp-lead':'')+'" id="grp-'+key+'"'+(first?' open':'')+'>'+
-    '<summary>'+
-      '<span class="grp-ttl">'+esc(meta.title)+'</span>'+
-      '<span class="grp-n">'+list.length+'</span>'+
-      '<span class="grp-act"><button class="moveall'+(first?'':' ghost')+'" id="mv-'+key+'" onclick="moveGroup(event,\\''+key+'\\')">'+ICONS.crm+' Move all to CRM</button></span>'+
-      '<span class="grp-sub">'+esc(meta.sub)+'</span>'+
-    '</summary>'+
-    '<div class="grp-body">'+list.map(function(p){return card(p,key)}).join('')+'</div>'+
-  '</details>';
+  return '<section class="col'+(first?' col-lead':'')+'" id="grp-'+key+'">'+
+    '<header class="colhead">'+
+      '<div class="ch-top"><span class="col-ttl">'+esc(meta.title)+'</span>'+
+      '<span class="col-n">'+list.length+'</span></div>'+
+      '<div class="col-sub">'+esc(meta.sub)+'</div>'+
+      '<button class="moveall'+(first?'':' ghost')+'" id="mv-'+key+'" onclick="moveGroup(event,\\''+key+'\\')">'+
+        ICONS.crm+' Move all to CRM</button>'+
+    '</header>'+
+    '<div class="col-body">'+list.map(function(p){return card(p,key)}).join('')+'</div>'+
+  '</section>';
 }
 // Once a group has been moved, it shrinks to a single line so the eye moves on.
 function collapseGroup(key,added,skipped){
@@ -909,7 +1000,8 @@ function render(s,prospects,mode){
   // The value story first: how much ground the scan covered for them.
   var scanned=Number(s.scanned||0);
   var head=scanned?'<div class="scanline">We scanned <b>'+scanned.toLocaleString()+' businesses</b> for you and sorted them into three lists.</div>':'';
-  document.getElementById('results').innerHTML=head+GROUP_KEYS.map(groupSection).join('');
+  document.getElementById('results').innerHTML=head+colNav()+'<div class="cols">'+GROUP_KEYS.map(colSection).join('')+'</div>';
+  collapseSearch();
 }
 function stat(n,l,cls){return '<div class="stat '+(cls||'')+'"><div class="n">'+n+'</div><div class="l">'+l+'</div></div>'}
 function card(p,bucket){
