@@ -520,8 +520,6 @@ function st(html){document.getElementById('status').innerHTML=html}
 // a startup cost plus per-place work; the dating pass adds a flat ~35s.
 function estSeconds(sources,depth){return Math.round(sources*(18+depth*1.1)+35);}
 function fmtMin(sec){return Math.max(1,Math.round(sec/60))+' min';}
-// Typical yield per city — a soft guide, NOT a promise (real count depends on the area).
-function leadRange(depth){return depth<=20?[5,15]:depth<=60?[12,25]:[20,40];}
 function mmss(s){var m=Math.floor(s/60),x=s%60;return m+':'+(x<10?'0':'')+x;}
 var PROG_STAGES=['Scanning Google Maps\u2026','Checking Facebook pages\u2026','Checking Instagram profiles\u2026','Dropping businesses that already have a website\u2026','Checking who is still active\u2026','Putting your leads together\u2026'];
 var progTimer=null;
@@ -554,11 +552,10 @@ function updateEstimate(){
   const big=totalSec>700; // near the server's run limit
   el.className='estimate'+(big?' big':'');
   if(cells>1){
-    el.innerHTML=(big?'⚠️ ':'')+'Batch of <b>'+cells+'</b> searches · about <b>'+fmtMin(totalSec)+'</b> · ~<b>'+tokens.toLocaleString()+' tokens</b>'+(big?' <span style="opacity:.85">— may be too big to finish in one run</span>':'');
+    el.innerHTML=(big?'⚠️ ':'')+'Batch of <b>'+cells+'</b> searches · scans <b>~'+places.toLocaleString()+' businesses</b> · about <b>'+fmtMin(totalSec)+'</b> · ~<b>'+tokens.toLocaleString()+' tokens</b>'+(big?' <span style="opacity:.85">— may be too big to finish in one run</span>':'');
     return;
   }
-  const lr=leadRange(depth);
-  el.innerHTML='Usually <b>~'+lr[0]+'\u2013'+lr[1]+' leads</b> · about <b>'+fmtMin(totalSec)+'</b> · ~<b>'+tokens.toLocaleString()+' tokens</b> <span style="opacity:.65">\u2014 varies by city</span>';
+  el.innerHTML='Scans <b>~'+places.toLocaleString()+' businesses</b> · about <b>'+fmtMin(totalSec)+'</b> · ~<b>'+tokens.toLocaleString()+' tokens</b> <span style="opacity:.65">\u2014 more than you could check by hand</span>';
 }
 
 async function runSearch(force){
