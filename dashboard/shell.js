@@ -186,6 +186,24 @@ input,select{padding:11px 13px}
 .ex-item p{color:var(--muted);font-size:13px;margin-top:4px;line-height:1.55}
 .ex-foot{color:var(--muted);font-size:13px;margin-top:4px;padding-top:12px;border-top:1px solid var(--border);line-height:1.55}
 .ex-foot b,.ex-item p b{color:var(--accent-ink)}
+/* First-run welcome card (Search page). Matches the .explain / .statbox cards:
+   rounded, bordered, var(--panel); an accent left edge + mark keep it friendly. */
+.welcome{margin-bottom:16px}
+.welcome-card{position:relative;display:flex;gap:14px;background:var(--panel);border:1px solid var(--border);border-left:3px solid var(--accent);border-radius:12px;padding:18px 20px}
+.welcome-pending{background:var(--accent-weak);border-color:var(--accent)}
+.welcome-mark{flex:none;width:34px;height:34px;border-radius:9px;background:var(--accent-weak);color:var(--accent-ink);display:grid;place-items:center;font-size:15px;font-weight:800}
+.welcome-pending .welcome-mark{background:var(--accent);color:var(--on-accent)}
+.welcome-body{flex:1;min-width:0}
+.welcome-h{font-size:16px;font-weight:800;color:var(--text);margin:0 0 8px;letter-spacing:.1px}
+.welcome-body p{color:var(--muted);font-size:13.5px;line-height:1.55;margin:0 0 6px}
+.welcome-body p:last-child{margin:0}
+.welcome-points{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:9px}
+.welcome-points li{position:relative;padding-left:16px;color:var(--muted);font-size:13.5px;line-height:1.5}
+.welcome-points li::before{content:"";position:absolute;left:0;top:7px;width:6px;height:6px;border-radius:50%;background:var(--accent)}
+.welcome-points b{color:var(--text);font-weight:600}
+.welcome-foot{margin-top:14px}
+.welcome-got{font-family:inherit;background:var(--accent);color:var(--on-accent);border:none;border-radius:8px;padding:9px 18px;font-weight:700;font-size:13px;cursor:pointer}
+.welcome-got:hover{filter:brightness(.96)}
 .demobar{display:flex;align-items:center;gap:12px;flex-wrap:wrap;background:var(--warn-weak);color:var(--warn);border:1px solid var(--warn-weak);border-radius:10px;padding:8px 8px 8px 14px;margin-bottom:16px;font-size:13px;font-weight:600;line-height:1.4}
 .demobar-txt{flex:1;min-width:0}
 .demobar form{margin:0;display:flex}

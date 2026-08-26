@@ -399,6 +399,35 @@ ${sidebar("search", { isAdmin: req.isAdmin, demo: req.isDemo })}<div class="page
   </div>
 </div>
 
+<!-- First-run welcome card. Rendered hidden; the page script fetches /api/usage and
+     reveals the variant that matches this account (or keeps it hidden for a returning
+     active user who already dismissed it). Human numbers (tokens/searches) are filled
+     client-side from the fetch. -->
+<div id="prWelcome" class="welcome" style="display:none" role="region" aria-label="Getting started">
+  <div id="prWelcomePending" class="welcome-card welcome-pending" style="display:none">
+    <div class="welcome-mark" aria-hidden="true">&#9670;</div>
+    <div class="welcome-body">
+      <h2 class="welcome-h">You're all set up &mdash; activation pending</h2>
+      <p>Your account is ready to go, but a plan hasn't been assigned yet, so searching is locked for now.</p>
+      <p>You'll be able to run searches the moment your tokens are added. Reach out to your account contact to activate.</p>
+    </div>
+  </div>
+  <div id="prWelcomeActive" class="welcome-card" style="display:none">
+    <div class="welcome-mark" aria-hidden="true">&#9670;</div>
+    <div class="welcome-body">
+      <h2 class="welcome-h">Welcome to Prospector</h2>
+      <ul class="welcome-points">
+        <li><b>What it does.</b> Prospector finds local businesses that don't have a website yet &mdash; the ones you can offer to build one for.</li>
+        <li><b>Your plan this month.</b> You have <span id="prAllot">&mdash;</span> tokens this month &mdash; about <span id="prSearches">&mdash;</span> searches.</li>
+        <li><b>When you run low.</b> Your tokens refill on the 1st, or reach out for more.</li>
+      </ul>
+      <div class="welcome-foot">
+        <button type="button" class="welcome-got" id="prWelcomeDismiss" onclick="prDismissWelcome()">Got it</button>
+      </div>
+    </div>
+  </div>
+</div>
+
 <details class="explain">
   <summary><span class="ex-ttl">What counts as a lead?</span><span class="ex-sub">a business must pass all 3 checks to show up here</span></summary>
   <div class="ex-body">
@@ -548,6 +577,41 @@ async function loadMemory(){
   }catch(e){}
 }
 loadMemory();
+
+// ── First-run welcome card ──────────────────────────────────────────────────
+// Pure state pick, kept as its own function so it can be unit-tested in isolation.
+// Returns which variant (if any) to show, given the /api/usage payload and whether
+// this browser has already dismissed the welcome:
+//   'unassigned' → 0 tokens / no plan yet (can't search) — always shown, not dismissable
+//   'active'     → has a plan (allotment>0) and hasn't dismissed yet — the teaching card
+//   'hide'       → active user who already clicked "Got it" (or a bad/empty response)
+function prPickWelcome(u,welcomed){
+  if(!u||!u.ok) return 'hide';
+  if(u.unassigned) return 'unassigned';
+  if(Number(u.allotment)>0) return welcomed?'hide':'active';
+  return 'hide';
+}
+function prDismissWelcome(){
+  try{localStorage.setItem('pr-welcomed','1');}catch(e){}
+  var w=document.getElementById('prWelcome');if(w)w.style.display='none';
+}
+(async function prWelcome(){
+  var box=document.getElementById('prWelcome');if(!box)return;
+  var welcomed=false;try{welcomed=localStorage.getItem('pr-welcomed')==='1';}catch(e){}
+  var u=null;try{u=await (await fetch('/api/usage')).json();}catch(e){return;}
+  var pick=prPickWelcome(u,welcomed);
+  if(pick==='hide')return;
+  if(pick==='unassigned'){
+    var p=document.getElementById('prWelcomePending');if(p)p.style.display='flex';
+  }else{
+    var a=document.getElementById('prWelcomeActive');if(a)a.style.display='flex';
+    var allot=Number(u.allotment)||0, n=Math.round(allot/25); // ~25 tokens per typical search
+    var ta=document.getElementById('prAllot');if(ta)ta.textContent=allot.toLocaleString();
+    var ns=document.getElementById('prSearches');if(ns)ns.textContent=n.toLocaleString();
+  }
+  box.style.display='block';
+})();
+
 function render(s,prospects,mode){
   document.getElementById('statsWrap').innerHTML=
     '<div class="stats" style="grid-template-columns:repeat(3,1fr)">'+
