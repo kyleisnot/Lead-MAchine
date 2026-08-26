@@ -52,6 +52,10 @@ import * as store from "../data/store.js";
 import { dataProvider, getSupabase } from "../lib/supabase.js";
 import { RATE_PER_1K } from "../lib/spend.js";
 import { THEME_INIT_SCRIPT, SHELL_TAIL_SCRIPT, SHARED_CSS, sidebar, FAVICON } from "./shell.js";
+// The admin console's tab bar, so Demo sits under the same Overview · Analytics · Demo
+// bar as the rest of the console. admin.js imports only auth.js/shell.js/lib — never
+// demo.js — so this new edge introduces no import cycle.
+import { adminTabs } from "./admin.js";
 
 export const demoRouter = express.Router();
 
@@ -817,6 +821,9 @@ function renderDemoPage(req, target) {
 <style>
   *{box-sizing:border-box;margin:0;padding:0}
   body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+  /* Console tab bar layout (colours live in SHARED_CSS). */
+  .tabs{display:flex;gap:8px;margin:0 0 8px;flex-wrap:wrap}
+  .tab{display:inline-flex;align-items:center;gap:6px;text-decoration:none;font-weight:700;font-size:14px;border-radius:9px;padding:9px 16px}
   .demo{max-width:1000px;margin:0 auto;padding:8px 0 80px}
   .dhead{text-align:center;margin:26px 0 34px}
   .dhead h1{font-size:40px;line-height:1.15;font-weight:800;letter-spacing:-.5px;color:var(--text)}
@@ -919,6 +926,7 @@ function renderDemoPage(req, target) {
 ${SHARED_CSS}</style></head><body>
 ${sidebar("demo", { isAdmin: true, demo: !!req.isDemo })}
 <div class="demo">
+  ${adminTabs("demo")}
   <div class="dhead">
     <h1>Which businesses near you have no website?</h1>
     <p>Pick a city and a trade. The machine scans Google, Facebook and Instagram, drops everyone who already has a site, and hands back the ones still open for business.</p>

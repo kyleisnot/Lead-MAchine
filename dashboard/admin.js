@@ -244,11 +244,29 @@ async function loadOverview() {
 
 // ── render ───────────────────────────────────────────────────────────────────
 
-function page(body, extraScript = "", demo = false) {
+// The admin console's tab bar. Three tabs — Overview (/admin, where the users table
+// lives too), Analytics (/admin/analytics) and Demo (/demo) — so Demo reads as part
+// of the console rather than a stray nav item. Exported: demo.js renders it too, so
+// the same bar sits above every console page. The `.tabs`/`.tab` colours come from
+// SHARED_CSS; page() (here) and demo.js each add the shared layout rules.
+export function adminTabs(active) {
+  const tab = (href, key, label) =>
+    `<a class="tab${active === key ? " active" : ""}" href="${href}">${label}</a>`;
+  return `<div class="tabs">${tab("/admin", "overview", "Overview")}${tab(
+    "/admin/analytics",
+    "analytics",
+    "Analytics"
+  )}${tab("/demo", "demo", "Demo")}</div>`;
+}
+
+function page(body, extraScript = "", demo = false, active = null) {
   return `<!doctype html><html><head>${THEME_INIT_SCRIPT}<meta charset="utf-8">${FAVICON}<title>Prospector — Admin</title>
 <style>
   *{box-sizing:border-box;margin:0;padding:0}
   body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+  /* Console tab bar layout (colours live in SHARED_CSS). */
+  .tabs{display:flex;gap:8px;margin:0 0 20px;flex-wrap:wrap}
+  .tab{display:inline-flex;align-items:center;gap:6px;text-decoration:none;font-weight:700;font-size:14px;border-radius:9px;padding:9px 16px}
   .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(168px,1fr));gap:12px;margin-bottom:20px}
   .stat{border-radius:10px;padding:16px}
   .stat .n{font-size:26px;font-weight:800;line-height:1.15}
@@ -298,9 +316,11 @@ function page(body, extraScript = "", demo = false) {
   .notice p{font-size:14px;color:var(--muted);line-height:1.6}
   .notice code{background:var(--surface2);border:1px solid var(--border);border-radius:5px;padding:1px 6px;font-size:13px;color:var(--text)}
   .empty{color:var(--muted);font-size:15px;padding:26px 4px}
+  .sectionhead{font-size:13px;text-transform:uppercase;letter-spacing:.5px;color:var(--muted);font-weight:700;margin:6px 0 12px}
   @media(max-width:900px){.stats{grid-template-columns:repeat(2,1fr)}}
 ${SHARED_CSS}</style></head><body>
 ${sidebar("admin", { isAdmin: true, demo })}<div class="pagehead"><div class="titlewrap"><h1>Admin</h1><div class="pagesub">Operator overview — every user, their usage this month, and their plan</div></div><div class="spacer"></div></div>
+${active ? adminTabs(active) : ""}
 ${body}
 ${extraScript}${SHELL_TAIL_SCRIPT}</main></div></body></html>`;
 }
@@ -509,7 +529,111 @@ async function lmResetUsage(id,btn){
 }
 </script>`;
 
-  return page(cards + table, script, demo);
+  return page(cards + table, script, demo, "overview");
+}
+
+// ── analytics ─────────────────────────────────────────────────────────────────
+
+// "$3,000" — commas, no cents unless the amount actually carries them.
+function money(n) {
+  const v = Number(n) || 0;
+  return "$" + v.toLocaleString("en-US", { maximumFractionDigits: v % 1 ? 2 : 0 });
+}
+
+// "42% of signups" for a funnel step, or "—" before there is anyone to be a % of.
+function pctOfSignups(n, signups) {
+  if (!signups) return "—";
+  return `${Math.round((n / signups) * 100)}% of signups`;
+}
+
+// The whole analytics view in one shot, all cross-user via the service client (this is
+// the one place that's allowed). The demo/staged account is excluded from the funnel —
+// it's staged data, not a real signup — but real closed revenue is counted as-is.
+async function loadAnalytics() {
+  const sb = await getSupabase();
+  const demoAddr = demoEmailAddress();
+
+  const [profRes, searchRes, winsRes, recentRes] = await Promise.all([
+    sb.from("profiles").select("id,email,tier").range(0, MAX_ROWS),
+    // Activation is "ran at least one search" — the kind='search' usage rows, user_id only.
+    sb.from("usage_log").select("user_id").eq("kind", "search").range(0, MAX_ROWS),
+    // Every win, for the revenue total + the distinct-winners count.
+    sb.from("wins").select("user_id,amount").range(0, MAX_ROWS),
+    // The latest 25 wins for the table (bounded via .range — dodges the 1000-row default).
+    sb
+      .from("wins")
+      .select("id,user_id,client_name,amount,created_at")
+      .order("created_at", { ascending: false })
+      .range(0, 24),
+  ]);
+
+  const profiles = unwrap(profRes, "profiles").data || [];
+  const isDemo = (p) => String(p.email || "").toLowerCase() === demoAddr;
+  const real = profiles.filter((p) => !isDemo(p));
+  const realIds = new Set(real.map((p) => String(p.id)));
+  const emailById = new Map(profiles.map((p) => [String(p.id), p.email || ""]));
+
+  const signedUp = real.length;
+  const paying = real.filter((p) => priceOf(p.tier) > 0).length;
+
+  const activatedSet = new Set();
+  for (const r of unwrap(searchRes, "search usage").data || []) {
+    const uid = String(r.user_id);
+    if (realIds.has(uid)) activatedSet.add(uid);
+  }
+  const activated = activatedSet.size;
+
+  const winnerSet = new Set();
+  let revenue = 0;
+  let winCount = 0;
+  for (const r of unwrap(winsRes, "wins").data || []) {
+    winCount++;
+    revenue += Number(r.amount) || 0;
+    const uid = String(r.user_id);
+    if (realIds.has(uid)) winnerSet.add(uid);
+  }
+  const won = winnerSet.size;
+
+  const recent = (unwrap(recentRes, "recent wins").data || []).map((w) => ({
+    id: w.id,
+    clientName: w.client_name || "—",
+    amount: w.amount,
+    email: emailById.get(String(w.user_id)) || "—",
+    createdAt: w.created_at,
+  }));
+
+  return { signedUp, activated, paying, won, revenue, winCount, recent };
+}
+
+function renderAnalytics(d, demo = false) {
+  const cards = `<div class="stats">
+${statCard(num(d.signedUp), "Signed up", "accounts, excluding demo")}
+${statCard(num(d.activated), "Activated", pctOfSignups(d.activated, d.signedUp))}
+${statCard(num(d.paying), "Paying", pctOfSignups(d.paying, d.signedUp))}
+${statCard(num(d.won), "Won", pctOfSignups(d.won, d.signedUp))}
+${statCard(money(d.revenue), "Closed revenue", `${num(d.winCount)} win${d.winCount === 1 ? "" : "s"} logged`)}
+</div>`;
+
+  const winsTable = d.recent.length
+    ? `<div class="tblwrap"><table>
+<thead><tr><th>Client / trade</th><th class="n">Amount</th><th>User</th><th>Date</th></tr></thead>
+<tbody>${d.recent
+        .map(
+          (w) => `<tr>
+  <td>${esc(w.clientName)}</td>
+  <td class="n">${w.amount == null ? "—" : money(w.amount)}</td>
+  <td>${esc(w.email)}</td>
+  <td class="d">${fmtDate(w.createdAt)}</td>
+</tr>`
+        )
+        .join("\n")}</tbody></table></div>`
+    : `<div class="empty">No wins logged yet. Closed deals show up here as users log them.</div>`;
+
+  const body =
+    cards +
+    `<div class="sectionhead">Recent wins</div>` +
+    winsTable;
+  return page(body, "", demo, "analytics");
 }
 
 // ── routes ───────────────────────────────────────────────────────────────────
@@ -537,7 +661,10 @@ adminRouter.get("/admin", requireUser, requireAdmin, async (req, res) => {
           "The admin panel needs Supabase mode",
           "This app is running on local SQLite, which is single-user, so there is nothing to administer. " +
             "Set <code>DATA_PROVIDER=supabase</code> in <code>.env</code> (with the project URL and service-role key) and restart to see users, usage and plans here."
-        )
+        ),
+        "",
+        false,
+        "overview"
       )
     );
   }
@@ -556,7 +683,47 @@ adminRouter.get("/admin", requireUser, requireAdmin, async (req, res) => {
           noticeCard(
             "Could not load the admin data",
             `Supabase returned an error: <code>${esc(e && e.message ? e.message : String(e))}</code>`
-          )
+          ),
+          "",
+          !!req.isDemo,
+          "overview"
+        )
+      );
+  }
+});
+
+// Funnel + closed-revenue analytics. Admin-guarded like every route here; all data is
+// cross-user via the service client, which this module is the one place allowed to do.
+adminRouter.get("/admin/analytics", requireUser, requireAdmin, async (req, res) => {
+  if (dataProvider() !== "supabase") {
+    return res.send(
+      page(
+        noticeCard(
+          "Analytics needs Supabase mode",
+          "This app is running on local SQLite, which is single-user, so there is no cross-user funnel to chart. " +
+            "Set <code>DATA_PROVIDER=supabase</code> in <code>.env</code> (with the project URL and service-role key) and restart to see signups, activation and closed revenue here."
+        ),
+        "",
+        false,
+        "analytics"
+      )
+    );
+  }
+  try {
+    const data = await loadAnalytics();
+    res.send(renderAnalytics(data, !!req.isDemo));
+  } catch (e) {
+    res
+      .status(500)
+      .send(
+        page(
+          noticeCard(
+            "Could not load the analytics",
+            `Supabase returned an error: <code>${esc(e && e.message ? e.message : String(e))}</code>`
+          ),
+          "",
+          !!req.isDemo,
+          "analytics"
         )
       );
   }

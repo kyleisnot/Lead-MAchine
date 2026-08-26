@@ -533,3 +533,59 @@ export async function getProfile(userId) {
   // assigns a plan. New signups get their tokens from the DB trigger.
   return data || { id: userId, email: "", tier: "trial", monthly_token_allotment: 0 };
 }
+
+// ── Wins (a user's closed deals) ─────────────────────────────────────────────
+// client_name is required; amount is parsed to a number-or-null; note is optional.
+export async function addWin(userId, { clientName, amount, note } = {}) {
+  const client = String(clientName ?? "").trim();
+  if (!client) throw new Error("addWin: a client/trade name is required");
+  const parsed = amount === "" || amount === null || amount === undefined ? null : Number(amount);
+  const cleanAmount = Number.isFinite(parsed) ? parsed : null;
+  if (!isSupabase()) return (await db()).addWin({ clientName: client, amount: cleanAmount, note });
+  const c = await getSupabase();
+  const data = must(
+    await c
+      .from("wins")
+      .insert({ user_id: userId, client_name: client, amount: cleanAmount, note: note ? String(note) : "" })
+      .select("id")
+      .single(),
+    "addWin"
+  );
+  return data?.id;
+}
+
+// This user's wins, newest first.
+export async function listWins(userId) {
+  if (!isSupabase()) return (await db()).listWins();
+  const c = await getSupabase();
+  return (
+    must(
+      await c
+        .from("wins")
+        .select("*")
+        .eq("user_id", userId)
+        .order("created_at", { ascending: false })
+        .range(0, BIG),
+      "listWins"
+    ) || []
+  );
+}
+
+// { count, total } — total is the sum of every win's amount (null amounts count as 0).
+export async function winStats(userId) {
+  if (!isSupabase()) return (await db()).winStats();
+  const c = await getSupabase();
+  const data = must(
+    await c.from("wins").select("amount").eq("user_id", userId).range(0, BIG),
+    "winStats"
+  );
+  let count = 0, total = 0;
+  for (const r of data || []) { count++; total += Number(r.amount) || 0; }
+  return { count, total };
+}
+
+export async function removeWin(userId, id) {
+  if (!isSupabase()) return (await db()).removeWin(id);
+  const c = await getSupabase();
+  must(await c.from("wins").delete().eq("user_id", userId).eq("id", Number(id)), "removeWin");
+}

@@ -31,6 +31,8 @@ function navIcon(key) {
   // "leads" is the merged CRM + Brain page; it reuses the original CRM table icon.
   if (key === "leads" || key === "crm") return s + '<rect x="3" y="4" width="18" height="16" rx="2"></rect><path d="M3 10h18M9 4v16"></path></svg>';
   if (key === "brain") return s + '<path d="M9 4a3 3 0 0 0-3 3 3 3 0 0 0-1.5 5.6V17a2 2 0 0 0 2 2h1"></path><path d="M15 4a3 3 0 0 1 3 3 3 3 0 0 1 1.5 5.6V17a2 2 0 0 1-2 2h-1"></path><path d="M12 4v15"></path></svg>';
+  // "wins" is the closed-deal trophy case — a trophy cup.
+  if (key === "wins") return s + '<path d="M8 21h8M12 17v4M7 4h10v4a5 5 0 0 1-10 0z"></path><path d="M7 6H4v1a4 4 0 0 0 3 3.9M17 6h3v1a4 4 0 0 1-3 3.9"></path></svg>';
   if (key === "demo") return s + '<circle cx="12" cy="12" r="9"></circle><path d="M10 8.5l6 3.5-6 3.5z"></path></svg>';
   if (key === "admin") return s + '<path d="M12 3l7 4v5c0 4.4-3 8.4-7 9-4-.6-7-4.6-7-9V7z"></path><path d="M9.5 12l2 2 3.5-3.5"></path></svg>';
   return s + "</svg>";
@@ -52,7 +54,7 @@ export function sidebar(active, { isAdmin = false, demo = false } = {}) {
   <div class="brand"><span class="bmark"><svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linejoin="round" aria-hidden="true"><path d="M6 3h12l3 6-9 12L3 9z"/><path d="M3 9h18M9 3l-2 6 5 12 5-12-2-6"/></svg></span><span class="bname">Prospector</span></div>
   ${link("/", "search", "Search")}
   ${link("/leads", "leads", "Leads")}
-  ${isAdmin ? link("/demo", "demo", "Demo") : ""}
+  ${link("/wins", "wins", "Wins")}
   ${isAdmin ? link("/admin", "admin", "Admin") : ""}
   <div class="grow"></div>
   <div class="foot">

@@ -360,4 +360,31 @@ export function removeFollowup(id) {
   db.prepare(`DELETE FROM manual_followups WHERE id=?`).run(id);
 }
 
+// ── Wins: a user's closed deals — their trophy case (mirrors the Supabase `wins` table) ──
+db.exec(`CREATE TABLE IF NOT EXISTS wins (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  client_name TEXT NOT NULL,
+  amount      REAL,
+  note        TEXT NOT NULL DEFAULT '',
+  created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+)`);
+// clientName is required; amount is a number-or-null (a win with no dollar figure is fine).
+export function addWin({ clientName, amount, note } = {}) {
+  const info = db
+    .prepare(`INSERT INTO wins (client_name, amount, note) VALUES (?,?,?)`)
+    .run(String(clientName), amount == null ? null : Number(amount), note ? String(note) : "");
+  return info.lastInsertRowid;
+}
+// Newest first; id breaks ties when two wins share a created_at second.
+export function listWins() {
+  return db.prepare(`SELECT * FROM wins ORDER BY created_at DESC, id DESC`).all();
+}
+export function winStats() {
+  const row = db.prepare(`SELECT COUNT(*) count, COALESCE(SUM(amount),0) total FROM wins`).get();
+  return { count: row.count || 0, total: row.total || 0 };
+}
+export function removeWin(id) {
+  db.prepare(`DELETE FROM wins WHERE id=?`).run(id);
+}
+
 export default db;

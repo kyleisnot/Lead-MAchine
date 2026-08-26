@@ -284,6 +284,29 @@ app.get("/api/last-search", route(async (req, res) => {
   });
 }));
 
+// ── WINS: the user's closed-deal trophy case ──
+// One page: a headline stat, a "log a win" form, and the list of wins. The API is
+// user-scoped through ../data/store.js exactly like every other data call here.
+app.get("/wins", route(async (req, res) => res.send(await renderWinsPage(req))));
+
+app.post("/api/wins", route(async (req, res) => {
+  const { clientName, amount, note } = req.body || {};
+  if (!clientName || !String(clientName).trim()) {
+    return res.status(400).json({ ok: false, error: "Add a client name." });
+  }
+  // amount is optional: an empty/blank field is a win with no dollar figure (null),
+  // anything else is parsed to a number (a non-numeric value falls back to null).
+  const raw = amount === "" || amount === null || amount === undefined ? null : Number(amount);
+  const cleanAmount = Number.isFinite(raw) ? raw : null;
+  const id = await store.addWin(req.userId, { clientName, amount: cleanAmount, note });
+  res.json({ ok: true, id });
+}));
+
+app.post("/api/wins/remove/:id", route(async (req, res) => {
+  await store.removeWin(req.userId, req.params.id);
+  res.json({ ok: true });
+}));
+
 // Landing page = the search/prospector UI.
 app.get("/", route(async (req, res) => res.send(await renderSearchPage(req))));
 
@@ -978,6 +1001,134 @@ function filterRows(){
     r.style.display=hit?'':'none';if(hit)shown++;
   });
   var nm=document.getElementById('noMatch');if(nm)nm.style.display=shown?'none':'block';
+}
+</script>${SHELL_TAIL_SCRIPT}</main></div></body></html>`;
+}
+
+// ── WINS PAGE (the closed-deal trophy case) ──
+// "$2,400" — commas, no cents unless the amount actually has them.
+function fmtMoney(n) {
+  const v = Number(n) || 0;
+  return "$" + v.toLocaleString("en-US", { maximumFractionDigits: v % 1 ? 2 : 0 });
+}
+
+// A win's date, from either a SQLite UTC datetime ("2026-08-26 14:03:00") or a
+// Postgres timestamptz — mirrors daysAgo()'s two-provider parsing.
+function winDate(dt) {
+  if (!dt) return "";
+  const s = String(dt);
+  const iso = /[TZ+]|\d{2}:\d{2}:\d{2}\.\d+/.test(s.slice(10)) ? s.replace(" ", "T") : s.replace(" ", "T") + "Z";
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return esc(s);
+  return d.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
+}
+
+function winRow(w) {
+  const amt = w.amount === null || w.amount === undefined || w.amount === ""
+    ? '<span class="muted">—</span>'
+    : esc(fmtMoney(w.amount));
+  return `<tr id="win-${w.id}" data-amount="${Number(w.amount) || 0}">
+    <td><b>${esc(w.client_name)}</b></td>
+    <td class="amt">${amt}</td>
+    <td>${w.note ? esc(w.note) : '<span class="muted">—</span>'}</td>
+    <td class="d">${winDate(w.created_at)}</td>
+    <td class="actions"><button class="rm" onclick="removeWin(${w.id})">Remove</button></td>
+  </tr>`;
+}
+
+async function renderWinsPage(req) {
+  const [stats, wins] = await Promise.all([
+    store.winStats(req.userId),
+    store.listWins(req.userId),
+  ]);
+  const count = stats.count || 0;
+  const total = stats.total || 0;
+  const rows = wins.map(winRow).join("");
+  const statLine = `${count} win${count === 1 ? "" : "s"} · ${fmtMoney(total)} closed`;
+
+  return `<!doctype html><html><head>${THEME_INIT_SCRIPT}<meta charset="utf-8">${FAVICON}<title>Prospector — Wins</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+  .wins-stat{font-size:20px;font-weight:800;color:var(--text);margin-bottom:20px;font-variant-numeric:tabular-nums}
+  .winform{padding:20px 22px;margin-bottom:22px}
+  .winform h3{font-size:15px;font-weight:700;color:var(--text);margin-bottom:14px}
+  .wrow{display:grid;grid-template-columns:1.5fr .8fr 1.7fr auto;gap:12px;align-items:end}
+  .wrow .f{min-width:0}
+  .wrow label{display:block;font-size:12px;font-weight:600;color:var(--muted);margin-bottom:6px}
+  .wrow input{width:100%}
+  .wrow .go{white-space:nowrap}
+  #winMsg{margin-top:10px;font-size:13px;color:var(--danger);min-height:16px}
+  table{width:100%;border-collapse:collapse;border-radius:12px;overflow:hidden}
+  th{text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.5px;padding:12px 14px}
+  td{padding:12px 14px;font-size:14px;vertical-align:middle}
+  tr:last-child td{border-bottom:none}
+  td.amt{font-variant-numeric:tabular-nums;font-weight:600;white-space:nowrap}
+  td.d{color:var(--muted);white-space:nowrap}
+  td.actions{text-align:right;white-space:nowrap}
+  .rm{background:transparent;border:1px solid var(--border);color:var(--muted);border-radius:6px;padding:5px 10px;cursor:pointer;font-size:12px}
+  .rm:hover{color:var(--danger);border-color:var(--danger)}
+  .empty{color:var(--muted);text-align:center;margin-top:44px;font-size:15px}
+  @media(max-width:640px){.wrow{grid-template-columns:1fr 1fr}.wrow .go{grid-column:1/-1;width:100%}}
+${SHARED_CSS}</style></head><body>
+${sidebar("wins", { isAdmin: req.isAdmin, demo: req.isDemo })}<div class="pagehead"><div class="titlewrap"><h1>Wins</h1><div class="pagesub">The deals you've closed</div></div><div class="spacer"></div></div>
+<div class="wins-stat" id="winStat">${esc(statLine)}</div>
+
+<div class="panel winform">
+  <h3>Log a win</h3>
+  <div class="wrow">
+    <div class="f"><label for="wClient">Client / trade</label><input id="wClient" placeholder="Acme Roofing" autocomplete="off"></div>
+    <div class="f"><label for="wAmount">Amount <span class="muted" style="font-weight:400">optional</span></label><input id="wAmount" type="number" min="0" step="any" placeholder="2400"></div>
+    <div class="f"><label for="wNote">Note <span class="muted" style="font-weight:400">optional</span></label><input id="wNote" placeholder="quoted, signed…" autocomplete="off"></div>
+    <button class="go" onclick="addWin()">Add win</button>
+  </div>
+  <div id="winMsg"></div>
+</div>
+
+<div id="winsWrap">
+  <table id="winsTable"${count ? "" : ' style="display:none"'}>
+    <thead><tr><th>Client / trade</th><th>Amount</th><th>Note</th><th>Date</th><th></th></tr></thead>
+    <tbody id="winRows">${rows}</tbody>
+  </table>
+  <div id="winsEmpty" class="empty"${count ? ' style="display:none"' : ""}>No wins logged yet — add your first closed deal.</div>
+</div>
+
+<script>
+var winCount=${count}, winTotal=${total};
+function esc(s){return (s||'').replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]})}
+async function post(url,data){var r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data||{})});return r.json()}
+function fmtMoney(n){var v=Number(n)||0;return '$'+v.toLocaleString('en-US',{maximumFractionDigits:v%1?2:0})}
+function paintStat(){document.getElementById('winStat').textContent=winCount+' win'+(winCount===1?'':'s')+' · '+fmtMoney(winTotal)+' closed'}
+function paintChrome(){document.getElementById('winsTable').style.display=winCount?'':'none';document.getElementById('winsEmpty').style.display=winCount?'none':''}
+async function addWin(){
+  var c=document.getElementById('wClient'),a=document.getElementById('wAmount'),n=document.getElementById('wNote'),msg=document.getElementById('winMsg');
+  msg.textContent='';
+  if(!c.value.trim()){msg.textContent='Add a client name.';c.focus();return}
+  var body={clientName:c.value.trim(),amount:a.value.trim(),note:n.value.trim()};
+  var r=await post('/api/wins',body);
+  if(!r||!r.ok){msg.textContent=(r&&r.error)||'Could not add win.';return}
+  var amt=body.amount===''?null:Number(body.amount);
+  if(!isFinite(amt))amt=null;
+  var tr=document.createElement('tr');
+  tr.id='win-'+r.id;
+  tr.setAttribute('data-amount',amt||0);
+  tr.innerHTML='<td><b>'+esc(body.clientName)+'</b></td>'+
+    '<td class="amt">'+(amt==null?'<span class="muted">—</span>':esc(fmtMoney(amt)))+'</td>'+
+    '<td>'+(body.note?esc(body.note):'<span class="muted">—</span>')+'</td>'+
+    '<td class="d">just now</td>'+
+    '<td class="actions"><button class="rm" onclick="removeWin('+r.id+')">Remove</button></td>';
+  winCount++;winTotal+=(amt||0);
+  paintChrome();
+  var tb=document.getElementById('winRows');tb.insertBefore(tr,tb.firstChild);
+  paintStat();
+  c.value='';a.value='';n.value='';c.focus();
+}
+async function removeWin(id){
+  var r=await post('/api/wins/remove/'+id,{});
+  if(!r||!r.ok)return;
+  var tr=document.getElementById('win-'+id);
+  if(tr){var amt=Number(tr.getAttribute('data-amount'))||0;winCount=Math.max(0,winCount-1);winTotal=Math.max(0,winTotal-amt);tr.remove()}
+  paintStat();paintChrome();
 }
 </script>${SHELL_TAIL_SCRIPT}</main></div></body></html>`;
 }
