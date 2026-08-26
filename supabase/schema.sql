@@ -16,7 +16,7 @@ create table if not exists public.profiles (
   id                       uuid primary key references auth.users(id) on delete cascade,
   email                    text,
   tier                     text    not null default 'trial',      -- trial | starter | pro
-  monthly_token_allotment  integer not null default 500,          -- 0 = unlimited
+  monthly_token_allotment  integer not null default 0,            -- 0 = no plan yet (blocked)
   created_at               timestamptz not null default now()
 );
 
@@ -146,7 +146,7 @@ create or replace function public.handle_new_user()
 returns trigger language plpgsql security definer set search_path = public as $$
 begin
   insert into public.profiles (id, email, tier, monthly_token_allotment)
-  values (new.id, new.email, 'trial', 500)
+  values (new.id, new.email, 'unassigned', 0)
   on conflict (id) do nothing;
   return new;
 end; $$;
@@ -155,3 +155,17 @@ drop trigger if exists on_auth_user_created on auth.users;
 create trigger on_auth_user_created
   after insert on auth.users
   for each row execute function public.handle_new_user();
+
+-- ── wins: a user's closed deals — their trophy case, and the operator's "did they sell" signal ──
+create table if not exists public.wins (
+  id          bigint generated always as identity primary key,
+  user_id     uuid not null default auth.uid() references auth.users(id) on delete cascade,
+  client_name text not null,
+  amount      numeric,
+  note        text not null default '',
+  created_at  timestamptz not null default now()
+);
+create index if not exists wins_user_idx on public.wins (user_id, created_at desc);
+alter table public.wins enable row level security;
+create policy "own wins" on public.wins
+  for all using (user_id = auth.uid()) with check (user_id = auth.uid());
