@@ -20,6 +20,7 @@ import { detectLicenseSignal, licenseSearchUrl } from "../lib/license.js";
 import { isRealWebsiteUrl } from "../scrapers/filter.js";
 import { THEME_INIT_SCRIPT, SHELL_TAIL_SCRIPT, SHARED_CSS, sidebar, FAVICON } from "./shell.js";
 import { authRouter, requireUser } from "./auth.js";
+import { accountRouter } from "./account.js";
 import { adminRouter } from "./admin.js";
 import { demoRouter } from "./demo.js";
 import "dotenv/config";
@@ -101,6 +102,8 @@ app.use(express.static(join(__dirname, "public"))); // serves /logo.png, /mark.p
 // ── Wiring order matters ──
 // 1. authRouter: /login, /signup, /logout must stay reachable while logged out.
 // 2. requireUser: everything below this line has req.userId / req.userEmail / req.isAdmin.
+// 3. accountRouter: a normal signed-in area (/account, /account/tokens, /account/help),
+//    so it sits with the routes below, not with the operator routers.
 // (adminRouter is mounted after the routes, near app.listen.)
 // Public config health check (booleans only — never values). Lets us see whether the
 // deployment actually received its Supabase env vars, under any of the common names.
@@ -583,6 +586,20 @@ app.post("/api/wins/remove/:id", route(async (req, res) => {
   res.json({ ok: true });
 }));
 
+// ── The setup checklist's "Hide this" ──
+// The card is rendered by THIS page, so its dismiss lives here rather than in the account
+// area. It is a stored preference, not a browser one, so hiding it on a laptop also hides
+// it on a phone. Registered above the account router so this path is unambiguously ours.
+app.post("/api/account/onboarding/dismiss", route(async (req, res) => {
+  await store.dismissOnboarding(req.userId, true);
+  res.json({ ok: true });
+}));
+
+// The account area: profile, tokens and help. Mounted with the other signed-in routes
+// (after requireUser, before the admin/demo routers below) so every route inside it
+// already knows who is asking.
+app.use(accountRouter);
+
 // Landing page = the search/prospector UI.
 app.get("/", route(async (req, res) => res.send(await renderSearchPage(req))));
 
@@ -691,6 +708,149 @@ const TABLE_CSS = `
   @media (max-width:760px){.copanel{padding:16px 14px}.btabs{gap:18px}}
 `;
 
+// ── Setup checklist (first run) ──────────────────────────────────────────────
+// The five things a new account has to do before the tool is really theirs. Kept as a
+// pure function of the account's own data so the card can never disagree with reality:
+// there is no "seen it" flag per step, a step is done because the data says it is.
+//   1-3 come off the profile the account page writes.
+//   4   is any search in this month's usage log (the same count /api/usage reports).
+//   5   is any logged win.
+export function setupSteps({ profile = {}, searches = 0, wins = 0 } = {}) {
+  const set = (v) => !!String(v ?? "").trim();
+  return [
+    {
+      key: "agency", title: "Tell us about your agency",
+      sub: "Your name and agency, so quotes and emails go out as you",
+      href: "/account", cta: "Add your details", done: set(profile.agencyName),
+    },
+    {
+      key: "market", title: "Set your market",
+      sub: "The city and state you sell in, filled in for every search",
+      href: "/account", cta: "Set your market", done: set(profile.defaultCity) && set(profile.defaultState),
+    },
+    {
+      key: "trades", title: "Pick the trades you sell to",
+      sub: "The trade a search starts on, so you are one click from a scan",
+      href: "/account", cta: "Pick a trade", done: set(profile.defaultNiche),
+    },
+    {
+      key: "search", title: "Run your first search",
+      sub: "Find local businesses in your market with no website yet",
+      href: "#searchpanel", cta: "Run a search", done: (Number(searches) || 0) > 0,
+    },
+    {
+      key: "win", title: "Log your first win",
+      sub: "Every closed deal you log adds up on your Wins page",
+      href: "/wins", cta: "Log a win", done: (Number(wins) || 0) > 0,
+    },
+  ];
+}
+
+// The whole first-run region: an optional plan notice, then the checklist.
+//
+// The two are deliberately separate bands rather than one card. They answer different
+// questions and have different lifetimes: "can I search at all yet?" is a fact about the
+// account that only an operator can change, so it stays put and is not dismissable, while
+// "what should I set up next?" is the user's own list and they can hide it. Stacking the
+// notice ABOVE the checklist keeps the blocking fact first without hiding the setup work
+// a brand-new account can still get on with while it waits for tokens.
+function setupRegionHtml({ steps, unassigned, dismissed }) {
+  const doneCount = steps.filter((s) => s.done).length;
+  const allDone = doneCount === steps.length;
+  const plan = !unassigned ? "" : `
+  <div class="setup-plan" id="prSetupPlan">
+    <span class="setup-plan-i">${icon("clock", 17)}</span>
+    <div>
+      <b>Your account is not active yet</b>
+      <p>Everything here is ready except the tokens that pay for a search, and only an
+      operator can add those. <a href="/account/tokens">Ask to have your plan activated</a>
+      and you can run your first search the moment it lands.</p>
+    </div>
+  </div>`;
+  // Nothing left to say: no plan notice and a checklist that is either finished-and-seen
+  // or hidden by the user.
+  if (!plan && dismissed) return "";
+  let card = "";
+  if (!dismissed && allDone) {
+    // The finish line, shown once. renderSearchPage() dismisses it as it hands this back,
+    // so the next load is a clean page instead of a card with nothing left to ask for.
+    card = `
+  <div class="setup-card setup-allset" id="prSetupCard">
+    <span class="setup-mark">${icon("check", 18)}</span>
+    <div class="setup-allset-b">
+      <h2 class="setup-h">You are all set</h2>
+      <p id="prSetupProgress">${doneCount} of ${steps.length} done. Nothing left to set up, so this card is finished.</p>
+      <div class="setup-bar"><div class="setup-bar-fill" id="prSetupBar" style="width:100%"></div></div>
+    </div>
+  </div>`;
+  } else if (!dismissed) {
+    const pct = Math.round((doneCount / steps.length) * 100);
+    const rows = steps.map((s) => `
+      <li class="setup-step${s.done ? " done" : ""}" data-step="${s.key}">
+        <span class="setup-tick">${s.done ? icon("check", 12) : ""}</span>
+        <span class="setup-lbl"><b>${esc(s.title)}</b><span class="setup-sub">${esc(s.sub)}</span></span>
+        ${s.done
+          ? `<span class="setup-flag">Done</span>`
+          : `<a class="setup-go" href="${s.href}"${s.key === "search" ? ` onclick="openSearch();return false;"` : ""}>${esc(s.cta)}</a>`}
+      </li>`).join("");
+    card = `
+  <div class="setup-card" id="prSetupCard">
+    <div class="setup-head">
+      <div>
+        <h2 class="setup-h">Finish setting up your account</h2>
+        <div class="setup-prog" id="prSetupProgress">${doneCount} of ${steps.length} done</div>
+      </div>
+      <button type="button" class="setup-hide" onclick="prDismissSetup()">Hide this</button>
+    </div>
+    <div class="setup-bar"><div class="setup-bar-fill" id="prSetupBar" style="width:${pct}%"></div></div>
+    <ul class="setup-steps">${rows}
+    </ul>
+  </div>`;
+  }
+  return `<div class="setup" id="prSetup" role="region" aria-label="Getting started">${plan}${card}
+</div>`;
+}
+
+// Styling for the region above. Same card language as .panel (surface, 1px border, 12px
+// radius); the checklist carries an accent left edge so it reads as guidance rather than
+// as a result, and the plan notice uses the warn pair because it is a block, not advice.
+const SETUP_CSS = `
+  .setup{display:flex;flex-direction:column;gap:10px;margin-bottom:16px}
+  .setup-plan{display:flex;gap:13px;align-items:flex-start;background:var(--warn-weak);border:1px solid var(--warn);border-radius:12px;padding:15px 17px}
+  .setup-plan-i{flex:none;display:inline-flex;color:var(--warn);margin-top:1px}
+  .setup-plan b{display:block;font-size:14.5px;font-weight:700;color:var(--text);margin-bottom:4px}
+  .setup-plan p{margin:0;font-size:13.5px;line-height:1.55;color:var(--muted)}
+  .setup-plan a{font-weight:700;text-decoration:none}
+  .setup-plan a:hover{text-decoration:underline}
+  .setup-card{background:var(--panel);border:1px solid var(--border);border-left:3px solid var(--accent);border-radius:12px;padding:17px 19px}
+  .setup-head{display:flex;align-items:flex-start;gap:12px}
+  .setup-h{font-size:16px;font-weight:800;letter-spacing:.1px;color:var(--text);margin:0}
+  .setup-prog{margin-top:4px;font-size:13px;color:var(--muted)}
+  .setup-hide{margin-left:auto;flex:none;font-family:inherit;background:transparent;border:1px solid var(--border-strong);color:var(--muted);border-radius:8px;padding:6px 12px;font-size:12.5px;font-weight:600;cursor:pointer}
+  .setup-hide:hover{background:var(--surface2);color:var(--text)}
+  .setup-bar{height:4px;border-radius:3px;background:var(--surface2);overflow:hidden;margin:13px 0 2px}
+  .setup-bar-fill{height:100%;border-radius:3px;background:var(--accent);transition:width .2s}
+  .setup-steps{list-style:none;margin:4px 0 0;padding:0}
+  .setup-step{display:flex;align-items:center;gap:12px;padding:10px 8px;border-radius:9px}
+  .setup-step:hover{background:var(--surface2)}
+  .setup-tick{flex:none;width:20px;height:20px;border-radius:50%;border:1px solid var(--border-strong);display:grid;place-items:center;color:var(--faint)}
+  .setup-step.done .setup-tick{border-color:transparent;background:var(--accent-weak);color:var(--accent-ink)}
+  .setup-lbl{min-width:0}
+  .setup-lbl b{display:block;font-size:13.5px;font-weight:700;color:var(--text)}
+  .setup-step.done .setup-lbl b{color:var(--muted);font-weight:600}
+  .setup-sub{display:block;margin-top:2px;font-size:12.5px;line-height:1.45;color:var(--muted)}
+  .setup-step.done .setup-sub{color:var(--faint)}
+  .setup-go{margin-left:auto;flex:none;font-size:12.5px;font-weight:700;text-decoration:none;white-space:nowrap}
+  .setup-go:hover{text-decoration:underline}
+  .setup-flag{margin-left:auto;flex:none;font-size:12px;font-weight:600;color:var(--faint)}
+  .setup-allset{display:flex;align-items:center;gap:14px}
+  .setup-allset-b{flex:1;min-width:0}
+  .setup-mark{flex:none;width:34px;height:34px;border-radius:9px;background:var(--accent-weak);color:var(--accent-ink);display:grid;place-items:center}
+  .setup-allset p{margin:4px 0 0;font-size:13.5px;line-height:1.5;color:var(--muted)}
+  .setup-allset .setup-bar{margin:11px 0 1px}
+  @media (max-width:700px){.setup-step{flex-wrap:wrap}.setup-go,.setup-flag{margin-left:32px}}
+`;
+
 // ── SEARCH / PROSPECTOR PAGE ──
 async function renderSearchPage(req) {
   const nicheButtons = NICHES.map(
@@ -702,6 +862,31 @@ async function renderSearchPage(req) {
   const activeExplain = !fcfg.enabled
     ? "This check is currently off, so businesses are kept no matter how long ago they were last active."
     : `We look at each business's newest Facebook or Instagram post (or Google review). If the most recent one is older than <b>${esc(cutoffLabel())}</b>, we file them under <b>not active</b>: a business that's gone quiet probably isn't taking new customers.`;
+
+  // Everything the first-run region and the prefilled form need, in one round trip.
+  const [profile, usage, wins] = await Promise.all([
+    store.getProfile(req.userId),
+    store.usageSummary(req.userId),
+    store.winStats(req.userId),
+  ]);
+  const steps = setupSteps({ profile, searches: usage.searches, wins: wins.count });
+  const allotRaw = Number.parseInt(profile?.monthly_token_allotment, 10);
+  const unassigned = !(Number.isFinite(allotRaw) && allotRaw > 0); // 0 = no plan yet, can't search
+  const dismissed = !!profile?.onboardingDismissed;
+  const setupHtml = setupRegionHtml({ steps, unassigned, dismissed });
+  // Showing the finished card IS the last thing it has to do, so record that and let the
+  // next load come up clean. (Every step being done is itself permanent, so re-showing it
+  // would just be a card the user can never make progress on.)
+  if (!dismissed && steps.every((s) => s.done)) await store.dismissOnboarding(req.userId, true);
+
+  // Form prefill. The account's own market and trade win over the built-in example values;
+  // a remembered last search still beats both, because restoreLast() below overwrites the
+  // fields (and re-runs the estimate) once it comes back.
+  const pre = (v, fallback) => esc(String(v ?? "").trim() || fallback);
+  const preCity = pre(profile?.defaultCity, "Knoxville");
+  const preState = pre(profile?.defaultState, "TN");
+  const preNiche = pre(profile?.defaultNiche, "landscaping");
+
   return `<!doctype html><html><head>${THEME_INIT_SCRIPT}<meta charset="utf-8">${FAVICON}<title>Prospector · Search</title>
 <style>
   :root{--gold:#14FFB9;--bg:#0a1124;--panel:#0f1a30;--border:rgba(20,255,185,.22);--text:#e8eaf0;--muted:#7b8499}
@@ -779,6 +964,7 @@ async function renderSearchPage(req) {
   .grp .lead{margin:10px 0 0}
 
   /* Collapsed search bar: once results are on screen the form folds into one line. */
+  .srchbar[hidden]{display:none}
   .srchbar{display:flex;align-items:center;gap:12px;background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:12px 16px;margin-bottom:16px}
   .srchbar .sb-i{display:inline-flex;color:var(--muted);flex:none}
   .srchbar .sb-q{font-size:14px;font-weight:600;color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -812,7 +998,8 @@ ${TABLE_CSS}
   .lic-badge{display:inline-flex;align-items:center;gap:5px}
   .fresh-badge{display:inline-flex;align-items:center;gap:5px}
   .fresh-stale{background:var(--surface2);color:var(--muted)}
-${SHARED_CSS}</style></head><body>
+${SHARED_CSS}
+${SETUP_CSS}</style></head><body>
 ${sidebar("search", { isAdmin: req.isAdmin, demo: req.isDemo })}<div class="pagehead"><div class="titlewrap"><h1>Search</h1><div class="pagesub">Find local businesses that don't have a website yet</div></div><div class="spacer"></div>
   <div class="statbox">
     <div class="cell"><span class="k"><svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="vertical-align:-1px;margin-right:4px"><ellipse cx="12" cy="6" rx="8" ry="3"/><path d="M4 6v6c0 1.7 3.6 3 8 3s8-1.3 8-3V6"/><path d="M4 12v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6"/></svg>Remembered</span><span class="v" id="sbMem">&hellip;</span><span class="s2" id="sbMemSub"></span></div>
@@ -821,34 +1008,10 @@ ${sidebar("search", { isAdmin: req.isAdmin, demo: req.isDemo })}<div class="page
   </div>
 </div>
 
-<!-- First-run welcome card. Rendered hidden; the page script fetches /api/usage and
-     reveals the variant that matches this account (or keeps it hidden for a returning
-     active user who already dismissed it). Human numbers (tokens/searches) are filled
-     client-side from the fetch. -->
-<div id="prWelcome" class="welcome" style="display:none" role="region" aria-label="Getting started">
-  <div id="prWelcomePending" class="welcome-card welcome-pending" style="display:none">
-    <div class="welcome-mark">${icon("clock", 17)}</div>
-    <div class="welcome-body">
-      <h2 class="welcome-h">You're all set up, activation pending</h2>
-      <p>Your account is ready to go, but a plan hasn't been assigned yet, so searching is locked for now.</p>
-      <p>You'll be able to run searches the moment your tokens are added. Reach out to your account contact to activate.</p>
-    </div>
-  </div>
-  <div id="prWelcomeActive" class="welcome-card" style="display:none">
-    <div class="welcome-mark">${icon("search", 17)}</div>
-    <div class="welcome-body">
-      <h2 class="welcome-h">Welcome to Prospector</h2>
-      <ul class="welcome-points">
-        <li><b>What it does.</b> Prospector finds local businesses that don't have a website yet, the ones you can offer to build one for.</li>
-        <li><b>Your plan this month.</b> You have <span id="prAllot">&hellip;</span> tokens this month, about <span id="prSearches">&hellip;</span> searches.</li>
-        <li><b>When you run low.</b> Your tokens refill on the 1st, or reach out for more.</li>
-      </ul>
-      <div class="welcome-foot">
-        <button type="button" class="welcome-got" id="prWelcomeDismiss" onclick="prDismissWelcome()">Got it</button>
-      </div>
-    </div>
-  </div>
-</div>
+<!-- First run: an activation notice for an account with no plan yet, then the setup
+     checklist. Both are rendered server-side from this account's own data (profile,
+     usage log, wins), so what they claim is always what the database says. -->
+${setupHtml}
 
 <details class="explain">
   <summary><span class="ex-ttl">What counts as a top prospect?</span><span class="ex-sub">a business must pass all 3 checks below</span></summary>
@@ -865,14 +1028,14 @@ ${sidebar("search", { isAdmin: req.isAdmin, demo: req.isDemo })}<div class="page
   <div class="fgroup">
     <div class="glabel">Where</div>
     <div class="frow where">
-      <div class="f"><label for="city">City <span class="hint">comma-separate for several</span></label><input id="city" placeholder="Knoxville, Maryville, Oak Ridge" value="Knoxville"></div>
-      <div class="f"><label for="state">State</label><input id="state" placeholder="TN" value="TN"></div>
+      <div class="f"><label for="city">City <span class="hint">comma-separate for several</span></label><input id="city" placeholder="Knoxville, Maryville, Oak Ridge" value="${preCity}"></div>
+      <div class="f"><label for="state">State</label><input id="state" placeholder="TN" value="${preState}"></div>
     </div>
   </div>
 
   <div class="fgroup">
     <div class="glabel">What</div>
-    <div class="f"><label for="niche">Trade</label><input id="niche" placeholder="landscaping" value="landscaping"></div>
+    <div class="f"><label for="niche">Trade</label><input id="niche" placeholder="landscaping" value="${preNiche}"></div>
     <div class="chips">${nicheButtons}</div>
     <label class="opt"><input type="checkbox" id="allNiches" oninput="updateEstimate()"> Search <b>all trades</b> at once</label>
   </div>
@@ -1015,39 +1178,18 @@ async function loadMemory(){
 }
 loadMemory();
 
-// ── First-run welcome card ──────────────────────────────────────────────────
-// Pure state pick, kept as its own function so it can be unit-tested in isolation.
-// Returns which variant (if any) to show, given the /api/usage payload and whether
-// this browser has already dismissed the welcome:
-//   'unassigned' = 0 tokens / no plan yet (can't search). Always shown, not dismissable.
-//   'active'     = has a plan (allotment>0) and hasn't dismissed yet. The teaching card.
-//   'hide'       = active user who already clicked "Got it" (or a bad/empty response).
-function prPickWelcome(u,welcomed){
-  if(!u||!u.ok) return 'hide';
-  if(u.unassigned) return 'unassigned';
-  if(Number(u.allotment)>0) return welcomed?'hide':'active';
-  return 'hide';
+// ── The setup checklist's "Hide this" ───────────────────────────────────────
+// The card is server-rendered, so hiding it is a stored preference rather than a browser
+// one: it goes away here immediately AND stays away on the user's other devices. The
+// activation notice above it is not part of the deal, because an account with no tokens
+// still has to be told why searching is locked.
+async function prDismissSetup(){
+  var card=document.getElementById('prSetupCard');
+  if(card)card.remove();
+  var box=document.getElementById('prSetup');
+  if(box&&!box.querySelector('.setup-plan'))box.remove();
+  try{await post('/api/account/onboarding/dismiss',{});}catch(e){}
 }
-function prDismissWelcome(){
-  try{localStorage.setItem('pr-welcomed','1');}catch(e){}
-  var w=document.getElementById('prWelcome');if(w)w.style.display='none';
-}
-(async function prWelcome(){
-  var box=document.getElementById('prWelcome');if(!box)return;
-  var welcomed=false;try{welcomed=localStorage.getItem('pr-welcomed')==='1';}catch(e){}
-  var u=null;try{u=await (await fetch('/api/usage')).json();}catch(e){return;}
-  var pick=prPickWelcome(u,welcomed);
-  if(pick==='hide')return;
-  if(pick==='unassigned'){
-    var p=document.getElementById('prWelcomePending');if(p)p.style.display='flex';
-  }else{
-    var a=document.getElementById('prWelcomeActive');if(a)a.style.display='flex';
-    var allot=Number(u.allotment)||0, n=Math.round(allot/25); // ~25 tokens per typical search
-    var ta=document.getElementById('prAllot');if(ta)ta.textContent=allot.toLocaleString();
-    var ns=document.getElementById('prSearches');if(ns)ns.textContent=n.toLocaleString();
-  }
-  box.style.display='block';
-})();
 
 // ── Result grouping ────────────────────────────────────────────────────────
 // Every result lands in exactly one of three groups, in the order you work them:

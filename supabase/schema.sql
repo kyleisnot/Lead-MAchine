@@ -11,13 +11,21 @@
 --   3. Put the project URL + keys in .env and set DATA_PROVIDER=supabase
 -- ============================================================================
 
--- ── profiles: one row per user, holds their plan/tier + monthly token allotment ──
+-- ── profiles: one row per user — their plan/tier + monthly token allotment, and the
+--    account settings they fill in themselves (all nullable, all optional) ──
 create table if not exists public.profiles (
   id                       uuid primary key references auth.users(id) on delete cascade,
   email                    text,
   tier                     text    not null default 'trial',      -- trial | starter | pro
   monthly_token_allotment  integer not null default 0,            -- 0 = no plan yet (blocked)
-  created_at               timestamptz not null default now()
+  created_at               timestamptz not null default now(),
+  full_name                text,
+  agency_name              text,
+  phone                    text,
+  default_city             text,                                  -- prefills the search form
+  default_state            text,
+  default_niche            text,
+  onboarding_dismissed     boolean not null default false
 );
 
 -- ── leads: the prospects surfaced to a user + their CRM state ──
@@ -238,3 +246,70 @@ drop trigger if exists business_directory_merge_trg on public.business_directory
 create trigger business_directory_merge_trg
   before update on public.business_directory
   for each row execute function public.business_directory_merge();
+
+-- ============================================================================
+-- support_messages + token_requests: the two things a user sends the operator.
+-- ----------------------------------------------------------------------------
+-- Both are own-rows-only under RLS. The admin panel reads and answers them with the
+-- service-role client, which bypasses RLS.
+-- ============================================================================
+
+-- ── support_messages: a user writes in, the operator answers ──
+-- Deliberately no CHECK constraint on status, matching leads.bucket: an unexpected
+-- value must never make a message unreadable.
+create table if not exists public.support_messages (
+  id          bigint generated always as identity primary key,
+  user_id     uuid not null default auth.uid() references auth.users(id) on delete cascade,
+  subject     text not null,
+  body        text not null,
+  status      text not null default 'open',      -- open | answered | closed
+  created_at  timestamptz not null default now(),
+  admin_reply text,
+  replied_at  timestamptz
+);
+create index if not exists support_messages_user_idx   on public.support_messages (user_id, created_at desc);
+create index if not exists support_messages_status_idx on public.support_messages (status);
+
+alter table public.support_messages enable row level security;
+
+do $$
+begin
+  if not exists (
+    select 1 from pg_policies
+    where schemaname = 'public' and tablename = 'support_messages' and policyname = 'own messages'
+  ) then
+    create policy "own messages" on public.support_messages
+      for all using (user_id = auth.uid()) with check (user_id = auth.uid());
+  end if;
+end $$;
+
+-- ── token_requests: "I need more tokens" ──
+-- tokens_requested is what the user asked for; tokens_granted / price_usd / admin_note
+-- are what the operator actually decided, and stay null until then.
+create table if not exists public.token_requests (
+  id               bigint generated always as identity primary key,
+  user_id          uuid not null default auth.uid() references auth.users(id) on delete cascade,
+  tokens_requested integer not null,
+  note             text not null default '',
+  status           text not null default 'pending',   -- pending | approved | declined
+  created_at       timestamptz not null default now(),
+  decided_at       timestamptz,
+  tokens_granted   integer,
+  price_usd        numeric,
+  admin_note       text
+);
+create index if not exists token_requests_user_idx   on public.token_requests (user_id, created_at desc);
+create index if not exists token_requests_status_idx on public.token_requests (status);
+
+alter table public.token_requests enable row level security;
+
+do $$
+begin
+  if not exists (
+    select 1 from pg_policies
+    where schemaname = 'public' and tablename = 'token_requests' and policyname = 'own requests'
+  ) then
+    create policy "own requests" on public.token_requests
+      for all using (user_id = auth.uid()) with check (user_id = auth.uid());
+  end if;
+end $$;

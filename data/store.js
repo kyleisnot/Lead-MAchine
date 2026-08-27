@@ -733,7 +733,53 @@ export async function usageSummary(userId) {
   return { searches, builds, aiUsd };
 }
 
-// ── Profile (plan + monthly token allotment) ─────────────────────────────────
+// ── Profile (plan + monthly token allotment + account settings) ──────────────
+// The plan half (id, email, tier, monthly_token_allotment) is unchanged and is what the
+// allotment gate and /api/usage read. The account-settings half is the seven camelCase
+// keys below, added by the 20260827_accounts migration.
+
+// camelCase key → profiles column. This list IS the contract: it decides both what
+// getProfile() returns and what updateProfile() is allowed to write.
+const PROFILE_FIELDS = [
+  ["fullName", "full_name"],
+  ["agencyName", "agency_name"],
+  ["phone", "phone"],
+  ["defaultCity", "default_city"],
+  ["defaultState", "default_state"],
+  ["defaultNiche", "default_niche"],
+];
+const PLAN_COLS = "id,email,tier,monthly_token_allotment";
+const PROFILE_COLS = `${PLAN_COLS},${PROFILE_FIELDS.map(([, col]) => col).join(",")},onboarding_dismissed`;
+
+// "  Kyle  " → "Kyle". Empty, whitespace-only, null and undefined all clear to null.
+function cleanField(v) {
+  if (v === null || v === undefined) return null;
+  const s = String(v).trim();
+  return s === "" ? null : s;
+}
+
+// A profiles row (or null) → the seven account keys every getProfile() answer carries.
+function accountFields(row) {
+  const out = {};
+  for (const [key, col] of PROFILE_FIELDS) out[key] = row?.[col] ?? null;
+  out.onboardingDismissed = !!row?.onboarding_dismissed;
+  return out;
+}
+
+// A caller patch → { column: value } for the keys actually present. Unknown keys are
+// dropped here, so nothing outside PROFILE_FIELDS can ever reach the database.
+function profilePatch(patch) {
+  const out = {};
+  if (!patch || typeof patch !== "object") return out;
+  for (const [key, col] of PROFILE_FIELDS) {
+    if (Object.prototype.hasOwnProperty.call(patch, key)) out[col] = cleanField(patch[key]);
+  }
+  return out;
+}
+
+// True when Postgres rejected the query because a column doesn't exist (SQLSTATE 42703).
+const isMissingColumn = (e) => e?.code === "42703" || /column .* does not exist/i.test(e?.message || "");
+
 export async function getProfile(userId) {
   if (!isSupabase()) {
     return {
@@ -741,16 +787,172 @@ export async function getProfile(userId) {
       email: "local@dev",
       tier: "local",
       monthly_token_allotment: parseInt(process.env.MONTHLY_TOKEN_ALLOTMENT || "1000000", 10) || 1000000,
+      ...accountFields((await db()).getProfileRow(userId)),
     };
   }
   const c = await getSupabase();
-  const data = must(
-    await c.from("profiles").select("id,email,tier,monthly_token_allotment").eq("id", userId).maybeSingle(),
-    "getProfile"
-  );
+  const q = await c.from("profiles").select(PROFILE_COLS).eq("id", userId).maybeSingle();
+  // Deploy-order safety net: if the accounts migration hasn't been applied to this project
+  // yet, fall back to the plan columns alone rather than breaking every caller of
+  // getProfile (the search gate and /api/usage both depend on it). Settings then read
+  // empty until the operator applies the migration.
+  const data =
+    q.error && isMissingColumn(q.error)
+      ? must(await c.from("profiles").select(PLAN_COLS).eq("id", userId).maybeSingle(), "getProfile")
+      : must(q, "getProfile");
   // No profile row yet → an un-provisioned account: 0 tokens (blocked) until an admin
   // assigns a plan. New signups get their tokens from the DB trigger.
-  return data || { id: userId, email: "", tier: "trial", monthly_token_allotment: 0 };
+  const plan = data
+    ? { id: data.id, email: data.email, tier: data.tier, monthly_token_allotment: data.monthly_token_allotment }
+    : { id: userId, email: "", tier: "trial", monthly_token_allotment: 0 };
+  return { ...plan, ...accountFields(data) };
+}
+
+// Save account settings. Accepts any of fullName, agencyName, phone, defaultCity,
+// defaultState, defaultNiche; ignores every other key; trims strings and turns an empty
+// one into null (which is how the UI clears a field). Returns the profile in the same
+// shape getProfile() does, so a route can answer with it directly.
+export async function updateProfile(userId, patch) {
+  const set = profilePatch(patch);
+  if (!Object.keys(set).length) return getProfile(userId);
+  if (!isSupabase()) {
+    (await db()).updateProfileRow(userId, set);
+    return getProfile(userId);
+  }
+  const c = await getSupabase();
+  // Upsert, not update: the signup trigger normally created the row already, and on the
+  // rare account that has none the settings still save instead of vanishing. Only the id
+  // and the patched columns are sent, so tier / monthly_token_allotment are never touched.
+  must(await c.from("profiles").upsert({ id: userId, ...set }, { onConflict: "id" }), "updateProfile");
+  return getProfile(userId);
+}
+
+// Hide (or bring back) the onboarding checklist. Returns the updated profile.
+export async function dismissOnboarding(userId, dismissed = true) {
+  const flag = !!dismissed;
+  if (!isSupabase()) {
+    (await db()).setOnboardingDismissed(userId, flag);
+    return getProfile(userId);
+  }
+  const c = await getSupabase();
+  must(
+    await c.from("profiles").upsert({ id: userId, onboarding_dismissed: flag }, { onConflict: "id" }),
+    "dismissOnboarding"
+  );
+  return getProfile(userId);
+}
+
+// ── Support messages + token requests ────────────────────────────────────────
+// Both are write-then-read-your-own: a user creates a row and lists their own, and the
+// operator answers from the admin panel (which queries the service client directly).
+//
+// Bad input THROWS. The error carries .status = 400 and a message safe to show the user,
+// so a route can do: catch (e) { res.status(e.status || 500).json({ ok:false, error:e.message }) }
+function badRequest(message) {
+  const err = new Error(message);
+  err.status = 400;
+  err.code = "bad_request";
+  return err;
+}
+
+function supportRow(r) {
+  return {
+    id: Number(r.id),
+    subject: r.subject ?? "",
+    body: r.body ?? "",
+    status: r.status ?? "open",
+    createdAt: r.created_at ?? null,
+    adminReply: r.admin_reply ?? null,
+    repliedAt: r.replied_at ?? null,
+  };
+}
+
+function tokenRequestRow(r) {
+  return {
+    id: Number(r.id),
+    tokensRequested: Number(r.tokens_requested) || 0,
+    note: r.note ?? "",
+    status: r.status ?? "pending",
+    createdAt: r.created_at ?? null,
+    decidedAt: r.decided_at ?? null,
+    tokensGranted: r.tokens_granted === null || r.tokens_granted === undefined ? null : Number(r.tokens_granted),
+    priceUsd: r.price_usd === null || r.price_usd === undefined ? null : Number(r.price_usd),
+    adminNote: r.admin_note ?? null,
+  };
+}
+
+// { id } of the new message. Subject and body are both required after trimming.
+export async function createSupportMessage(userId, { subject, body } = {}) {
+  const s = String(subject ?? "").trim();
+  const b = String(body ?? "").trim();
+  if (!s) throw badRequest("Add a subject.");
+  if (!b) throw badRequest("Add a message.");
+  if (!isSupabase()) {
+    return { id: Number((await db()).createSupportMessage(userId, { subject: s, body: b })) };
+  }
+  const c = await getSupabase();
+  const data = must(
+    await c.from("support_messages").insert({ user_id: userId, subject: s, body: b }).select("id").single(),
+    "createSupportMessage"
+  );
+  return { id: Number(data?.id) };
+}
+
+// This user's messages, newest first. id breaks ties on identical timestamps.
+export async function listSupportMessages(userId) {
+  if (!isSupabase()) return ((await db()).listSupportMessages(userId) || []).map(supportRow);
+  const c = await getSupabase();
+  const data = must(
+    await c
+      .from("support_messages")
+      .select("id,subject,body,status,created_at,admin_reply,replied_at")
+      .eq("user_id", userId)
+      .order("created_at", { ascending: false })
+      .order("id", { ascending: false })
+      .range(0, BIG),
+    "listSupportMessages"
+  );
+  return (data || []).map(supportRow);
+}
+
+// { id } of the new request. tokens must be a positive whole number; note is optional.
+export async function createTokenRequest(userId, { tokens, note } = {}) {
+  // A form sends a string, code sends a number, and nothing else counts: without the
+  // typeof guard `true` would coerce to a request for 1 token.
+  const raw = typeof tokens === "string" ? tokens.trim() : tokens;
+  const n = typeof raw === "number" || typeof raw === "string" ? Number(raw) : NaN;
+  if (!Number.isInteger(n) || n <= 0) throw badRequest("Ask for a whole number of tokens, at least 1.");
+  const text = String(note ?? "").trim();
+  if (!isSupabase()) {
+    return { id: Number((await db()).createTokenRequest(userId, { tokens: n, note: text })) };
+  }
+  const c = await getSupabase();
+  const data = must(
+    await c
+      .from("token_requests")
+      .insert({ user_id: userId, tokens_requested: n, note: text })
+      .select("id")
+      .single(),
+    "createTokenRequest"
+  );
+  return { id: Number(data?.id) };
+}
+
+// This user's token requests, newest first.
+export async function listTokenRequests(userId) {
+  if (!isSupabase()) return ((await db()).listTokenRequests(userId) || []).map(tokenRequestRow);
+  const c = await getSupabase();
+  const data = must(
+    await c
+      .from("token_requests")
+      .select("id,tokens_requested,note,status,created_at,decided_at,tokens_granted,price_usd,admin_note")
+      .eq("user_id", userId)
+      .order("created_at", { ascending: false })
+      .order("id", { ascending: false })
+      .range(0, BIG),
+    "listTokenRequests"
+  );
+  return (data || []).map(tokenRequestRow);
 }
 
 // ── Wins (a user's closed deals) ─────────────────────────────────────────────

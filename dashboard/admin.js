@@ -10,10 +10,15 @@
 // Contract (see the MVP spec, section 6):
 //   export const adminRouter   — express Router, all paths under /admin,
 //                                every route guarded by requireUser + requireAdmin.
-//   GET  /admin                            — operator overview (stat cards + users table)
-//   POST /admin/api/user/:id               — {tier, monthly_token_allotment} → updates profiles
-//   POST /admin/api/user/:id/topup         — {tokens} → adds N to monthly_token_allotment
-//   POST /admin/api/user/:id/reset-usage   — clears THIS calendar month's usage_log rows
+//   GET  /admin                            - operator overview (stat cards + users table)
+//   POST /admin/api/user/:id               - {tier, monthly_token_allotment} -> updates profiles
+//   POST /admin/api/user/:id/topup         - {tokens} -> adds N to monthly_token_allotment
+//   POST /admin/api/user/:id/reset-usage   - clears THIS calendar month's usage_log rows
+//   GET  /admin/inbox                      - operator inbox (token requests + support messages)
+//   POST /admin/api/request/:id/approve    - {tokens, priceUsd, note} -> grants and closes a request
+//   POST /admin/api/request/:id/decline    - {note} -> closes a request, grants nothing
+//   POST /admin/api/support/:id/reply      - {reply} -> stores the reply, status answered
+//   POST /admin/api/support/:id/close      - status closed
 import express from "express";
 import { requireUser, requireAdmin } from "./auth.js";
 import { dataProvider, getSupabase } from "../lib/supabase.js";
@@ -24,15 +29,20 @@ export const adminRouter = express.Router();
 
 // ── plans: the single source of truth for what the operator sells ────────────
 // `tokens` is the monthly allotment the plan implies. 0 means NO TOKENS (a
-// not-yet-activated account is blocked until an admin assigns a plan); "Unlimited"
-// is just a very high cap. `price` is USD per month, 0 for non-paying plans.
-// `prospect` is the near-nothing plan demo-created accounts sit on.
+// not-yet-activated account is blocked until an admin assigns a plan). `price` is
+// USD per month, 0 for non-paying plans. `prospect` is the near-nothing plan
+// demo-created accounts sit on.
+//
+// The old `unlimited` tier is retired. Rows in the DB that still carry it (or any
+// other hand-edited string) are NOT migrated: normalizeTier / planFor tolerate an
+// unknown tier, so such a user still renders, still saves, and counts $0 toward
+// MRR until the operator reassigns them by hand.
 const PLANS = {
   prospect: { label: "Prospect (demo)", tokens: 1, price: 0 },
   trial: { label: "Trial", tokens: 300, price: 0 },
-  starter: { label: "Starter", tokens: 2000, price: 97 },
-  pro: { label: "Pro", tokens: 6000, price: 297 },
-  unlimited: { label: "Unlimited", tokens: 100000, price: 997 },
+  starter: { label: "Starter", tokens: 800, price: 50 },
+  pro: { label: "Pro", tokens: 2000, price: 100 },
+  agency: { label: "Agency", tokens: 9000, price: 400 },
 };
 const PLAN_KEYS = Object.keys(PLANS);
 
@@ -43,6 +53,12 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 const TOPUP_MIN = 1;
 const TOPUP_MAX = 1000000;
 const ALLOTMENT_MAX = 1000000000; // stays inside a postgres int4
+
+// Inbox free text: what an operator can type on a decision or a support reply.
+const NOTE_MAX = 2000;
+const REPLY_MAX = 5000;
+// A single approval can be recorded at any sane invoice size, but not at a typo'd one.
+const PRICE_MAX = 1000000;
 
 // PostgREST caps un-ranged selects at 1000 rows — ask for more explicitly.
 const MAX_ROWS = 4999;
@@ -60,6 +76,14 @@ function esc(s) {
 function tokensPerUsd() {
   const n = parseFloat(process.env.TOKENS_PER_USD || "75");
   return Number.isFinite(n) && n > 0 ? n : 75;
+}
+
+// USD per token when a customer buys more AFTER burning their allotment. Priced
+// deliberately above every plan's per-token rate, so topping up mid-month is worse
+// value than moving up a plan. Validated exactly like tokensPerUsd().
+function overageRatePerToken() {
+  const n = parseFloat(process.env.OVERAGE_RATE_PER_TOKEN || "0.09");
+  return Number.isFinite(n) && n > 0 ? n : 0.09;
 }
 
 // Start of the current calendar month, server-local, as an ISO timestamp.
@@ -86,6 +110,25 @@ function fmtDate(v) {
   if (isNaN(d.getTime())) return "n/a";
   const p = (x) => String(x).padStart(2, "0");
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+
+// Date plus wall-clock time, server-local. The inbox needs the time of day: two
+// requests from the same customer on the same day have to be tellable apart.
+function fmtWhen(v) {
+  if (!v) return "n/a";
+  const d = new Date(v);
+  if (isNaN(d.getTime())) return "n/a";
+  const p = (x) => String(x).padStart(2, "0");
+  return `${fmtDate(v)} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+// Operator-typed free text on its way into the DB: normalized newlines, trimmed,
+// hard length cap. Returns "" for anything empty, so callers can test truthiness.
+function cleanText(v, max) {
+  const s = String(v ?? "")
+    .replace(/\r\n?/g, "\n")
+    .trim();
+  return s.length > max ? s.slice(0, max) : s;
 }
 
 // The plan record for a tier string, or null when the DB holds something we
@@ -244,24 +287,38 @@ async function loadOverview() {
 
 // ── render ───────────────────────────────────────────────────────────────────
 
-// The admin console's tab bar. Four tabs — Overview (/admin, where the users table
-// lives too), Analytics (/admin/analytics), Pricing (/admin/pricing) and Demo (/demo) —
-// so Demo reads as part of the console rather than a stray nav item. Exported: demo.js
-// renders it too, so the same bar sits above every console page. The `.tabs`/`.tab`
-// colours come from SHARED_CSS; page() (here) and demo.js each add the shared layout rules.
-export function adminTabs(active) {
-  const tab = (href, key, label) =>
-    `<a class="tab${active === key ? " active" : ""}" href="${href}">${label}</a>`;
+// The admin console's tab bar. Five tabs: Overview (/admin, where the users table
+// lives too), Analytics (/admin/analytics), Inbox (/admin/inbox), Pricing
+// (/admin/pricing) and Demo (/demo), so Demo reads as part of the console rather
+// than a stray nav item. Exported: demo.js renders it too, so the same bar sits
+// above every console page. The `.tabs`/`.tab`/`.pill` colours come from SHARED_CSS;
+// page() (here) and demo.js each add the shared layout rules.
+//
+// `pending` is the count of work waiting in the inbox. It is optional so the old
+// one-argument call (demo.js) keeps working: 0 or missing means no badge at all.
+export function adminTabs(active, pending = 0) {
+  const n = Math.max(0, Math.round(Number(pending) || 0));
+  const badge = n
+    ? `<span class="pill" id="lm-inbox-badge" title="${n} waiting in the inbox">${
+        n > 99 ? "99+" : n
+      }</span>`
+    : "";
+  const tab = (href, key, label, extra = "") =>
+    `<a class="tab${active === key ? " active" : ""}" href="${href}">${label}${extra}</a>`;
   return `<div class="tabs">${tab("/admin", "overview", "Overview")}${tab(
     "/admin/analytics",
     "analytics",
     "Analytics"
-  )}${tab("/admin/pricing", "pricing", "Pricing")}${tab("/demo", "demo", "Demo")}</div>`;
+  )}${tab("/admin/inbox", "inbox", "Inbox", badge)}${tab("/admin/pricing", "pricing", "Pricing")}${tab(
+    "/demo",
+    "demo",
+    "Demo"
+  )}</div>`;
 }
 
 // `sub` overrides the page subtitle; the default is the operator overview's wording,
 // so Overview and Analytics render byte-for-byte as before.
-function page(body, extraScript = "", demo = false, active = null, sub = null) {
+function page(body, extraScript = "", demo = false, active = null, sub = null, pending = 0) {
   return `<!doctype html><html><head>${THEME_INIT_SCRIPT}<meta charset="utf-8">${FAVICON}<title>Admin · Prospector</title>
 <style>
   *{box-sizing:border-box;margin:0;padding:0}
@@ -269,6 +326,8 @@ function page(body, extraScript = "", demo = false, active = null, sub = null) {
   /* Console tab bar layout (colours live in SHARED_CSS). */
   .tabs{display:flex;gap:8px;margin:0 0 20px;flex-wrap:wrap}
   .tab{display:inline-flex;align-items:center;gap:6px;text-decoration:none;font-weight:700;font-size:14px;border-radius:9px;padding:9px 16px}
+  /* Pending-work badge on the Inbox tab (colours live in SHARED_CSS). */
+  .tab .pill{display:inline-block;min-width:19px;text-align:center;font-size:11px;font-weight:800;line-height:1;border-radius:999px;padding:4px 6px;font-variant-numeric:tabular-nums}
   .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(168px,1fr));gap:12px;margin-bottom:20px}
   .stat{border-radius:10px;padding:16px}
   .stat .n{font-size:26px;font-weight:800;line-height:1.15}
@@ -337,12 +396,35 @@ function page(body, extraScript = "", demo = false, active = null, sub = null) {
   .foot code{background:var(--surface2);border:1px solid var(--border);border-radius:5px;padding:1px 6px;font-size:12px;color:var(--text)}
   .foot ul{margin:8px 0 0;padding-left:18px}
   .foot li{margin-bottom:5px}
+  /* Inbox tab. Two tables of operator work: token requests and support messages. */
+  .inboxtbl{min-width:1020px}
+  .msgtbl{min-width:940px}
+  /* Wider than the overview's user cell: these tables have the room, and an email
+     that wraps mid-word is hard to read back to a customer. */
+  .inboxtbl td.usercell,.msgtbl td.usercell{max-width:250px;min-width:186px}
+  tr.done td{color:var(--muted)}
+  td.body{max-width:360px}
+  .msgbody{font-size:13px;line-height:1.55;white-space:pre-wrap;word-break:break-word;max-height:132px;overflow-y:auto}
+  .rnote{font-size:13px;line-height:1.5;white-space:pre-wrap;word-break:break-word;max-width:260px}
+  .rnote.none{color:var(--faint)}
+  .rstatus{display:inline-block;font-size:9px;font-weight:800;text-transform:uppercase;letter-spacing:.5px;border-radius:5px;padding:3px 7px;background:var(--surface2);color:var(--muted);border:1px solid var(--border)}
+  .rstatus.wait{background:var(--warn-weak);color:var(--warn);border-color:transparent}
+  .rstatus.yes{background:var(--accent-weak);color:var(--accent-ink);border-color:transparent}
+  td.decide{min-width:330px}
+  .fld{display:inline-flex;align-items:center;gap:5px;font-size:12px;color:var(--muted);white-space:nowrap}
+  input.gtok,input.gusd{border-radius:7px;padding:5px 6px;font-size:12px;width:80px;text-align:right}
+  input.gnote{border-radius:7px;padding:5px 7px;font-size:12px;width:100%;max-width:310px}
+  textarea.reply{border-radius:7px;padding:7px 8px;font-size:13px;width:100%;max-width:330px;min-height:62px;resize:vertical;font-family:inherit;line-height:1.5}
+  .outcome{font-size:12.5px;color:var(--muted);line-height:1.6;max-width:310px}
+  .outcome b{color:var(--text)}
+  .inboxnote{margin:0 0 12px;font-size:12.5px;color:var(--muted);line-height:1.6;max-width:900px}
+  .inboxnote b{color:var(--text)}
   @media(max-width:900px){.stats{grid-template-columns:repeat(2,1fr)}}
 ${SHARED_CSS}</style></head><body>
 ${sidebar("admin", { isAdmin: true, demo })}<div class="pagehead"><div class="titlewrap"><h1>Admin</h1><div class="pagesub">${
     sub ? esc(sub) : "Operator overview: every user, their usage this month, and their plan"
   }</div></div><div class="spacer"></div></div>
-${active ? adminTabs(active) : ""}
+${active ? adminTabs(active, pending) : ""}
 ${body}
 ${extraScript}${SHELL_TAIL_SCRIPT}</main></div></body></html>`;
 }
@@ -429,7 +511,7 @@ function userRow(u, meEmail = "") {
 </tr>`;
 }
 
-function renderOverview(d, spend, demo = false, meEmail = "") {
+function renderOverview(d, spend, demo = false, meEmail = "", pending = 0) {
   const cards = `<div class="stats">
 ${statCard(num(d.totalUsers), "Users")}
 ${statCard(`$${num(d.mrr)}<span class="per">/mo</span>`, "MRR", mixLine(d.mix))}
@@ -446,8 +528,14 @@ ${statCard(
     (k) =>
       `<b>${esc(PLANS[k].label)}</b>: ${
         PLANS[k].price ? `$${PLANS[k].price}/mo` : "free"
-      }, ${PLANS[k].tokens ? `${num(PLANS[k].tokens)} tokens` : "unlimited tokens"}`
-  ).join('<span class="lsep">·</span>')}<br>Picking a plan fills in its allotment, and you can still override the number before saving. An allotment of <b>0</b> blocks the account (no tokens), so use it for signups you have not activated yet. <b>Add</b> tops up this month's allotment when a customer runs out; <b>Reset month</b> clears their usage rows for the current calendar month only.</div>`;
+      }, ${num(PLANS[k].tokens)} tokens`
+  ).join('<span class="lsep">·</span>')}<br>Picking a plan fills in its allotment, and you can still override the number before saving. An allotment of <b>0</b> blocks the account (no tokens), so use it for signups you have not activated yet. <b>Add</b> tops up this month's allotment when a customer runs out; <b>Reset month</b> clears their usage rows for the current calendar month only.<br>The old <b>Unlimited</b> plan is retired and is no longer in the picker. An account still sitting on it (or on any other hand-edited tier) keeps showing that tier verbatim, counts $0 toward MRR, and saves fine, so move those accounts onto ${esc(
+    PLANS.agency.label
+  )} or ${esc(
+    PLANS.pro.label
+  )} by hand. Selling more tokens mid-month is priced at ${usd4(
+    overageRatePerToken()
+  )} per token; see the Pricing tab.</div>`;
 
   const table = d.users.length
     ? `<div class="tblwrap"><table>
@@ -551,7 +639,7 @@ async function lmResetUsage(id,btn){
 }
 </script>`;
 
-  return page(cards + table, script, demo, "overview");
+  return page(cards + table, script, demo, "overview", null, pending);
 }
 
 // ── analytics ─────────────────────────────────────────────────────────────────
@@ -627,7 +715,7 @@ async function loadAnalytics() {
   return { signedUp, activated, paying, won, revenue, winCount, recent };
 }
 
-function renderAnalytics(d, demo = false) {
+function renderAnalytics(d, demo = false, pending = 0) {
   const cards = `<div class="stats">
 ${statCard(num(d.signedUp), "Signed up", "accounts, excluding demo")}
 ${statCard(num(d.activated), "Activated", pctOfSignups(d.activated, d.signedUp))}
@@ -655,7 +743,7 @@ ${statCard(money(d.revenue), "Closed revenue", `${num(d.winCount)} win${d.winCou
     cards +
     `<div class="sectionhead">Recent wins</div>` +
     winsTable;
-  return page(body, "", demo, "analytics");
+  return page(body, "", demo, "analytics", null, pending);
 }
 
 // ── pricing ──────────────────────────────────────────────────────────────────
@@ -690,6 +778,10 @@ const GUARANTEE_TARGET = 5;
 const YIELD_TYPICAL = 7; // businesses scanned per qualified company, typical market
 const YIELD_WORST = 20; // ... and in a thin one
 const GUARANTEE_CAP_PLACES = 120;
+
+// The sample basket the overage card prices, so the rate lands as a real number a
+// customer would actually be quoted rather than a fraction of a cent.
+const OVERAGE_SAMPLE_TOKENS = 500;
 
 // Plans the pricing page reasons about. `prospect` is the 1-token demo shell, not
 // something the operator sells, so it stays out of the margin maths.
@@ -741,6 +833,7 @@ function pricingModel() {
   const rate = apifyRatePer1k();
   const tpu = tokensPerUsd();
   const flatFive = guaranteedFiveTokens();
+  const overageRate = overageRatePerToken();
 
   const usdPerPlace = rate / 1000; // what one scanned business costs us
   const tokensPerPlace = usdPerPlace * tpu; // what we charge for one, in tokens
@@ -800,6 +893,23 @@ function pricingModel() {
     },
   ];
 
+  // Overage: what a customer pays for extra tokens once the allotment is gone.
+  // Per place billing makes our cost exactly tokens / tpu, so the margin reduces to
+  // 1 - (1 / tpu) / rate and is the same whatever basket size we quote.
+  const overageCustomerUsd = OVERAGE_SAMPLE_TOKENS * overageRate;
+  const overageCostUsd = OVERAGE_SAMPLE_TOKENS / tpu;
+  const overage = {
+    rate: overageRate,
+    sampleTokens: OVERAGE_SAMPLE_TOKENS,
+    customerUsd: overageCustomerUsd,
+    ourCostUsd: overageCostUsd,
+    margin: overageCustomerUsd > 0 ? 1 - overageCostUsd / overageCustomerUsd : 0,
+    // The paid plans it has to beat, cheapest per token last.
+    beats: plans
+      .filter((p) => p.price > 0 && p.usdPerToken > 0)
+      .sort((a, b) => b.usdPerToken - a.usdPerToken),
+  };
+
   return {
     rate,
     tpu,
@@ -809,6 +919,7 @@ function pricingModel() {
     plans,
     planBy,
     modes,
+    overage,
     typicalPlaces,
     worstPlaces,
     typicalCostUsd: typicalPlaces * usdPerPlace,
@@ -876,7 +987,9 @@ function flowDiagram(m) {
 <text x="829" y="45" text-anchor="middle" font-size="13" font-weight="700" fill="var(--text)">Customer plans</text>
 <text x="829" y="63" text-anchor="middle" font-size="10.5" fill="var(--muted)">what a token sells for</text>
 ${planLines}
-<text x="829" y="170" text-anchor="middle" font-size="10" fill="var(--faint)">Unlimited is a cap, not a rate anyone reaches</text>
+<text x="829" y="170" text-anchor="middle" font-size="10" fill="var(--faint)">Overage after the allotment: ${centsPerToken(
+    m.overage.rate
+  )} per token, above every plan rate</text>
 </svg></div>`;
 }
 
@@ -972,10 +1085,7 @@ function planTable(m) {
       const worst = `<td class="n">${usd2(p.worstCostUsd)}</td>`;
       const margin =
         p.price > 0
-          ? marginCell(
-              p.margin,
-              p.key === "unlimited" ? "a cap, not a rate anyone reaches" : ""
-            )
+          ? marginCell(p.margin)
           : `<td class="n"><span class="sub">acquisition cost, up to ${usd2(
               p.worstCostUsd
             )}</span></td>`;
@@ -1006,13 +1116,50 @@ function planTable(m) {
 <tbody>${rows}</tbody></table></div>`;
 }
 
+// What a customer pays for tokens bought AFTER the allotment is gone, and why the
+// rate sits above every plan. Same worst case cost basis as the plan table, so the
+// two margins are comparable.
+function overageCards(m) {
+  const o = m.overage;
+  const cheaper = o.beats.map((p) => `${esc(p.label)} at ${centsPerToken(p.usdPerToken)}`);
+  const beatsLine = cheaper.length
+    ? cheaper.length === 1
+      ? cheaper[0]
+      : cheaper.slice(0, -1).join(", ") + " and " + cheaper[cheaper.length - 1]
+    : "every paid plan";
+
+  return `<div class="stats">
+${statCard(
+  usd4(o.rate),
+  "Overage rate, per token",
+  `${centsPerToken(o.rate)} each, set by OVERAGE_RATE_PER_TOKEN`
+)}
+${statCard(
+  usd2(o.customerUsd),
+  `Customer pays, ${num(o.sampleTokens)} extra tokens`,
+  `${num(o.sampleTokens)} tokens at ${centsPerToken(o.rate)} each`
+)}
+${statCard(
+  usd2(o.ourCostUsd),
+  "Our cost for those tokens",
+  `${num(o.sampleTokens)} tokens at ${num(m.tpu)} tokens per $1`
+)}
+${statCard(
+  `<span class="mgn ${marginClass(o.margin)}">${pctText(o.margin)}</span>`,
+  "Overage margin, worst case",
+  "same per place cost basis as the plans"
+)}
+</div>
+<div class="foot">Overage is priced above every plan rate on purpose: ${centsPerToken(
+    o.rate
+  )} per token beats ${beatsLine}, so a customer who keeps running out mid-month is always better off upgrading than buying more tokens at this rate.</div>`;
+}
+
 function pricingFootnote(m) {
-  const starter = m.planBy("starter");
-  const pro = m.planBy("pro");
-  const ceilings = [starter, pro]
-    .filter(Boolean)
+  const paid = m.plans.filter((p) => p.price > 0);
+  const ceilings = paid
     .map((p) => `${usd2(p.guaranteedCeilingUsd)} on ${esc(p.label)}`)
-    .join(" and ");
+    .join(", ");
 
   return `<div class="foot"><b>Assumptions and where the numbers come from</b>
 <ul>
@@ -1026,18 +1173,22 @@ function pricingFootnote(m) {
     String(m.rate)
   )}), <code>TOKENS_PER_USD</code> (now ${esc(
     String(m.tpu)
-  )}) and <code>GUARANTEED_FIVE_TOKENS</code> (now ${esc(
+  )}), <code>GUARANTEED_FIVE_TOKENS</code> (now ${esc(
     String(m.flatFive)
+  )}) and <code>OVERAGE_RATE_PER_TOKEN</code> (now ${esc(
+    String(m.overage.rate)
   )}). Change one in the environment and everything here reprices on the next load.</li>
   <li>Per place billing makes our cost exactly tokens divided by <code>TOKENS_PER_USD</code>, whatever the Apify rate is, which is why the worst case column matches the plan margin. If a customer instead spent a whole allotment on guaranteed searches that all ran to the cap, our cost would top out slightly higher: ${ceilings}.</li>
   <li>Trial is free, so it has no margin. Treat its ${usd2(
     (m.planBy("trial") || { worstCostUsd: 0 }).worstCostUsd
-  )} as acquisition cost. Unlimited is a ceiling rather than a rate customers reach, so its margin column is the theoretical figure for an account that burns the entire cap.</li>
+  )} as acquisition cost.</li>
+  <li>Overage sits above every plan rate by design, so the upgrade is always the better deal for the customer and we never sell our cheapest tokens to the customers using the most. Its margin uses the same worst case basis as the plan rows.</li>
+  <li>The old Unlimited plan is retired and no longer sells. Any account still carrying that tier renders with its raw tier and counts $0 toward MRR until the operator reassigns it, and is deliberately left out of this page.</li>
   <li>The 1-token Prospect (demo) plan is left out: it is a demo shell, not something the operator sells.</li>
 </ul></div>`;
 }
 
-function renderPricing(m, demo = false) {
+function renderPricing(m, demo = false, pending = 0) {
   const body =
     `<div class="sectionhead">Money flow, supplier cost to plan price</div>` +
     flowDiagram(m) +
@@ -1047,13 +1198,406 @@ function renderPricing(m, demo = false) {
     guaranteeCards(m) +
     `<div class="sectionhead pricehead">Plan margins</div>` +
     planTable(m) +
+    `<div class="sectionhead pricehead">Overage, after the allotment runs out</div>` +
+    overageCards(m) +
     pricingFootnote(m);
   return page(
     body,
     "",
     demo,
     "pricing",
-    "What a scan costs us, what the meter charges for it, and what each plan earns"
+    "What a scan costs us, what the meter charges for it, and what each plan earns",
+    pending
+  );
+}
+
+// ── inbox ────────────────────────────────────────────────────────────────────
+//
+// The operator's work queue: customers asking for more tokens, and customers
+// asking for help. Both tables are read cross-user through the service client,
+// which this module is the one place allowed to do.
+
+// How the plan column reads for one requester. A tier we no longer sell (the
+// retired `unlimited`, or anything hand-edited) is shown verbatim and flagged, so
+// the operator can see at a glance who still needs reassigning.
+function tierLabel(tier) {
+  const raw = String(tier ?? "").trim();
+  if (!raw) return "no plan";
+  const p = planFor(raw);
+  return p ? p.label : `${raw} (retired or custom)`;
+}
+
+// Pending token requests plus open support messages: the number on the Inbox tab.
+// Two head:true count queries, no row transfer, and it NEVER throws. A badge is a
+// convenience, so a missing table or a sqlite deployment just means no badge at all
+// rather than a dead admin page.
+async function pendingInboxCount() {
+  if (dataProvider() !== "supabase") return 0;
+  try {
+    const sb = await getSupabase();
+    const [reqRes, msgRes] = await Promise.all([
+      sb.from("token_requests").select("*", { count: "exact", head: true }).eq("status", "pending"),
+      sb.from("support_messages").select("*", { count: "exact", head: true }).eq("status", "open"),
+    ]);
+    if (reqRes.error || msgRes.error) return 0;
+    return (reqRes.count || 0) + (msgRes.count || 0);
+  } catch {
+    return 0;
+  }
+}
+
+// Both inbox tables, newest first, with the requester details each row needs.
+// Ranged like loadOverview so PostgREST's 1000-row default cannot silently truncate.
+async function loadInbox() {
+  const sb = await getSupabase();
+  const since = firstOfMonthISO();
+  const rate = overageRatePerToken();
+
+  const [reqRes, msgRes] = await Promise.all([
+    sb
+      .from("token_requests")
+      .select(
+        "id,user_id,tokens_requested,note,status,created_at,decided_at,tokens_granted,price_usd,admin_note"
+      )
+      .order("created_at", { ascending: false })
+      .range(0, MAX_ROWS),
+    sb
+      .from("support_messages")
+      .select("id,user_id,subject,body,status,created_at,admin_reply,replied_at")
+      .order("created_at", { ascending: false })
+      .range(0, MAX_ROWS),
+  ]);
+  const rawRequests = unwrap(reqRes, "token requests").data || [];
+  const rawMessages = unwrap(msgRes, "support messages").data || [];
+
+  // The profiles behind every row on the page, loaded once for both sections.
+  const ids = [
+    ...new Set(
+      [...rawRequests, ...rawMessages].map((r) => String(r.user_id || "")).filter(Boolean)
+    ),
+  ];
+  const profiles = ids.length
+    ? unwrap(
+        await sb
+          .from("profiles")
+          .select("id,email,tier,monthly_token_allotment")
+          .in("id", ids)
+          .range(0, MAX_ROWS),
+        "profiles"
+      ).data || []
+    : [];
+  const profById = new Map(profiles.map((p) => [String(p.id), p]));
+
+  // This month's spend, same maths as the overview's usage cell, for the requesters
+  // only: the support rows do not show a usage figure, so they cost no queries here.
+  const reqIds = [
+    ...new Set(rawRequests.map((r) => String(r.user_id || "")).filter(Boolean)),
+  ];
+  const usedById = new Map();
+  await mapPool(reqIds, 6, async (uid) => {
+    const r = await sb
+      .from("usage_log")
+      .select("cost")
+      .eq("user_id", uid)
+      .gte("at", since)
+      .range(0, MAX_ROWS);
+    const costUsd = (unwrap(r, "usage").data || []).reduce((a, x) => a + (Number(x.cost) || 0), 0);
+    usedById.set(uid, Math.round(costUsd * tokensPerUsd()));
+  });
+
+  const who = (uid) => {
+    const key = String(uid || "");
+    const p = profById.get(key);
+    return {
+      email: (p && p.email) || "No email on file",
+      shortId: key ? key.slice(0, 8) : "no user id",
+      tier: (p && p.tier) || "",
+      allotment: Number((p && p.monthly_token_allotment) ?? 0),
+    };
+  };
+
+  const requests = rawRequests.map((r) => {
+    const w = who(r.user_id);
+    const asked = Math.max(0, Math.round(Number(r.tokens_requested) || 0));
+    return {
+      id: r.id,
+      userId: String(r.user_id || ""),
+      email: w.email,
+      shortId: w.shortId,
+      tierLabel: tierLabel(w.tier),
+      allotment: w.allotment,
+      used: usedById.get(String(r.user_id || "")) || 0,
+      tokensRequested: asked,
+      // Prefilled price: what the overage rate says that many tokens is worth.
+      suggestedPrice: (Math.round(asked * rate * 100) / 100).toFixed(2),
+      note: String(r.note || ""),
+      status: String(r.status || "pending").toLowerCase(),
+      createdAt: r.created_at,
+      decidedAt: r.decided_at,
+      tokensGranted: r.tokens_granted,
+      priceUsd: r.price_usd,
+      adminNote: String(r.admin_note || ""),
+    };
+  });
+
+  const messages = rawMessages.map((m) => {
+    const w = who(m.user_id);
+    return {
+      id: m.id,
+      email: w.email,
+      shortId: w.shortId,
+      subject: String(m.subject || "No subject"),
+      body: String(m.body || ""),
+      status: String(m.status || "open").toLowerCase(),
+      createdAt: m.created_at,
+      adminReply: String(m.admin_reply || ""),
+      repliedAt: m.replied_at,
+    };
+  });
+
+  // Work waiting floats to the top; everything else keeps the newest-first order
+  // the queries already came back in (Array.sort is stable).
+  requests.sort((a, b) => (a.status === "pending" ? 0 : 1) - (b.status === "pending" ? 0 : 1));
+  messages.sort((a, b) => (a.status === "open" ? 0 : 1) - (b.status === "open" ? 0 : 1));
+
+  const pendingRequests = requests.filter((r) => r.status === "pending").length;
+  const openMessages = messages.filter((m) => m.status === "open").length;
+
+  return { requests, messages, pendingRequests, openMessages, rate };
+}
+
+// ── inbox render ─────────────────────────────────────────────────────────────
+
+function requestStatusClass(s) {
+  if (s === "pending") return "wait";
+  if (s === "approved") return "yes";
+  return "";
+}
+
+function messageStatusClass(s) {
+  if (s === "open") return "wait";
+  if (s === "answered") return "yes";
+  return "";
+}
+
+// The decision cell for a request still waiting: how many tokens to hand over, what
+// to charge for them, an optional note, and the two buttons.
+function approveControls(r) {
+  const id = esc(String(r.id));
+  return `<div class="rowact2"><span class="fld">Grant <input class="gtok" type="number" min="${TOPUP_MIN}" step="10" value="${
+    r.tokensRequested
+  }" aria-label="Tokens to grant"></span><span class="fld">Price $ <input class="gusd" type="number" min="0" step="0.01" value="${esc(
+    r.suggestedPrice
+  )}" aria-label="Price charged in USD"></span></div>
+    <div class="rowact2"><input class="gnote" type="text" maxlength="${NOTE_MAX}" placeholder="Note for the record (optional)" aria-label="Admin note"></div>
+    <div class="rowact"><button class="savebtn" onclick="lmApprove('${id}',this)">Approve</button><button class="minibtn danger" onclick="lmDecline('${id}',this)">Decline</button><span class="flag" id="rf-${id}"></span></div>`;
+}
+
+// The same cell once the request is decided. Mirrored by lmReqOutcome() in the
+// inline script, which paints it in place after a click instead of reloading.
+function requestOutcome(r) {
+  const when = esc(fmtWhen(r.decidedAt));
+  const note = r.adminNote ? `<br>Note: ${esc(r.adminNote)}` : "";
+  if (r.status === "approved") {
+    return `<div class="outcome"><b>Approved</b>, granted ${num(
+      r.tokensGranted
+    )} tokens for ${usd2(r.priceUsd)}${note}<br>${when}</div>`;
+  }
+  if (r.status === "declined") {
+    return `<div class="outcome"><b>Declined</b>, nothing granted${note}<br>${when}</div>`;
+  }
+  return `<div class="outcome"><b>${esc(r.status)}</b>${note}<br>${when}</div>`;
+}
+
+function requestRow(r) {
+  const id = esc(String(r.id));
+  const pending = r.status === "pending";
+  const usage = r.allotment
+    ? `${num(r.used)} / ${num(r.allotment)} tokens this month`
+    : `${num(r.used)} tokens used, no allotment`;
+  return `<tr id="rq-${id}"${pending ? "" : ' class="done"'}>
+  <td class="usercell"><div class="who">${esc(r.email)}</div><div class="sub muted">${esc(
+    r.shortId
+  )}</div><div class="sub muted">${esc(fmtWhen(r.createdAt))}</div></td>
+  <td><div class="who">${esc(r.tierLabel)}</div><div class="sub muted">${esc(usage)}</div></td>
+  <td class="n">${num(r.tokensRequested)}</td>
+  <td><div class="rnote${r.note ? "" : " none"}">${
+    r.note ? esc(r.note) : "No note"
+  }</div></td>
+  <td><span class="rstatus ${requestStatusClass(r.status)}" id="rs-${id}">${esc(
+    r.status
+  )}</span></td>
+  <td class="decide" id="rd-${id}">${pending ? approveControls(r) : requestOutcome(r)}</td>
+</tr>`;
+}
+
+function messageRow(m) {
+  const id = esc(String(m.id));
+  const open = m.status === "open";
+  const closed = m.status === "closed";
+  const replied = m.adminReply
+    ? `<b>Replied</b> ${esc(fmtWhen(m.repliedAt))}<br>${esc(m.adminReply)}`
+    : "";
+  return `<tr id="ms-${id}"${open ? "" : ' class="done"'}>
+  <td class="usercell"><div class="who">${esc(m.email)}</div><div class="sub muted">${esc(
+    m.shortId
+  )}</div><div class="sub muted">${esc(fmtWhen(m.createdAt))}</div></td>
+  <td><div class="who">${esc(m.subject)}</div></td>
+  <td class="body"><div class="msgbody">${esc(m.body)}</div></td>
+  <td><span class="rstatus ${messageStatusClass(m.status)}" id="mst-${id}">${esc(
+    m.status
+  )}</span></td>
+  <td class="decide">
+    <div class="outcome" id="mo-${id}"${
+      replied ? "" : ' style="display:none"'
+    }>${replied}</div>
+    <div id="mc-${id}"${closed ? ' style="display:none"' : ""}>
+      <div class="rowact2"><textarea class="reply" maxlength="${REPLY_MAX}" placeholder="Write a reply" aria-label="Reply to ${esc(
+        m.email
+      )}"></textarea></div>
+      <div class="rowact"><button class="savebtn" onclick="lmReply('${id}',this)">Send reply</button><button class="minibtn" onclick="lmCloseMsg('${id}',this)">Close</button><span class="flag" id="mf-${id}"></span></div>
+    </div>
+  </td>
+</tr>`;
+}
+
+function renderInbox(d, demo = false) {
+  const pending = d.pendingRequests + d.openMessages;
+
+  const intro = `<div class="inboxnote">Requests waiting on you sort to the top. Approving one adds the tokens you enter to that customer's monthly allotment straight away, exactly like the <b>Add</b> button on the overview, and records what you charged. Extra tokens are priced at ${usd4(
+    d.rate
+  )} each (${centsPerToken(
+    d.rate
+  )} per token), which is above every plan rate on purpose, so a customer asking for a third top-up is a customer who should be upgrading.</div>`;
+
+  const requestsTable = d.requests.length
+    ? `<div class="tblwrap"><table class="inboxtbl">
+<thead><tr>
+  <th>Requester</th><th>Plan and usage</th><th class="n">Tokens requested</th>
+  <th>Their note</th><th>Status</th><th>Decision</th>
+</tr></thead>
+<tbody>${d.requests.map(requestRow).join("\n")}</tbody></table></div>`
+    : `<div class="empty">No token requests yet. They appear here as soon as a customer asks for more.</div>`;
+
+  const messagesTable = d.messages.length
+    ? `<div class="tblwrap"><table class="msgtbl">
+<thead><tr>
+  <th>From</th><th>Subject</th><th>Message</th><th>Status</th><th>Reply</th>
+</tr></thead>
+<tbody>${d.messages.map(messageRow).join("\n")}</tbody></table></div>`
+    : `<div class="empty">No support messages yet. Anything a customer sends lands here.</div>`;
+
+  const script = `<script>
+var LM_INBOX_PENDING=${pending};
+function lmNum(n){return Number(n||0).toLocaleString('en-US')}
+function lmUsd(n){return '$'+Number(n||0).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2})}
+function lmEsc(s){var d=document.createElement('div');d.textContent=(s==null?'':String(s));return d.innerHTML}
+function lmFlagAt(elId,cls,txt,hold){
+  var f=document.getElementById(elId); if(!f)return;
+  f.className='flag'+(cls?' '+cls:''); f.textContent=txt||'';
+  if(txt&&cls==='ok'&&!hold)setTimeout(function(){if(f.textContent===txt){f.textContent='';f.className='flag'}},2500);
+}
+function lmSetStatus(elId,txt,cls){
+  var s=document.getElementById(elId); if(!s)return;
+  s.className='rstatus'+(cls?' '+cls:''); s.textContent=txt;
+}
+// Keeps the Inbox tab badge honest without a reload: one less piece of work waiting.
+function lmBadge(delta){
+  LM_INBOX_PENDING=Math.max(0,LM_INBOX_PENDING+delta);
+  var b=document.getElementById('lm-inbox-badge'); if(!b)return;
+  if(!LM_INBOX_PENDING){b.style.display='none';b.textContent='';b.title='';return}
+  b.style.display=''; b.textContent=LM_INBOX_PENDING>99?'99+':String(LM_INBOX_PENDING);
+  b.title=LM_INBOX_PENDING+' waiting in the inbox';
+}
+async function lmPost(url,body){
+  var r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});
+  var j=null; try{j=await r.json()}catch(e){}
+  return j||{ok:false,error:'HTTP '+r.status};
+}
+// Mirrors requestOutcome() on the server, so a repainted row matches a reloaded one.
+function lmReqOutcome(status,tokens,price,note,when){
+  var head=status==='approved'
+    ?'<b>Approved<\\/b>, granted '+lmNum(tokens)+' tokens for '+lmUsd(price)
+    :'<b>Declined<\\/b>, nothing granted';
+  return '<div class="outcome">'+head+(note?'<br>Note: '+lmEsc(note):'')+'<br>'+lmEsc(when||'')+'<\\/div>';
+}
+async function lmDecide(id,btn,path,status){
+  var row=document.getElementById('rq-'+id), cell=document.getElementById('rd-'+id);
+  if(!row||!cell)return;
+  var body={note:(cell.querySelector('input.gnote')||{value:''}).value};
+  if(status==='approved'){
+    var tok=parseInt((cell.querySelector('input.gtok')||{value:''}).value,10);
+    var usd=parseFloat((cell.querySelector('input.gusd')||{value:''}).value);
+    if(!isFinite(tok)||tok<1){lmFlagAt('rf-'+id,'err','Enter how many tokens to grant.',true);return}
+    if(!isFinite(usd)||usd<0){lmFlagAt('rf-'+id,'err','Enter the price to charge, 0 or more.',true);return}
+    body.tokens=tok; body.priceUsd=usd;
+  }
+  btn.disabled=true; lmFlagAt('rf-'+id,'','');
+  try{
+    var j=await lmPost('/admin/api/request/'+encodeURIComponent(id)+'/'+path,body);
+    if(j&&j.ok){
+      cell.innerHTML=lmReqOutcome(status,j.tokens,j.priceUsd,j.note,j.decidedAtText);
+      lmSetStatus('rs-'+id,status,status==='approved'?'yes':'');
+      row.className='done'; lmBadge(-1);
+    }else{lmFlagAt('rf-'+id,'err',(j&&j.error)?j.error:'Could not save that.',true); btn.disabled=false}
+  }catch(e){lmFlagAt('rf-'+id,'err','Could not save that.',true); btn.disabled=false}
+}
+function lmApprove(id,btn){return lmDecide(id,btn,'approve','approved')}
+function lmDecline(id,btn){return lmDecide(id,btn,'decline','declined')}
+async function lmReply(id,btn){
+  var row=document.getElementById('ms-'+id), box=document.getElementById('mc-'+id);
+  if(!row||!box)return;
+  var ta=box.querySelector('textarea.reply');
+  var txt=ta?String(ta.value||'').trim():'';
+  if(!txt){lmFlagAt('mf-'+id,'err','Write a reply before sending it.',true); if(ta)ta.focus(); return}
+  btn.disabled=true; lmFlagAt('mf-'+id,'','');
+  try{
+    var j=await lmPost('/admin/api/support/'+encodeURIComponent(id)+'/reply',{reply:txt});
+    if(j&&j.ok){
+      var was=row.className!=='done';
+      var out=document.getElementById('mo-'+id);
+      if(out){out.style.display=''; out.innerHTML='<b>Replied<\\/b> '+lmEsc(j.repliedAtText||'')+'<br>'+lmEsc(j.reply||txt)}
+      lmSetStatus('mst-'+id,'answered','yes'); row.className='done';
+      if(ta)ta.value='';
+      if(was)lmBadge(-1);
+      lmFlagAt('mf-'+id,'ok','Sent');
+    }else lmFlagAt('mf-'+id,'err',(j&&j.error)?j.error:'Could not send that.',true);
+  }catch(e){lmFlagAt('mf-'+id,'err','Could not send that.',true)}
+  btn.disabled=false;
+}
+async function lmCloseMsg(id,btn){
+  var row=document.getElementById('ms-'+id), box=document.getElementById('mc-'+id);
+  if(!row||!box)return;
+  btn.disabled=true; lmFlagAt('mf-'+id,'','');
+  try{
+    var j=await lmPost('/admin/api/support/'+encodeURIComponent(id)+'/close',{});
+    if(j&&j.ok){
+      var was=row.className!=='done';
+      lmSetStatus('mst-'+id,'closed',''); row.className='done'; box.style.display='none';
+      if(was)lmBadge(-1);
+    }else{lmFlagAt('mf-'+id,'err',(j&&j.error)?j.error:'Could not close that.',true); btn.disabled=false}
+  }catch(e){lmFlagAt('mf-'+id,'err','Could not close that.',true); btn.disabled=false}
+}
+</script>`;
+
+  const body =
+    intro +
+    `<div class="sectionhead">Token requests${
+      d.pendingRequests ? ` (${num(d.pendingRequests)} pending)` : ""
+    }</div>` +
+    requestsTable +
+    `<div class="sectionhead pricehead">Support messages${
+      d.openMessages ? ` (${num(d.openMessages)} open)` : ""
+    }</div>` +
+    messagesTable;
+
+  return page(
+    body,
+    script,
+    demo,
+    "inbox",
+    "Token requests and support messages waiting on you",
+    pending
   );
 }
 
@@ -1074,6 +1618,76 @@ function mutableId(req, res) {
   return id;
 }
 
+// Same guard for the inbox rows, whose primary key may be a uuid or a bigint
+// depending on how the table was created, so both shapes are accepted.
+function inboxRowId(req, res, what) {
+  if (dataProvider() !== "supabase") {
+    res.status(400).json({ ok: false, error: "Admin edits need Supabase mode." });
+    return null;
+  }
+  const id = String(req.params.id || "").trim();
+  if (!UUID_RE.test(id) && !/^[0-9]{1,19}$/.test(id)) {
+    res.status(400).json({ ok: false, error: `Invalid ${what} id.` });
+    return null;
+  }
+  return id;
+}
+
+// A top-up has to be a whole number of tokens inside the bounds. Returns the
+// number, or null when it is unusable. Shared by the Add button and an approval so
+// the two can never drift apart.
+function topupTokens(raw) {
+  const n = typeof raw === "number" ? raw : Number(String(raw ?? "").trim());
+  if (!Number.isFinite(n) || !Number.isInteger(n) || n < TOPUP_MIN || n > TOPUP_MAX) return null;
+  return n;
+}
+
+// THE top-up rule, in one place: add N tokens to a user's monthly allotment,
+// refusing to go past the column ceiling. Works from a 0 allotment (no plan yet,
+// account blocked): the top-up simply becomes the allotment and unblocks them.
+// Returns {ok:true, previous, allotment, profile} or {ok:false, status, error}.
+async function addAllotment(sb, id, n) {
+  const cur = await sb
+    .from("profiles")
+    .select("id,email,tier,monthly_token_allotment")
+    .eq("id", id)
+    .maybeSingle();
+  if (cur.error) return { ok: false, status: 500, error: cur.error.message };
+  if (!cur.data) return { ok: false, status: 404, error: "User not found." };
+
+  const current = Number(cur.data.monthly_token_allotment ?? 0);
+  const next = current + n;
+  if (next > ALLOTMENT_MAX) {
+    return {
+      ok: false,
+      status: 400,
+      error: `That would push the allotment past ${num(ALLOTMENT_MAX)}.`,
+    };
+  }
+
+  const { data, error } = await sb
+    .from("profiles")
+    .update({ monthly_token_allotment: next })
+    .eq("id", id)
+    .select("id,tier,monthly_token_allotment");
+  if (error) return { ok: false, status: 500, error: error.message };
+  if (!data || !data.length) return { ok: false, status: 404, error: "User not found." };
+  return { ok: true, previous: current, allotment: next, profile: data[0] };
+}
+
+// Why a conditional claim came back empty: the row is gone, or somebody already
+// decided it. Used to turn a lost race into one clear sentence for the operator.
+async function decidedAlreadyMessage(sb, id) {
+  try {
+    const r = await sb.from("token_requests").select("status").eq("id", id).maybeSingle();
+    const st = r && r.data ? String(r.data.status || "").toLowerCase() : "";
+    if (!st) return "That request no longer exists. Nothing was granted.";
+    return `That request is already ${st}, so it was left alone. Nothing was granted.`;
+  } catch {
+    return "That request is no longer pending. Nothing was granted.";
+  }
+}
+
 adminRouter.get("/admin", requireUser, requireAdmin, async (req, res) => {
   if (dataProvider() !== "supabase") {
     return res.send(
@@ -1090,12 +1704,14 @@ adminRouter.get("/admin", requireUser, requireAdmin, async (req, res) => {
     );
   }
   try {
-    // The spend lookup is a third-party call — never let it fail the page.
-    const [data, spend] = await Promise.all([
+    // The spend lookup is a third-party call: never let it fail the page. The
+    // inbox count is best-effort for the same reason and resolves to 0 on trouble.
+    const [data, spend, pending] = await Promise.all([
       loadOverview(),
       apifySpend().catch(() => null),
+      pendingInboxCount(),
     ]);
-    res.send(renderOverview(data, spend, !!req.isDemo, req.userEmail || ""));
+    res.send(renderOverview(data, spend, !!req.isDemo, req.userEmail || "", pending));
   } catch (e) {
     res
       .status(500)
@@ -1131,8 +1747,8 @@ adminRouter.get("/admin/analytics", requireUser, requireAdmin, async (req, res) 
     );
   }
   try {
-    const data = await loadAnalytics();
-    res.send(renderAnalytics(data, !!req.isDemo));
+    const [data, pending] = await Promise.all([loadAnalytics(), pendingInboxCount()]);
+    res.send(renderAnalytics(data, !!req.isDemo, pending));
   } catch (e) {
     res
       .status(500)
@@ -1153,9 +1769,10 @@ adminRouter.get("/admin/analytics", requireUser, requireAdmin, async (req, res) 
 // Unit economics. Guarded exactly like the other admin pages, but deliberately NOT
 // gated on supabase mode: it reads no user data, only the env constants, so it is
 // just as useful against a local sqlite instance.
-adminRouter.get("/admin/pricing", requireUser, requireAdmin, (req, res) => {
+adminRouter.get("/admin/pricing", requireUser, requireAdmin, async (req, res) => {
   try {
-    res.send(renderPricing(pricingModel(), !!req.isDemo));
+    const pending = await pendingInboxCount();
+    res.send(renderPricing(pricingModel(), !!req.isDemo, pending));
   } catch (e) {
     res
       .status(500)
@@ -1170,6 +1787,45 @@ adminRouter.get("/admin/pricing", requireUser, requireAdmin, (req, res) => {
           "",
           !!req.isDemo,
           "pricing"
+        )
+      );
+  }
+});
+
+// The operator inbox: token requests and support messages. Same guard chain and
+// same supabase-mode gate as the overview, since both sections are cross-user data.
+adminRouter.get("/admin/inbox", requireUser, requireAdmin, async (req, res) => {
+  if (dataProvider() !== "supabase") {
+    return res.send(
+      page(
+        noticeCard(
+          "The inbox needs Supabase mode",
+          "This app is running on local SQLite, which is single-user, so there is nobody to be asking for tokens or writing in for help. " +
+            "Set <code>DATA_PROVIDER=supabase</code> in <code>.env</code> (with the project URL and service-role key) and restart to work the queue here."
+        ),
+        "",
+        false,
+        "inbox",
+        "Token requests and support messages waiting on you"
+      )
+    );
+  }
+  try {
+    const data = await loadInbox();
+    res.send(renderInbox(data, !!req.isDemo));
+  } catch (e) {
+    res
+      .status(500)
+      .send(
+        page(
+          noticeCard(
+            "Could not load the inbox",
+            `Supabase returned an error: <code>${esc(e && e.message ? e.message : String(e))}</code>`
+          ),
+          "",
+          !!req.isDemo,
+          "inbox",
+          "Token requests and support messages waiting on you"
         )
       );
   }
@@ -1244,9 +1900,8 @@ adminRouter.post(
     const id = mutableId(req, res);
     if (!id) return;
 
-    const raw = (req.body || {}).tokens;
-    const n = typeof raw === "number" ? raw : Number(String(raw ?? "").trim());
-    if (!Number.isFinite(n) || !Number.isInteger(n) || n < TOPUP_MIN || n > TOPUP_MAX) {
+    const n = topupTokens((req.body || {}).tokens);
+    if (n === null) {
       return res.status(400).json({
         ok: false,
         error: `Tokens to add must be a whole number between ${num(TOPUP_MIN)} and ${num(TOPUP_MAX)}.`,
@@ -1255,32 +1910,15 @@ adminRouter.post(
 
     try {
       const sb = await getSupabase();
-      const cur = await sb
-        .from("profiles")
-        .select("id,email,tier,monthly_token_allotment")
-        .eq("id", id)
-        .maybeSingle();
-      if (cur.error) return res.status(500).json({ ok: false, error: cur.error.message });
-      if (!cur.data) return res.status(404).json({ ok: false, error: "User not found." });
-
-      // 0 = no plan yet (blocked). A top-up from 0 simply becomes the allotment,
-      // which unblocks the account without forcing a plan pick first.
-      const current = Number(cur.data.monthly_token_allotment ?? 0);
-      const next = current + n;
-      if (next > ALLOTMENT_MAX) {
-        return res
-          .status(400)
-          .json({ ok: false, error: `That would push the allotment past ${num(ALLOTMENT_MAX)}.` });
-      }
-
-      const { data, error } = await sb
-        .from("profiles")
-        .update({ monthly_token_allotment: next })
-        .eq("id", id)
-        .select("id,tier,monthly_token_allotment");
-      if (error) return res.status(500).json({ ok: false, error: error.message });
-      if (!data || !data.length) return res.status(404).json({ ok: false, error: "User not found." });
-      res.json({ ok: true, added: n, previous: current, allotment: next, profile: data[0] });
+      const r = await addAllotment(sb, id, n);
+      if (!r.ok) return res.status(r.status).json({ ok: false, error: r.error });
+      res.json({
+        ok: true,
+        added: n,
+        previous: r.previous,
+        allotment: r.allotment,
+        profile: r.profile,
+      });
     } catch (e) {
       res.status(500).json({ ok: false, error: e && e.message ? e.message : "Top-up failed." });
     }
@@ -1315,6 +1953,225 @@ adminRouter.post(
       res.json({ ok: true, deleted: (data || []).length, since });
     } catch (e) {
       res.status(500).json({ ok: false, error: e && e.message ? e.message : "Reset failed." });
+    }
+  }
+);
+
+// ── inbox routes ─────────────────────────────────────────────────────────────
+
+// Approve a token request: hand over the tokens the operator entered and record
+// what was charged for them.
+//
+// Double-click safety. The status flip happens FIRST, as an update filtered on
+// `status = 'pending'`. PostgREST returns the rows it actually changed, so exactly
+// one caller can ever see a row come back: the loser gets an empty result, is told
+// the request is already decided, and grants nothing. Only the winner goes on to
+// touch the allotment. If that grant then fails the row is put back to pending, so
+// a request is never left marked approved with nothing handed over.
+adminRouter.post(
+  "/admin/api/request/:id/approve",
+  requireUser,
+  requireAdmin,
+  express.json(),
+  async (req, res) => {
+    const id = inboxRowId(req, res, "request");
+    if (!id) return;
+
+    const body = req.body || {};
+    const tokens = topupTokens(body.tokens);
+    if (tokens === null) {
+      return res.status(400).json({
+        ok: false,
+        error: `Tokens to grant must be a whole number between ${num(TOPUP_MIN)} and ${num(
+          TOPUP_MAX
+        )}.`,
+      });
+    }
+
+    const rawPrice = body.priceUsd;
+    const price = typeof rawPrice === "number" ? rawPrice : Number(String(rawPrice ?? "").trim());
+    if (!Number.isFinite(price) || price < 0) {
+      return res.status(400).json({ ok: false, error: "Price charged must be zero or more." });
+    }
+    if (price > PRICE_MAX) {
+      return res
+        .status(400)
+        .json({ ok: false, error: `Price charged must be ${usd2(PRICE_MAX)} or less.` });
+    }
+    const priceUsd = Math.round(price * 100) / 100;
+    const note = cleanText(body.note, NOTE_MAX);
+
+    try {
+      const sb = await getSupabase();
+      const decidedAt = new Date().toISOString();
+
+      const claim = await sb
+        .from("token_requests")
+        .update({
+          status: "approved",
+          tokens_granted: tokens,
+          price_usd: priceUsd,
+          admin_note: note || null,
+          decided_at: decidedAt,
+        })
+        .eq("id", id)
+        .eq("status", "pending")
+        .select("id,user_id,status,tokens_requested,tokens_granted,price_usd,decided_at");
+      if (claim.error) return res.status(500).json({ ok: false, error: claim.error.message });
+
+      const row = (claim.data || [])[0];
+      if (!row) {
+        return res.status(409).json({ ok: false, error: await decidedAlreadyMessage(sb, id) });
+      }
+
+      const grant = await addAllotment(sb, String(row.user_id || ""), tokens);
+      if (!grant.ok) {
+        await sb
+          .from("token_requests")
+          .update({
+            status: "pending",
+            tokens_granted: null,
+            price_usd: null,
+            admin_note: null,
+            decided_at: null,
+          })
+          .eq("id", id);
+        return res
+          .status(grant.status)
+          .json({ ok: false, error: `${grant.error} Nothing was granted, the request is still pending.` });
+      }
+
+      res.json({
+        ok: true,
+        id: row.id,
+        userId: String(row.user_id || ""),
+        status: "approved",
+        tokens,
+        priceUsd,
+        note,
+        decidedAt,
+        decidedAtText: fmtWhen(decidedAt),
+        previous: grant.previous,
+        allotment: grant.allotment,
+      });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: e && e.message ? e.message : "Approve failed." });
+    }
+  }
+);
+
+// Decline a token request. Same conditional claim, so a second click is refused
+// the same way, and nothing is ever added to anyone's allotment.
+adminRouter.post(
+  "/admin/api/request/:id/decline",
+  requireUser,
+  requireAdmin,
+  express.json(),
+  async (req, res) => {
+    const id = inboxRowId(req, res, "request");
+    if (!id) return;
+
+    const note = cleanText((req.body || {}).note, NOTE_MAX);
+
+    try {
+      const sb = await getSupabase();
+      const decidedAt = new Date().toISOString();
+
+      const claim = await sb
+        .from("token_requests")
+        .update({ status: "declined", admin_note: note || null, decided_at: decidedAt })
+        .eq("id", id)
+        .eq("status", "pending")
+        .select("id,user_id,status,decided_at");
+      if (claim.error) return res.status(500).json({ ok: false, error: claim.error.message });
+
+      const row = (claim.data || [])[0];
+      if (!row) {
+        return res.status(409).json({ ok: false, error: await decidedAlreadyMessage(sb, id) });
+      }
+
+      res.json({
+        ok: true,
+        id: row.id,
+        userId: String(row.user_id || ""),
+        status: "declined",
+        note,
+        decidedAt,
+        decidedAtText: fmtWhen(decidedAt),
+      });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: e && e.message ? e.message : "Decline failed." });
+    }
+  }
+);
+
+// Answer a support message. Replying to an already answered thread is allowed
+// (the operator is following up); the newest reply is the one stored.
+adminRouter.post(
+  "/admin/api/support/:id/reply",
+  requireUser,
+  requireAdmin,
+  express.json(),
+  async (req, res) => {
+    const id = inboxRowId(req, res, "message");
+    if (!id) return;
+
+    const reply = cleanText((req.body || {}).reply, REPLY_MAX);
+    if (!reply) {
+      return res.status(400).json({ ok: false, error: "Write a reply before sending it." });
+    }
+
+    try {
+      const sb = await getSupabase();
+      const repliedAt = new Date().toISOString();
+      const { data, error } = await sb
+        .from("support_messages")
+        .update({ admin_reply: reply, replied_at: repliedAt, status: "answered" })
+        .eq("id", id)
+        .select("id,user_id,status,admin_reply,replied_at");
+      if (error) return res.status(500).json({ ok: false, error: error.message });
+      if (!data || !data.length) {
+        return res.status(404).json({ ok: false, error: "That message no longer exists." });
+      }
+
+      res.json({
+        ok: true,
+        id: data[0].id,
+        status: "answered",
+        reply,
+        repliedAt,
+        repliedAtText: fmtWhen(repliedAt),
+      });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: e && e.message ? e.message : "Reply failed." });
+    }
+  }
+);
+
+// Close a support message: done with, whether or not it was answered.
+adminRouter.post(
+  "/admin/api/support/:id/close",
+  requireUser,
+  requireAdmin,
+  express.json(),
+  async (req, res) => {
+    const id = inboxRowId(req, res, "message");
+    if (!id) return;
+
+    try {
+      const sb = await getSupabase();
+      const { data, error } = await sb
+        .from("support_messages")
+        .update({ status: "closed" })
+        .eq("id", id)
+        .select("id,user_id,status");
+      if (error) return res.status(500).json({ ok: false, error: error.message });
+      if (!data || !data.length) {
+        return res.status(404).json({ ok: false, error: "That message no longer exists." });
+      }
+      res.json({ ok: true, id: data[0].id, status: "closed" });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: e && e.message ? e.message : "Close failed." });
     }
   }
 );

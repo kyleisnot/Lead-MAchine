@@ -556,4 +556,148 @@ export function removeWin(id) {
   db.prepare(`DELETE FROM wins WHERE id=?`).run(id);
 }
 
+// ── Account settings (mirrors the Supabase `profiles` table) ──────────────────
+// SQLite is single-user dev, so there is normally exactly one row here, keyed 'local'.
+// The base columns match Postgres so the same store code runs against either. tier and
+// monthly_token_allotment are stored for shape parity only: store.getProfile() still
+// answers those two from the environment on the SQLite path, exactly as it always has.
+db.exec(`CREATE TABLE IF NOT EXISTS profiles (
+  id                      TEXT PRIMARY KEY,
+  email                   TEXT,
+  tier                    TEXT NOT NULL DEFAULT 'local',
+  monthly_token_allotment INTEGER NOT NULL DEFAULT 0,
+  created_at              TEXT NOT NULL DEFAULT (datetime('now'))
+)`);
+
+// Guarded column adds, the same PRAGMA probe the leads table uses at the top of this file,
+// so a database created by an older build picks the account fields up on the next boot.
+{
+  const pcols = new Set(db.prepare(`PRAGMA table_info(profiles)`).all().map((c) => c.name));
+  const addProfileCol = (name, def) => {
+    if (!pcols.has(name)) db.exec(`ALTER TABLE profiles ADD COLUMN ${name} ${def}`);
+  };
+  addProfileCol("full_name", "TEXT");
+  addProfileCol("agency_name", "TEXT");
+  addProfileCol("phone", "TEXT");
+  addProfileCol("default_city", "TEXT");
+  addProfileCol("default_state", "TEXT");
+  addProfileCol("default_niche", "TEXT");
+  addProfileCol("onboarding_dismissed", "INTEGER NOT NULL DEFAULT 0");
+}
+
+// The one local user. A userId still comes in from the store (it is "local" in dev), and is
+// used as the key so a stray id can never read another row's settings.
+const LOCAL_USER = "local";
+const profileKey = (userId) => String(userId || LOCAL_USER);
+
+// The settings columns updateProfileRow() is allowed to write. Anything else is dropped
+// before it reaches SQL, so the column list below is the only thing ever interpolated.
+const PROFILE_SETTING_COLS = [
+  "full_name",
+  "agency_name",
+  "phone",
+  "default_city",
+  "default_state",
+  "default_niche",
+];
+const PROFILE_READ_COLS = [...PROFILE_SETTING_COLS, "onboarding_dismissed"].join(", ");
+
+function ensureProfile(id) {
+  db.prepare(`INSERT OR IGNORE INTO profiles (id) VALUES (?)`).run(id);
+}
+
+// The settings row, or null when this user has never saved anything.
+export function getProfileRow(userId) {
+  return db.prepare(`SELECT ${PROFILE_READ_COLS} FROM profiles WHERE id=?`).get(profileKey(userId)) || null;
+}
+
+// patch keys are snake_case column names; values are already trimmed/nulled by the store.
+export function updateProfileRow(userId, patch = {}) {
+  const id = profileKey(userId);
+  const cols = PROFILE_SETTING_COLS.filter((c) => Object.prototype.hasOwnProperty.call(patch, c));
+  ensureProfile(id);
+  if (cols.length) {
+    db.prepare(`UPDATE profiles SET ${cols.map((c) => `${c}=?`).join(", ")} WHERE id=?`).run(
+      ...cols.map((c) => patch[c]),
+      id
+    );
+  }
+  return getProfileRow(userId);
+}
+
+export function setOnboardingDismissed(userId, dismissed = true) {
+  const id = profileKey(userId);
+  ensureProfile(id);
+  db.prepare(`UPDATE profiles SET onboarding_dismissed=? WHERE id=?`).run(dismissed ? 1 : 0, id);
+  return getProfileRow(userId);
+}
+
+// ── Support messages (mirrors the Supabase `support_messages` table) ──────────
+// A user writes in; the operator answers from the admin panel (admin_reply/replied_at).
+db.exec(`CREATE TABLE IF NOT EXISTS support_messages (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id     TEXT NOT NULL DEFAULT 'local',
+  subject     TEXT NOT NULL,
+  body        TEXT NOT NULL,
+  status      TEXT NOT NULL DEFAULT 'open',   -- open | answered | closed
+  created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+  admin_reply TEXT,
+  replied_at  TEXT
+)`);
+db.exec(`CREATE INDEX IF NOT EXISTS support_messages_user_idx   ON support_messages (user_id, created_at DESC)`);
+db.exec(`CREATE INDEX IF NOT EXISTS support_messages_status_idx ON support_messages (status)`);
+
+// subject/body arrive already trimmed and non-empty (the store validates).
+export function createSupportMessage(userId, { subject, body } = {}) {
+  const info = db
+    .prepare(`INSERT INTO support_messages (user_id, subject, body) VALUES (?,?,?)`)
+    .run(profileKey(userId), subject, body);
+  return info.lastInsertRowid;
+}
+
+// Newest first. created_at only has second resolution here, so id breaks ties.
+export function listSupportMessages(userId) {
+  return db
+    .prepare(
+      `SELECT id, subject, body, status, created_at, admin_reply, replied_at
+       FROM support_messages WHERE user_id=? ORDER BY created_at DESC, id DESC`
+    )
+    .all(profileKey(userId));
+}
+
+// ── Token requests (mirrors the Supabase `token_requests` table) ──────────────
+// "I need more tokens" from the user; the operator approves/declines and records what
+// was actually granted and charged.
+db.exec(`CREATE TABLE IF NOT EXISTS token_requests (
+  id               INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id          TEXT NOT NULL DEFAULT 'local',
+  tokens_requested INTEGER NOT NULL,
+  note             TEXT NOT NULL DEFAULT '',
+  status           TEXT NOT NULL DEFAULT 'pending',  -- pending | approved | declined
+  created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+  decided_at       TEXT,
+  tokens_granted   INTEGER,
+  price_usd        REAL,
+  admin_note       TEXT
+)`);
+db.exec(`CREATE INDEX IF NOT EXISTS token_requests_user_idx   ON token_requests (user_id, created_at DESC)`);
+db.exec(`CREATE INDEX IF NOT EXISTS token_requests_status_idx ON token_requests (status)`);
+
+// tokens arrives already validated as a positive integer (the store validates).
+export function createTokenRequest(userId, { tokens, note } = {}) {
+  const info = db
+    .prepare(`INSERT INTO token_requests (user_id, tokens_requested, note) VALUES (?,?,?)`)
+    .run(profileKey(userId), tokens, note || "");
+  return info.lastInsertRowid;
+}
+
+export function listTokenRequests(userId) {
+  return db
+    .prepare(
+      `SELECT id, tokens_requested, note, status, created_at, decided_at, tokens_granted, price_usd, admin_note
+       FROM token_requests WHERE user_id=? ORDER BY created_at DESC, id DESC`
+    )
+    .all(profileKey(userId));
+}
+
 export default db;

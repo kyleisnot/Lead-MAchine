@@ -36,24 +36,112 @@ export function icon(key, size = 18) {
   if (key === "warning") return s + '<path d="M10.3 3.9L1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"></path><path d="M12 9v4M12 17h.01"></path></svg>';
   if (key === "check") return s + '<path d="M20 6L9 17l-5-5"></path></svg>';
   if (key === "arrow-right") return s + '<path d="M5 12h14M12 5l7 7-7 7"></path></svg>';
+  // The account cluster's marks (see accountCluster below). Additive: every key here was
+  // previously an empty svg, so nothing that already calls icon() changes.
+  if (key === "user") return s + '<circle cx="12" cy="8" r="3.6"></circle><path d="M4.6 20a7.6 7.6 0 0 1 14.8 0"></path></svg>';
+  if (key === "tokens") return s + '<circle cx="12" cy="12" r="9"></circle><path d="M12 7.5v9M14.6 9.6a3 3 0 0 0-2.6-1.1c-1.4 0-2.5.8-2.5 1.9 0 2.5 5.2 1.3 5.2 3.9 0 1.1-1.1 1.9-2.6 1.9a3 3 0 0 1-2.7-1.2"></path></svg>';
+  if (key === "settings") return s + '<circle cx="12" cy="12" r="3"></circle><path d="M19.3 14.5a1.6 1.6 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.6 1.6 0 0 0-1.8-.3 1.6 1.6 0 0 0-1 1.5V21a2 2 0 0 1-4 0v-.2a1.6 1.6 0 0 0-1-1.4 1.6 1.6 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.6 1.6 0 0 0 .3-1.8 1.6 1.6 0 0 0-1.5-1H3a2 2 0 0 1 0-4h.2a1.6 1.6 0 0 0 1.4-1 1.6 1.6 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.6 1.6 0 0 0 1.8.3H9a1.6 1.6 0 0 0 1-1.5V3a2 2 0 0 1 4 0v.2a1.6 1.6 0 0 0 1 1.4 1.6 1.6 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.6 1.6 0 0 0-.3 1.8V9a1.6 1.6 0 0 0 1.5 1H21a2 2 0 0 1 0 4h-.2a1.6 1.6 0 0 0-1.5 1z"></path></svg>';
+  if (key === "help") return s + '<circle cx="12" cy="12" r="9"></circle><path d="M9.6 9.4a2.5 2.5 0 0 1 4.9.6c0 1.7-2.5 2.5-2.5 2.5"></path><path d="M12 17h.01"></path></svg>';
+  if (key === "signout") return s + '<path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"></path><path d="M16 17l5-5-5-5M21 12H9"></path></svg>';
   return s + "</svg>";
+}
+
+// ── the top-right account cluster ───────────────────────────────────────────
+// Rendered by sidebar() so it exists on every page, then moved next to the token
+// meter (into the page's .pagehead) by the tail script below. The identity, plan and
+// token lines fill in from /api/account/me and /api/usage, because sidebar() is called
+// with the page's nav state only and never sees who is signed in.
+export function accountCluster() {
+  const item = (href, key, label, id = "") =>
+    `<a class="acct-item"${id ? ` id="${id}"` : ""} href="${href}"><span class="ai">${icon(key, 16)}</span><span>${label}</span></a>`;
+  return `<div class="acctdock" id="lmAcctDock"><div class="acctwrap" id="lmAcctWrap">
+  <button class="acctbtn" id="lmAcctBtn" type="button" aria-expanded="false" aria-controls="lmAcctMenu" aria-label="Account menu"><span class="acctav" id="lmAcctAv">${icon("user", 18)}</span></button>
+  <div class="acctmenu" id="lmAcctMenu" aria-labelledby="lmAcctBtn" hidden>
+    <div class="acct-id"><div class="acct-name" id="lmAcctName">Your account</div><div class="acct-email" id="lmAcctEmail"></div></div>
+    <div class="acct-plan"><span class="acct-plan-k" id="lmAcctTier">Your plan</span><span class="acct-plan-v" id="lmAcctPlanV">Loading your plan</span></div>
+    ${item("/account/tokens", "tokens", "Request more tokens", "lmAcctTokens")}
+    ${item("/account", "settings", "Settings")}
+    ${item("/account/help", "help", "Help and support")}
+    <button class="acct-item" id="lmAcctTheme" type="button" onclick="lmToggleTheme()"><span class="ai ti">${icon("sun", 16)}</span><span class="tl">Light mode</span></button>
+    <div class="acct-sep"></div>
+    <form class="acct-out" method="post" action="/logout"><button class="acct-item danger" type="submit"><span class="ai">${icon("signout", 16)}</span><span>Sign out</span></button></form>
+  </div>
+</div></div>`;
 }
 
 // Sets the theme on <html> BEFORE first paint (no flash). Stored choice wins;
 // otherwise follows the OS. Defaults to dark (the app's original identity).
 export const THEME_INIT_SCRIPT = `<script>(function(){try{var t=localStorage.getItem('lm-theme');if(t!=='light'&&t!=='dark'){t=(window.matchMedia&&matchMedia('(prefers-color-scheme: light)').matches)?'light':'dark';}document.documentElement.setAttribute('data-theme',t);}catch(e){document.documentElement.setAttribute('data-theme','dark');}})();</script>`;
 
-// Runs at end of <body>: syncs the theme toggle + keeps the header's token counter fresh
-// from /api/usage (which is per-user, so it shows THIS account's plan usage).
+// Runs at end of <body>: syncs the theme toggles + keeps the header's token counter fresh
+// from /api/usage (which is per-user, so it shows THIS account's plan usage), and drives
+// the top-right account menu.
 export const SHELL_TAIL_SCRIPT = `<script>
 var LM_ICON_SUN=${JSON.stringify(icon("sun", 16))},LM_ICON_MOON=${JSON.stringify(icon("moon", 16))};
-function lmSyncTheme(){var dark=document.documentElement.getAttribute('data-theme')!=='light';var b=document.getElementById('themeBtn');if(b){var ti=b.querySelector('.ti'),tl=b.querySelector('.tl');if(ti)ti.innerHTML=dark?LM_ICON_SUN:LM_ICON_MOON;if(tl)tl.textContent=dark?'Light mode':'Dark mode';}}
+// Two toggles now share one state: the sidebar's (#themeBtn) and the account menu's
+// mirror (#lmAcctTheme). Both carry a .ti icon slot and a .tl label, so one loop paints
+// them; the sidebar button behaves exactly as it did before.
+function lmSyncTheme(){var dark=document.documentElement.getAttribute('data-theme')!=='light';var ids=['themeBtn','lmAcctTheme'];for(var i=0;i<ids.length;i++){var b=document.getElementById(ids[i]);if(!b)continue;var ti=b.querySelector('.ti'),tl=b.querySelector('.tl');if(ti)ti.innerHTML=dark?LM_ICON_SUN:LM_ICON_MOON;if(tl)tl.textContent=dark?'Light mode':'Dark mode';}}
 function lmToggleTheme(){var light=document.documentElement.getAttribute('data-theme')==='light';var next=light?'dark':'light';document.documentElement.setAttribute('data-theme',next);try{localStorage.setItem('lm-theme',next);}catch(e){}lmSyncTheme();}
 lmSyncTheme();
+// ── account menu ──
+function lmAcctBtnEl(){return document.getElementById('lmAcctBtn');}
+function lmAcctIsOpen(){var b=lmAcctBtnEl();return !!b&&b.getAttribute('aria-expanded')==='true';}
+function lmAcctSet(open){var b=lmAcctBtnEl(),m=document.getElementById('lmAcctMenu');if(!b||!m)return;b.setAttribute('aria-expanded',open?'true':'false');if(open){m.removeAttribute('hidden');}else{m.setAttribute('hidden','');}}
+function lmAcctItems(){var m=document.getElementById('lmAcctMenu');return m?Array.prototype.slice.call(m.querySelectorAll('.acct-item')):[];}
+function lmAcctToggle(){var open=lmAcctIsOpen();lmAcctSet(!open);if(!open){var it=lmAcctItems();if(it.length)it[0].focus();}}
+function lmAcctClose(refocus){if(!lmAcctIsOpen())return;lmAcctSet(false);if(refocus){var b=lmAcctBtnEl();if(b)b.focus();}}
+(function(){
+  var dock=document.getElementById('lmAcctDock');if(!dock)return;
+  // The meter lives in the page's header row, so the avatar joins it there. Pages with no
+  // header row keep the dock where sidebar() put it, pinned to the top right of <main>.
+  var head=document.querySelector('.pagehead');if(head){head.appendChild(dock);dock.className='acctdock docked';}
+  var btn=document.getElementById('lmAcctBtn');if(btn)btn.addEventListener('click',function(e){e.preventDefault();lmAcctToggle();});
+  var menu=document.getElementById('lmAcctMenu');
+  if(menu)menu.addEventListener('keydown',function(e){
+    if(e.key!=='ArrowDown'&&e.key!=='ArrowUp')return;
+    var it=lmAcctItems();if(!it.length)return;e.preventDefault();
+    var i=it.indexOf(document.activeElement);var n=e.key==='ArrowDown'?i+1:i-1;
+    if(n<0)n=it.length-1;if(n>=it.length)n=0;it[n].focus();
+  });
+  document.addEventListener('click',function(e){var w=document.getElementById('lmAcctWrap');if(!w||!lmAcctIsOpen())return;if(!w.contains(e.target))lmAcctClose(false);});
+  document.addEventListener('keydown',function(e){if(e.key==='Escape')lmAcctClose(true);});
+  // Who is signed in. sidebar() never sees the user, so the name, email and plan label
+  // come from the account router; a missing route just leaves the fallbacks in place.
+  fetch('/api/account/me').then(function(r){return r.json();}).then(function(d){
+    if(!d||!d.ok)return;
+    var name=String(d.fullName||'').trim(),email=String(d.email||'').trim();
+    var ini=lmInitials(name,email);
+    var av=document.getElementById('lmAcctAv');if(av&&ini){av.textContent=ini;av.className='acctav ini';}
+    var n=document.getElementById('lmAcctName');if(n)n.textContent=name||email||'Your account';
+    var em=document.getElementById('lmAcctEmail');if(em)em.textContent=name?email:'';
+    var tr=document.getElementById('lmAcctTier');if(tr&&d.planLabel)tr.textContent=d.planLabel;
+  }).catch(function(){});
+})();
+// "Kyle Bennett" -> KB, "kyle" -> K, no name -> the email's first letter.
+function lmInitials(name,email){
+  var parts=String(name||'').split(' ');var out='';
+  for(var i=0;i<parts.length;i++){if(parts[i])out+=parts[i].charAt(0);}
+  if(out)return (out.length>2?out.charAt(0)+out.charAt(out.length-1):out).toUpperCase();
+  var e=String(email||'').trim();return e?e.charAt(0).toUpperCase():'';
+}
+// The menu's token line reads the same /api/usage payload the meter does, so the two can
+// never disagree. Low or empty makes "Request more tokens" the primary item.
+function lmPaintAcct(r){
+  var v=document.getElementById('lmAcctPlanV'),item=document.getElementById('lmAcctTokens');if(!v)return;
+  var low=false;
+  if(r.unassigned){v.textContent='No plan yet';low=true;}
+  else{var al=Number(r.allotment)||0,left=Number(r.planRemaining);
+    if(!isFinite(left))left=Math.max(0,al-(Number(r.tokens)||0));
+    v.textContent=left.toLocaleString()+' tokens left this month';
+    low=left<=0||(al>0&&left/al<=0.15);}
+  if(item)item.className=low?'acct-item primary':'acct-item';
+}
 (function(){async function u(){try{var r=await(await fetch('/api/usage')).json();if(!r.ok)return;var t=document.getElementById('sbTok'),s=document.getElementById('sbSearches'),w=document.getElementById('sbBarWrap'),bar=document.getElementById('sbBar');
 if(r.unassigned){if(t)t.textContent='No tokens yet';if(s)s.textContent='ask to activate your plan';if(w)w.style.display='none';}
 else if(Number(r.allotment)>0){if(t)t.textContent=(Number(r.tokens)||0).toLocaleString()+' / '+Number(r.allotment).toLocaleString();if(s)s.textContent='resets '+(r.resetsOn||'')+' · '+(r.searches||0)+' searches';if(w&&bar){var pct=Math.min(100,Math.round((Number(r.tokens)||0)/Number(r.allotment)*100));w.style.display='block';bar.style.width=pct+'%';w.className='tokbar'+(pct>=85?' warn':'');}}
-else{if(t)t.textContent=(Number(r.tokens)||0).toLocaleString()+' tokens';if(s)s.textContent=(r.searches||0)+' searches';if(w)w.style.display='none';}}catch(e){}}u();setInterval(u,30000);})();
+else{if(t)t.textContent=(Number(r.tokens)||0).toLocaleString()+' tokens';if(s)s.textContent=(r.searches||0)+' searches';if(w)w.style.display='none';}
+lmPaintAcct(r);}catch(e){}}u();setInterval(u,30000);})();
 </script>`;
 
 // Favicon: the wordmark's gem, inlined as SVG so there is no image file to keep in sync.
@@ -86,7 +174,7 @@ export function sidebar(active, { isAdmin = false, demo = false } = {}) {
   <div class="foot">
     <button class="themebtn" id="themeBtn" onclick="lmToggleTheme()" aria-label="Toggle light or dark mode"><span class="ti">${icon("sun", 16)}</span><span class="tl">Light mode</span></button>
   </div>
-</nav><main class="main">${demo ? DEMO_BANNER : ""}`;
+</nav><main class="main">${demo ? DEMO_BANNER : ""}${accountCluster()}`;
 }
 
 // All shared styling (both themes + layout + components). Appended to each page's
@@ -112,7 +200,7 @@ a{color:var(--accent)}
 .themebtn{display:flex;align-items:center;gap:8px;padding:8px 12px;border-radius:9px;border:1px solid var(--border-strong);background:var(--surface);color:var(--muted);font-weight:600;font-size:13px;cursor:pointer}
 .themebtn:hover{color:var(--text)}
 .themebtn .ti{display:inline-flex;align-items:center;color:currentColor}
-.main{flex:1;min-width:0;padding:24px 30px;max-width:1180px}
+.main{flex:1;min-width:0;padding:24px 30px;max-width:1180px;position:relative}
 .pagehead{display:flex;align-items:center;gap:14px;margin-bottom:20px}
 .pagehead h1{font-size:22px;font-weight:800;letter-spacing:.2px;color:var(--text)}
 .pagehead .spacer{flex:1}
@@ -238,6 +326,36 @@ input,select{padding:11px 13px}
 .demobar form{margin:0;display:flex}
 .demobar-btn{font-family:inherit;font-size:12px;font-weight:700;color:var(--warn);background:transparent;border:1px solid var(--warn);border-radius:7px;padding:5px 12px;cursor:pointer;white-space:nowrap}
 .demobar-btn:hover{background:var(--warn);color:var(--panel)}
+/* Account cluster: the avatar button + its dropdown, top right on every page.
+   The dock starts pinned to the top right of <main> and the tail script moves it into
+   the page header row next to the token meter, where one exists. */
+.acctdock{position:absolute;top:22px;right:30px;z-index:70}
+.acctdock.docked{position:static}
+.acctwrap{position:relative}
+.acctbtn{display:inline-flex;align-items:center;justify-content:center;width:36px;height:36px;padding:0;border-radius:50%;border:1px solid var(--border-strong);background:var(--surface);color:var(--muted);font-family:inherit;font-size:13px;font-weight:800;letter-spacing:.3px;line-height:1;cursor:pointer}
+.acctbtn:hover{border-color:var(--accent);color:var(--text)}
+.acctbtn[aria-expanded="true"]{border-color:var(--accent);background:var(--accent-weak);color:var(--accent-ink)}
+.acctbtn:focus-visible{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-weak)}
+.acctav{display:inline-flex;align-items:center;justify-content:center}
+.acctav.ini{font-size:13px;font-weight:800}
+.acctmenu{position:absolute;top:calc(100% + 9px);right:0;z-index:80;width:266px;background:var(--panel);border:1px solid var(--border-strong);border-radius:12px;padding:6px;box-shadow:0 14px 32px rgba(0,0,0,.22);text-align:left}
+.acctmenu[hidden]{display:none}
+.acct-id{padding:10px 11px 8px}
+.acct-name{font-size:13.5px;font-weight:700;color:var(--text);line-height:1.35;word-break:break-word}
+.acct-email{font-size:12px;color:var(--muted);margin-top:2px;word-break:break-all;line-height:1.35}
+.acct-plan{padding:0 11px 11px;margin-bottom:5px;border-bottom:1px solid var(--border)}
+.acct-plan-k{display:block;font-size:10px;text-transform:uppercase;letter-spacing:.5px;color:var(--faint);font-weight:700;margin-bottom:3px}
+.acct-plan-v{display:block;font-size:13px;font-weight:700;color:var(--text)}
+.acct-item{display:flex;align-items:center;gap:9px;width:100%;padding:9px 11px;border-radius:8px;border:1px solid transparent;background:transparent;color:var(--muted);font-family:inherit;font-size:13px;font-weight:600;text-align:left;text-decoration:none;cursor:pointer}
+.acct-item:hover{background:var(--surface2);color:var(--text)}
+.acct-item:focus-visible{outline:none;color:var(--text);border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-weak)}
+.acct-item .ai{display:inline-flex;align-items:center;color:currentColor;flex:none}
+.acct-item.primary{background:var(--accent-weak);color:var(--accent-ink);font-weight:700}
+.acct-item.primary:hover{background:var(--accent);color:var(--on-accent)}
+.acct-item.danger:hover{color:var(--danger)}
+.acct-sep{height:1px;background:var(--border);margin:5px 0}
+.acct-out{margin:0}
+@media(max-width:860px){.acctdock{top:16px;right:16px}}
 @media(max-width:860px){.side{width:60px;padding:14px 8px}.side .brand{justify-content:center;padding:6px 0}.side .bname{display:none}.navlink .lbl,.themebtn .tl{display:none}.themebtn{justify-content:center}.main{padding:18px 16px}}
 @media(max-width:700px){.row{grid-template-columns:1fr 1fr}.statbox{width:100%}}
 `;
