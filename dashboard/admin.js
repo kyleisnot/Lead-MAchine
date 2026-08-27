@@ -244,11 +244,11 @@ async function loadOverview() {
 
 // ── render ───────────────────────────────────────────────────────────────────
 
-// The admin console's tab bar. Three tabs — Overview (/admin, where the users table
-// lives too), Analytics (/admin/analytics) and Demo (/demo) — so Demo reads as part
-// of the console rather than a stray nav item. Exported: demo.js renders it too, so
-// the same bar sits above every console page. The `.tabs`/`.tab` colours come from
-// SHARED_CSS; page() (here) and demo.js each add the shared layout rules.
+// The admin console's tab bar. Four tabs — Overview (/admin, where the users table
+// lives too), Analytics (/admin/analytics), Pricing (/admin/pricing) and Demo (/demo) —
+// so Demo reads as part of the console rather than a stray nav item. Exported: demo.js
+// renders it too, so the same bar sits above every console page. The `.tabs`/`.tab`
+// colours come from SHARED_CSS; page() (here) and demo.js each add the shared layout rules.
 export function adminTabs(active) {
   const tab = (href, key, label) =>
     `<a class="tab${active === key ? " active" : ""}" href="${href}">${label}</a>`;
@@ -256,10 +256,12 @@ export function adminTabs(active) {
     "/admin/analytics",
     "analytics",
     "Analytics"
-  )}${tab("/demo", "demo", "Demo")}</div>`;
+  )}${tab("/admin/pricing", "pricing", "Pricing")}${tab("/demo", "demo", "Demo")}</div>`;
 }
 
-function page(body, extraScript = "", demo = false, active = null) {
+// `sub` overrides the page subtitle; the default is the operator overview's wording,
+// so Overview and Analytics render byte-for-byte as before.
+function page(body, extraScript = "", demo = false, active = null, sub = null) {
   return `<!doctype html><html><head>${THEME_INIT_SCRIPT}<meta charset="utf-8">${FAVICON}<title>Admin · Prospector</title>
 <style>
   *{box-sizing:border-box;margin:0;padding:0}
@@ -317,18 +319,38 @@ function page(body, extraScript = "", demo = false, active = null) {
   .notice code{background:var(--surface2);border:1px solid var(--border);border-radius:5px;padding:1px 6px;font-size:13px;color:var(--text)}
   .empty{color:var(--muted);font-size:15px;padding:26px 4px}
   .sectionhead{font-size:13px;text-transform:uppercase;letter-spacing:.5px;color:var(--muted);font-weight:700;margin:6px 0 12px}
+  /* Pricing tab. The flow diagram scrolls sideways rather than shrinking its
+     labels below legibility; every colour is a var so both themes work. */
+  .pricehead{margin-top:28px}
+  .flowwrap{overflow-x:auto;background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:18px 20px;margin-bottom:4px}
+  .flowsvg{display:block;width:100%;height:auto;max-width:980px;min-width:760px;margin:0 auto}
+  .flowsvg text{font-family:inherit}
+  .pricetbl{min-width:960px}
+  .plantbl{min-width:860px}
+  .mgn{font-weight:700;font-variant-numeric:tabular-nums}
+  .mgn.hi{color:var(--accent-ink)}
+  .mgn.mid{color:var(--text)}
+  .mgn.low{color:var(--warn)}
+  .stat.sm .n{font-size:19px}
+  .foot{margin-top:16px;font-size:12.5px;color:var(--muted);line-height:1.7;max-width:900px}
+  .foot b{color:var(--text)}
+  .foot code{background:var(--surface2);border:1px solid var(--border);border-radius:5px;padding:1px 6px;font-size:12px;color:var(--text)}
+  .foot ul{margin:8px 0 0;padding-left:18px}
+  .foot li{margin-bottom:5px}
   @media(max-width:900px){.stats{grid-template-columns:repeat(2,1fr)}}
 ${SHARED_CSS}</style></head><body>
-${sidebar("admin", { isAdmin: true, demo })}<div class="pagehead"><div class="titlewrap"><h1>Admin</h1><div class="pagesub">Operator overview: every user, their usage this month, and their plan</div></div><div class="spacer"></div></div>
+${sidebar("admin", { isAdmin: true, demo })}<div class="pagehead"><div class="titlewrap"><h1>Admin</h1><div class="pagesub">${
+    sub ? esc(sub) : "Operator overview: every user, their usage this month, and their plan"
+  }</div></div><div class="spacer"></div></div>
 ${active ? adminTabs(active) : ""}
 ${body}
 ${extraScript}${SHELL_TAIL_SCRIPT}</main></div></body></html>`;
 }
 
-function statCard(n, label, sub = "") {
-  return `<div class="stat"><div class="n">${n}</div><div class="l">${esc(label)}</div>${
-    sub ? `<div class="s">${esc(sub)}</div>` : ""
-  }</div>`;
+function statCard(n, label, sub = "", cls = "") {
+  return `<div class="stat${cls ? " " + cls : ""}"><div class="n">${n}</div><div class="l">${esc(
+    label
+  )}</div>${sub ? `<div class="s">${esc(sub)}</div>` : ""}</div>`;
 }
 
 function noticeCard(title, text) {
@@ -636,6 +658,405 @@ ${statCard(money(d.revenue), "Closed revenue", `${num(d.winCount)} win${d.winCou
   return page(body, "", demo, "analytics");
 }
 
+// ── pricing ──────────────────────────────────────────────────────────────────
+//
+// The operator's money page: what a scan costs us, what the meter turns it into,
+// and what each plan sells that token for. It reads no user data at all, so it
+// renders identically in sqlite and supabase mode.
+//
+// Everything below is derived at request time from three env vars. Nothing is
+// precomputed, cached or hardcoded, so changing APIFY_RATE_PER_1K (or either of
+// the other two) reprices the entire page on the next load.
+
+// Our supplier rate: USD per 1,000 businesses scanned. Measured across a 3-source
+// scan, where each scraper carries its own startup cost.
+function apifyRatePer1k() {
+  const n = parseFloat(process.env.APIFY_RATE_PER_1K || "7.5");
+  return Number.isFinite(n) && n > 0 ? n : 7.5;
+}
+
+// The flat token price of the "Guaranteed 5 companies" search mode. Read with a
+// fallback so this page prices correctly whether or not that var is deployed yet.
+function guaranteedFiveTokens() {
+  const n = parseFloat(process.env.GUARANTEED_FIVE_TOKENS || "60");
+  return Number.isFinite(n) && n > 0 ? n : 60;
+}
+
+// Measured assumptions rather than env: the size of one standard scan cell, how
+// many qualified no-website companies a scan yields, and the hard stop the
+// guaranteed mode scans to before it gives up and bills per place instead.
+const SCAN_CELL_PLACES = 50;
+const GUARANTEE_TARGET = 5;
+const YIELD_TYPICAL = 7; // businesses scanned per qualified company, typical market
+const YIELD_WORST = 20; // ... and in a thin one
+const GUARANTEE_CAP_PLACES = 120;
+
+// Plans the pricing page reasons about. `prospect` is the 1-token demo shell, not
+// something the operator sells, so it stays out of the margin maths.
+const PRICING_PLAN_KEYS = PLAN_KEYS.filter((k) => k !== "prospect");
+
+function usd2(n) {
+  return (
+    "$" +
+    Number(n || 0).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+  );
+}
+
+// The per-business cost is fractions of a cent, so it needs four places to be true.
+function usd4(n) {
+  return "$" + Number(n || 0).toFixed(4);
+}
+
+function centsPerToken(usdPerToken) {
+  return (Number(usdPerToken || 0) * 100).toFixed(2) + "c";
+}
+
+// Whole tokens once the number is big enough for the fraction to be noise, two
+// decimals below that (so 0.5625 reads as 0.56 and 28.125 reads as 28).
+function tokenAmt(n) {
+  const v = Number(n || 0);
+  return v >= 10 ? num(Math.round(v)) : v.toFixed(2);
+}
+
+function pctText(fraction) {
+  return Math.round(Number(fraction) * 100) + "%";
+}
+
+// Margin colour: healthy at 70 and up, plain in the middle, amber below 50.
+function marginClass(fraction) {
+  const p = Number(fraction) * 100;
+  if (p >= 70) return "hi";
+  if (p >= 50) return "mid";
+  return "low";
+}
+
+function marginCell(fraction, sub = "") {
+  return `<td class="n"><span class="mgn ${marginClass(fraction)}">${pctText(
+    fraction
+  )}</span>${sub ? `<div class="sub">${esc(sub)}</div>` : ""}</td>`;
+}
+
+// The whole economic model, computed fresh per request.
+function pricingModel() {
+  const rate = apifyRatePer1k();
+  const tpu = tokensPerUsd();
+  const flatFive = guaranteedFiveTokens();
+
+  const usdPerPlace = rate / 1000; // what one scanned business costs us
+  const tokensPerPlace = usdPerPlace * tpu; // what we charge for one, in tokens
+
+  const plans = PRICING_PLAN_KEYS.map((k) => {
+    const p = PLANS[k];
+    const usdPerToken = p.price > 0 && p.tokens > 0 ? p.price / p.tokens : 0;
+    // Tokens charged always equal places x rate/1000 x tpu, so the Apify cost of a
+    // fully consumed allotment collapses to tokens / tpu: the rate cancels out.
+    const worstCostUsd = p.tokens / tpu;
+    // ... unless every token is spent in guaranteed mode and every one of those
+    // searches runs to the cap, which buys more places per token than the meter.
+    const guaranteedCeilingUsd = (p.tokens / flatFive) * GUARANTEE_CAP_PLACES * usdPerPlace;
+    return {
+      key: k,
+      label: p.label,
+      price: p.price,
+      tokens: p.tokens,
+      usdPerToken,
+      scanCells: Math.floor(p.tokens / (SCAN_CELL_PLACES * tokensPerPlace)),
+      guaranteedRuns: Math.floor(p.tokens / flatFive),
+      worstCostUsd,
+      guaranteedCeilingUsd,
+      margin: p.price > 0 ? 1 - worstCostUsd / p.price : null,
+    };
+  });
+  const planBy = (k) => plans.find((p) => p.key === k) || null;
+
+  // Businesses we have to scan to hand over five no-website companies.
+  const typicalPlaces = GUARANTEE_TARGET * YIELD_TYPICAL;
+  const worstPlaces = GUARANTEE_TARGET * YIELD_WORST;
+
+  const modes = [
+    {
+      name: "Scan 50 businesses",
+      note: "one standard cell, billed per place",
+      placesText: num(SCAN_CELL_PLACES),
+      tokens: SCAN_CELL_PLACES * tokensPerPlace,
+      costTypical: SCAN_CELL_PLACES * usdPerPlace,
+      costWorst: SCAN_CELL_PLACES * usdPerPlace,
+    },
+    {
+      name: "Guaranteed 5 companies, met",
+      note: "flat token price, whatever the scan costs us",
+      placesText: `${num(typicalPlaces)} to ${num(worstPlaces)}`,
+      tokens: flatFive,
+      costTypical: typicalPlaces * usdPerPlace,
+      costWorst: worstPlaces * usdPerPlace,
+    },
+    {
+      name: "Guaranteed 5, not met at the cap",
+      note: "stops at the cap and falls back to per place billing",
+      placesText: num(GUARANTEE_CAP_PLACES),
+      tokens: GUARANTEE_CAP_PLACES * tokensPerPlace,
+      costTypical: GUARANTEE_CAP_PLACES * usdPerPlace,
+      costWorst: GUARANTEE_CAP_PLACES * usdPerPlace,
+    },
+  ];
+
+  return {
+    rate,
+    tpu,
+    flatFive,
+    usdPerPlace,
+    tokensPerPlace,
+    plans,
+    planBy,
+    modes,
+    typicalPlaces,
+    worstPlaces,
+    typicalCostUsd: typicalPlaces * usdPerPlace,
+    worstCostUsd: worstPlaces * usdPerPlace,
+    scanCellTokens: SCAN_CELL_PLACES * tokensPerPlace,
+  };
+}
+
+// Three boxes left to right: what we pay, what the meter charges, what a token
+// sells for. The live constants ride on the two arrows between them. Deliberately
+// flat and horizontal so it stays readable at any width down to the scroll floor.
+function flowDiagram(m) {
+  const paid = m.plans.filter((p) => p.price > 0).slice(0, 3);
+  const planLines = paid
+    .map((p, i) => {
+      const y = 92 + i * 24;
+      return `<text x="699" y="${y}" font-size="11.5" fill="var(--text)">${esc(
+        p.label
+      )}, $${num(p.price)}</text><text x="959" y="${y}" text-anchor="end" font-size="11.5" font-weight="700" fill="var(--accent)">${centsPerToken(
+        p.usdPerToken
+      )} per token</text>`;
+    })
+    .join("");
+
+  return `<div class="flowwrap"><svg class="flowsvg" viewBox="0 0 980 200" role="img" aria-label="Apify cost feeds the token meter, which feeds the customer plan prices" xmlns="http://www.w3.org/2000/svg">
+<defs><marker id="lmpricearrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,1 L9,5 L0,9 z" fill="var(--border-strong)"/></marker></defs>
+
+<rect x="1" y="16" width="228" height="168" rx="12" fill="var(--surface2)" stroke="var(--border)"/>
+<text x="115" y="45" text-anchor="middle" font-size="13" font-weight="700" fill="var(--text)">Apify scan</text>
+<text x="115" y="63" text-anchor="middle" font-size="10.5" fill="var(--muted)">what we pay the supplier</text>
+<text x="115" y="113" text-anchor="middle" font-size="27" font-weight="800" fill="var(--text)">${usd4(
+    m.usdPerPlace
+  )}</text>
+<text x="115" y="134" text-anchor="middle" font-size="11" fill="var(--muted)">per business scanned</text>
+<text x="115" y="166" text-anchor="middle" font-size="10" fill="var(--faint)">APIFY_RATE_PER_1K = ${esc(
+    String(m.rate)
+  )}</text>
+
+<line x1="233" y1="100" x2="330" y2="100" stroke="var(--border-strong)" stroke-width="2" marker-end="url(#lmpricearrow)"/>
+<text x="285" y="76" text-anchor="middle" font-size="10.5" font-weight="700" fill="var(--text)">$${m.rate.toFixed(
+    2
+  )} per 1,000</text>
+<text x="285" y="90" text-anchor="middle" font-size="10.5" fill="var(--muted)">businesses scanned</text>
+
+<rect x="340" y="16" width="228" height="168" rx="12" fill="var(--surface2)" stroke="var(--border)"/>
+<text x="454" y="45" text-anchor="middle" font-size="13" font-weight="700" fill="var(--text)">Token meter</text>
+<text x="454" y="63" text-anchor="middle" font-size="10.5" fill="var(--muted)">our unit of account</text>
+<text x="454" y="113" text-anchor="middle" font-size="27" font-weight="800" fill="var(--text)">${tokenAmt(
+    m.tokensPerPlace
+  )}</text>
+<text x="454" y="134" text-anchor="middle" font-size="11" fill="var(--muted)">tokens charged per business</text>
+<text x="454" y="166" text-anchor="middle" font-size="10" fill="var(--faint)">TOKENS_PER_USD = ${esc(
+    String(m.tpu)
+  )}</text>
+
+<line x1="572" y1="100" x2="669" y2="100" stroke="var(--border-strong)" stroke-width="2" marker-end="url(#lmpricearrow)"/>
+<text x="624" y="76" text-anchor="middle" font-size="10.5" font-weight="700" fill="var(--text)">x${esc(
+    String(m.tpu)
+  )} tokens per $1</text>
+<text x="624" y="90" text-anchor="middle" font-size="10.5" fill="var(--muted)">${tokenAmt(
+    m.tokensPerPlace
+  )} tokens each</text>
+
+<rect x="679" y="16" width="300" height="168" rx="12" fill="var(--surface2)" stroke="var(--border)"/>
+<text x="829" y="45" text-anchor="middle" font-size="13" font-weight="700" fill="var(--text)">Customer plans</text>
+<text x="829" y="63" text-anchor="middle" font-size="10.5" fill="var(--muted)">what a token sells for</text>
+${planLines}
+<text x="829" y="170" text-anchor="middle" font-size="10" fill="var(--faint)">Unlimited is a cap, not a rate anyone reaches</text>
+</svg></div>`;
+}
+
+// One row per search mode, with the customer value and margin for the two plans
+// that carry a real per-token rate. Margin is stated against our WORST case cost.
+function modeTable(m) {
+  const starter = m.planBy("starter");
+  const pro = m.planBy("pro");
+
+  const rows = m.modes
+    .map((mode) => {
+      const cells = [starter, pro]
+        .map((p) => {
+          if (!p || !p.usdPerToken) return `<td class="n">n/a</td><td class="n">n/a</td>`;
+          const value = mode.tokens * p.usdPerToken;
+          return `<td class="n">${usd2(value)}</td>${marginCell(1 - mode.costWorst / value)}`;
+        })
+        .join("");
+      return `<tr>
+  <td><div class="who">${esc(mode.name)}</div><div class="sub">${esc(mode.note)}</div></td>
+  <td class="n">${esc(mode.placesText)}</td>
+  <td class="n">${tokenAmt(mode.tokens)}</td>
+  <td class="n">${usd2(mode.costTypical)}</td>
+  <td class="n">${usd2(mode.costWorst)}</td>
+  ${cells}
+</tr>`;
+    })
+    .join("\n");
+
+  return `<div class="tblwrap"><table class="pricetbl">
+<thead><tr>
+  <th>Search mode</th>
+  <th class="n">Businesses scanned</th>
+  <th class="n">Tokens charged</th>
+  <th class="n">Our cost, typical</th>
+  <th class="n">Our cost, worst</th>
+  <th class="n">Starter value</th>
+  <th class="n">Starter margin, worst</th>
+  <th class="n">Pro value</th>
+  <th class="n">Pro margin, worst</th>
+</tr></thead>
+<tbody>${rows}</tbody></table></div>`;
+}
+
+// The spread the guarantee monetizes: the same flat price covers a cheap market
+// and an expensive one, and the customer pays the same either way.
+function guaranteeCards(m) {
+  const starter = m.planBy("starter");
+  const rateNote = `at ${usd4(m.usdPerPlace)} per business`;
+  const flatValue = starter && starter.usdPerToken ? m.flatFive * starter.usdPerToken : 0;
+  const cellsTypical = Math.ceil(m.typicalPlaces / SCAN_CELL_PLACES);
+  const cellsWorst = Math.ceil(m.worstPlaces / SCAN_CELL_PLACES);
+  const scanTypical =
+    starter && starter.usdPerToken ? cellsTypical * m.scanCellTokens * starter.usdPerToken : 0;
+  const scanWorst =
+    starter && starter.usdPerToken ? cellsWorst * m.scanCellTokens * starter.usdPerToken : 0;
+
+  return `<div class="stats">
+${statCard(
+  num(m.typicalPlaces),
+  "Scanned to find 5, typical",
+  `our cost ${usd2(m.typicalCostUsd)}, 1 per ${YIELD_TYPICAL} scanned`
+)}
+${statCard(
+  num(m.worstPlaces),
+  "Scanned to find 5, thin market",
+  `our cost ${usd2(m.worstCostUsd)}, 1 per ${YIELD_WORST} scanned`
+)}
+${statCard(
+  usd2(flatValue),
+  "Customer pays, guaranteed 5",
+  `${tokenAmt(m.flatFive)} tokens on Starter, either market`
+)}
+${statCard(
+  `${usd2(scanTypical)} to ${usd2(scanWorst)}`,
+  "Customer pays, scan 50 cells",
+  `${cellsTypical} cell typical, ${cellsWorst} cells thin market`,
+  "sm"
+)}
+${statCard(
+  `${usd2(flatValue - m.worstCostUsd)} to ${usd2(flatValue - m.typicalCostUsd)}`,
+  "Gross per guaranteed 5",
+  "on Starter, thin market to typical",
+  "sm"
+)}
+</div>`;
+}
+
+// Per plan: what it costs the customer, what it buys, and the most it can cost us.
+function planTable(m) {
+  const rows = m.plans
+    .map((p) => {
+      const worst = `<td class="n">${usd2(p.worstCostUsd)}</td>`;
+      const margin =
+        p.price > 0
+          ? marginCell(
+              p.margin,
+              p.key === "unlimited" ? "a cap, not a rate anyone reaches" : ""
+            )
+          : `<td class="n"><span class="sub">acquisition cost, up to ${usd2(
+              p.worstCostUsd
+            )}</span></td>`;
+      return `<tr>
+  <td><div class="who">${esc(p.label)}</div></td>
+  <td class="n">${p.price > 0 ? "$" + num(p.price) : "free"}</td>
+  <td class="n">${num(p.tokens)}</td>
+  <td class="n">${p.usdPerToken ? centsPerToken(p.usdPerToken) : "free"}</td>
+  <td class="n">${num(p.scanCells)}</td>
+  <td class="n">${num(p.guaranteedRuns)}</td>
+  ${worst}
+  ${margin}
+</tr>`;
+    })
+    .join("\n");
+
+  return `<div class="tblwrap"><table class="plantbl">
+<thead><tr>
+  <th>Plan</th>
+  <th class="n">Price</th>
+  <th class="n">Tokens</th>
+  <th class="n">Price per token</th>
+  <th class="n">Scan 50 searches</th>
+  <th class="n">Guaranteed 5s</th>
+  <th class="n">Worst case Apify cost</th>
+  <th class="n">Gross margin</th>
+</tr></thead>
+<tbody>${rows}</tbody></table></div>`;
+}
+
+function pricingFootnote(m) {
+  const starter = m.planBy("starter");
+  const pro = m.planBy("pro");
+  const ceilings = [starter, pro]
+    .filter(Boolean)
+    .map((p) => `${usd2(p.guaranteedCeilingUsd)} on ${esc(p.label)}`)
+    .join(" and ");
+
+  return `<div class="foot"><b>Assumptions and where the numbers come from</b>
+<ul>
+  <li>Measured yield: about 1 qualified no-website company per ${YIELD_TYPICAL} businesses scanned in a typical market, and about 1 per ${YIELD_WORST} in a thin one. Five companies therefore costs us ${usd2(
+    m.typicalCostUsd
+  )} typically and ${usd2(m.worstCostUsd)} at the bad end.</li>
+  <li>The guaranteed mode scans at most ${num(
+    GUARANTEE_CAP_PLACES
+  )} businesses. Past that it stops, the guarantee is not met, and the search bills per place like a normal scan.</li>
+  <li>Every figure on this page is computed when the page loads, from <code>APIFY_RATE_PER_1K</code> (now ${esc(
+    String(m.rate)
+  )}), <code>TOKENS_PER_USD</code> (now ${esc(
+    String(m.tpu)
+  )}) and <code>GUARANTEED_FIVE_TOKENS</code> (now ${esc(
+    String(m.flatFive)
+  )}). Change one in the environment and everything here reprices on the next load.</li>
+  <li>Per place billing makes our cost exactly tokens divided by <code>TOKENS_PER_USD</code>, whatever the Apify rate is, which is why the worst case column matches the plan margin. If a customer instead spent a whole allotment on guaranteed searches that all ran to the cap, our cost would top out slightly higher: ${ceilings}.</li>
+  <li>Trial is free, so it has no margin. Treat its ${usd2(
+    (m.planBy("trial") || { worstCostUsd: 0 }).worstCostUsd
+  )} as acquisition cost. Unlimited is a ceiling rather than a rate customers reach, so its margin column is the theoretical figure for an account that burns the entire cap.</li>
+  <li>The 1-token Prospect (demo) plan is left out: it is a demo shell, not something the operator sells.</li>
+</ul></div>`;
+}
+
+function renderPricing(m, demo = false) {
+  const body =
+    `<div class="sectionhead">Money flow, supplier cost to plan price</div>` +
+    flowDiagram(m) +
+    `<div class="sectionhead pricehead">Search mode economics</div>` +
+    modeTable(m) +
+    `<div class="sectionhead pricehead">Cost of five no-website companies</div>` +
+    guaranteeCards(m) +
+    `<div class="sectionhead pricehead">Plan margins</div>` +
+    planTable(m) +
+    pricingFootnote(m);
+  return page(
+    body,
+    "",
+    demo,
+    "pricing",
+    "What a scan costs us, what the meter charges for it, and what each plan earns"
+  );
+}
+
 // ── routes ───────────────────────────────────────────────────────────────────
 
 // Shared guard for the three mutating endpoints: supabase mode + a real uuid.
@@ -724,6 +1145,31 @@ adminRouter.get("/admin/analytics", requireUser, requireAdmin, async (req, res) 
           "",
           !!req.isDemo,
           "analytics"
+        )
+      );
+  }
+});
+
+// Unit economics. Guarded exactly like the other admin pages, but deliberately NOT
+// gated on supabase mode: it reads no user data, only the env constants, so it is
+// just as useful against a local sqlite instance.
+adminRouter.get("/admin/pricing", requireUser, requireAdmin, (req, res) => {
+  try {
+    res.send(renderPricing(pricingModel(), !!req.isDemo));
+  } catch (e) {
+    res
+      .status(500)
+      .send(
+        page(
+          noticeCard(
+            "Could not work out the pricing",
+            `Something in the pricing constants is unusable: <code>${esc(
+              e && e.message ? e.message : String(e)
+            )}</code>`
+          ),
+          "",
+          !!req.isDemo,
+          "pricing"
         )
       );
   }

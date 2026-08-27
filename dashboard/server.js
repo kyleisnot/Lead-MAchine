@@ -9,7 +9,10 @@ import express from "express";
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";
 import * as store from "../data/store.js";
-import { discover, discoverMany, willSearchSpend } from "../lib/pipeline.js";
+import {
+  discover, discoverMany, discoverGuaranteed, willSearchSpend, listingUrlFor,
+  GUARANTEE_TARGET,
+} from "../lib/pipeline.js";
 import { NICHES } from "../lib/niches.js";
 import { lastActiveLabel, activityStatus, activitySignal, cutoffLabel, freshnessConfig } from "../lib/freshness.js";
 import { spendCapState, RATE_PER_1K } from "../lib/spend.js";
@@ -52,6 +55,8 @@ function icon(key, size = 15) {
     // A written-on page: the per-row notes toggle on the Leads table.
     note: '<path d="M14.5 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8.5z"></path><path d="M14 3v6h6"></path><path d="M8.5 13h7M8.5 16.5h4.5"></path>',
     refresh: '<path d="M21 12a9 9 0 1 1-2.6-6.4"></path><polyline points="21 3 21 9 15 9"></polyline>',
+    // Opens the listing on the site the scan found it on, in a new tab.
+    external: '<path d="M14 4h6v6"></path><path d="M20 4l-8 8"></path><path d="M18 13.5v5A1.5 1.5 0 0 1 16.5 20h-11A1.5 1.5 0 0 1 4 18.5v-11A1.5 1.5 0 0 1 5.5 6h5"></path>',
     // A tall business tower with window ticks next to a small house: the mix of
     // local businesses a scan turns up, and the mark for the Companies table.
     companies:
@@ -118,6 +123,18 @@ app.use(requireUser);
 // Cost is shown as "tokens" (a credit unit) instead of raw dollars. 1 USD = TOKENS_PER_USD tokens.
 const TOKENS_PER_USD = parseFloat(process.env.TOKENS_PER_USD || "75") || 75;
 const usdToTokens = (usd) => Math.max(0, Math.round((Number(usd) || 0) * TOKENS_PER_USD));
+// Tokens back to the USD the meter stores, so a flat price and a per-place scan land in
+// the same usage_log column and every downstream total keeps adding up.
+const tokensToUsd = (tokens) => (Number(tokens) || 0) / TOKENS_PER_USD;
+
+// ── The two search modes ─────────────────────────────────────────────────────
+// "Scan 50 businesses" is the everyday one: a fixed amount of looking, billed per place.
+// "Guaranteed 5 companies" sells the result instead of the effort, at one flat price.
+const STANDARD_DEPTH = 50;
+const GUARANTEED_FIVE_TOKENS = Math.max(0, parseInt(process.env.GUARANTEED_FIVE_TOKENS || "60", 10) || 0);
+// What a standard scan of N places costs the customer, in tokens. The search page shows
+// the same number before the scan runs.
+const standardTokens = (places) => usdToTokens((Math.max(0, places) / 1000) * RATE_PER_1K);
 
 function planResetLabel() {
   const d = new Date();
@@ -129,9 +146,24 @@ async function monthTokensUsed(userId) {
   const u = await store.usageSummary(userId);
   return usdToTokens(u.aiUsd || 0);
 }
-// Block a live (credit-spending) search once this user's monthly allotment is used up.
-// Their allotment lives on their profile row (0 = unlimited); it refills on the 1st.
-async function blockedByAllotment(req, res, { live }) {
+// What the allotment gate decides for one search, as a plain rule over three numbers.
+// Split out of the route so the decision can be reasoned about (and checked) on its own.
+//   need > 0 is a price known UP FRONT, the guaranteed mode's flat charge. A plan that
+//   cannot cover it is stopped before the scan, rather than after the money is spent.
+export function allotmentVerdict({ allotment = 0, used = 0, need = 0 }) {
+  const plan = Number(allotment) || 0;
+  // 0 = account not yet given a plan. (New convention: 0 no longer means "unlimited".)
+  if (plan <= 0) return { blocked: true, status: 402, reason: "unassigned" };
+  if (used >= plan) return { blocked: true, status: 429, reason: "used-up" };
+  if (need > 0 && plan - used < need) {
+    return { blocked: true, status: 429, reason: "short", remaining: plan - used, need };
+  }
+  return { blocked: false, reason: "" };
+}
+
+// Block a live (credit-spending) search once this user's monthly allotment can't cover it.
+// Their allotment lives on their profile row; it refills on the 1st.
+async function blockedByAllotment(req, res, { live, need = 0 }) {
   if (!live) return false;
   // An admin presenting a demo (staged or prospect) must never be stalled mid-meeting
   // by the TARGET account's plan — the gate applies to real customers only.
@@ -139,24 +171,19 @@ async function blockedByAllotment(req, res, { live }) {
   const profile = await store.getProfile(req.userId);
   const raw = Number.parseInt(profile?.monthly_token_allotment, 10);
   const allotment = Number.isFinite(raw) && raw > 0 ? raw : 0;
-  // 0 = account not yet given a plan. (New convention: 0 no longer means "unlimited".)
-  if (allotment === 0) {
-    res.status(402).json({
-      ok: false,
-      error: "Your account isn't active yet. Reach out to have your monthly tokens set up.",
-    });
-    return true;
-  }
-  const used = await monthTokensUsed(req.userId);
-  if (used >= allotment) {
-    res.status(429).json({
-      ok: false,
-      error: `You've used all ${allotment.toLocaleString()} tokens in your plan this month. ` +
-             `They refill on ${planResetLabel()}, or ask for a top-up to keep searching now.`,
-    });
-    return true;
-  }
-  return false;
+  const used = allotment ? await monthTokensUsed(req.userId) : 0;
+  const v = allotmentVerdict({ allotment, used, need });
+  if (!v.blocked) return false;
+  const error =
+    v.reason === "unassigned"
+      ? "Your account isn't active yet. Reach out to have your monthly tokens set up."
+      : v.reason === "short"
+        ? `This search costs ${need.toLocaleString()} tokens and you have ${v.remaining.toLocaleString()} left this month. ` +
+          `They refill on ${planResetLabel()}, or ask for a top-up to run it now.`
+        : `You've used all ${allotment.toLocaleString()} tokens in your plan this month. ` +
+          `They refill on ${planResetLabel()}, or ask for a top-up to keep searching now.`;
+  res.status(v.status).json({ ok: false, error });
+  return true;
 }
 
 // Block a search if this month's Apify spend has hit the configured cap.
@@ -182,36 +209,122 @@ async function blockedBySpendCap(res, { live }) {
 // that sees the FULL scanned set. discover() hands this handler the qualifying prospects
 // only, so recording it here would miss most of what we scanned.
 
+// ── Auto-save: a search result IS a list of companies ────────────────────────
+// Nothing a scan finds is worth making the user click to keep, so every completed search
+// files its results into their companies before the response goes out, under the bucket
+// each one landed in. store.moveToCrm adopts rather than clobbers and skips anything
+// already saved, which is what makes replaying a search a no-op instead of a duplicate.
+function bucketOfSlim(p) {
+  if (p.hasWebsite) return "has_website";
+  return p.activeStatus === "active" ? "qualified" : "inactive";
+}
+async function autoSaveResults(userId, slim) {
+  const groups = { qualified: [], inactive: [], has_website: [] };
+  for (const p of slim || []) groups[bucketOfSlim(p)].push(p);
+  const buckets = {};
+  let added = 0;
+  let skipped = 0;
+  for (const b of CRM_BUCKETS) {
+    if (!groups[b].length) { buckets[b] = { added: 0, skipped: 0 }; continue; }
+    const r = (await store.moveToCrm(userId, groups[b], b)) || {};
+    buckets[b] = { added: r.added || 0, skipped: r.skipped || 0 };
+    added += buckets[b].added;
+    skipped += buckets[b].skipped;
+  }
+  // They are in the CRM now either way, so the page renders every row already saved.
+  for (const p of slim || []) p.saved = true;
+  return { buckets, added, skipped };
+}
+
+// A list of values from either an array field or a single one, trimmed and de-blanked.
+function listOf(many, one) {
+  const raw = Array.isArray(many) ? many : [one];
+  return raw.map((s) => String(s ?? "").trim()).filter(Boolean);
+}
+
 // ── SEARCH API: run a live lookup (Google + Facebook) for a niche + city ──
+// Two modes. "standard" scans a fixed 50 businesses per cell and is billed per place.
+// "guaranteed" keeps scanning until five qualified companies are found and is billed one
+// flat price, unless a cap stops it short, in which case it falls back to the standard
+// per-place rate for what was actually scanned, so a thin market never costs the premium.
 app.post("/api/search", async (req, res) => {
-  const { niche, city, state, sources, limit, forceRefresh } = req.body;
-  if (!niche || !city) return res.status(400).json({ ok: false, error: "Need a niche and a city." });
+  const body = req.body || {};
+  const guaranteed = body.mode === "guaranteed";
+  const { state, forceRefresh } = body;
+  const resolvedSources = body.sources?.length ? body.sources : ["google", "facebook"];
+  const cities = listOf(body.cities, body.city);
+  const niches = listOf(body.niches, body.niche);
+  if (!niches.length || !cities.length) {
+    return res.status(400).json({ ok: false, error: "Need a niche and a city." });
+  }
   try {
+    if (guaranteed) {
+      // The flat price is known before a single business is scanned, so the plan gate
+      // gets to see it up front rather than discovering the overspend afterwards.
+      if (await blockedBySpendCap(res, { live: true })) return;
+      if (await blockedByAllotment(req, res, { live: true, need: GUARANTEED_FIVE_TOKENS })) return;
+      const r = await discoverGuaranteed({
+        userId: req.userId,
+        niches,
+        cities,
+        state,
+        sources: resolvedSources,
+        forceRefresh: !!forceRefresh,
+      });
+      const g = r.guarantee;
+      // Met: the flat price. Short of five: the standard per-place rate for the scan that
+      // actually ran. Served entirely from cache: nothing, like any other replay.
+      const costUsd = r.cached ? 0 : g.met ? tokensToUsd(GUARANTEED_FIVE_TOKENS) : (g.scanned / 1000) * RATE_PER_1K;
+      await store.logUsage(req.userId, "search", costUsd);
+      const prospects = r.prospects.map(slimProspect).concat(r.alsoSeen || []);
+      const saved = await autoSaveResults(req.userId, prospects);
+      return res.json({
+        ok: true,
+        mode: "guaranteed",
+        stats: r.stats,
+        cached: !!r.cached,
+        guarantee: g,
+        charged: { tokens: usdToTokens(costUsd), basis: r.cached ? "cached" : g.met ? "guarantee" : "scan" },
+        saved: saved.buckets,
+        savedTotals: { added: saved.added, skipped: saved.skipped },
+        prospects,
+      });
+    }
+
+    const niche = niches[0];
+    const city = cities[0];
+    const limit = Number(body.limit) > 0 ? Number(body.limit) : STANDARD_DEPTH;
     // Any search that will actually hit Apify (a cold/uncached lookup OR a forced re-scan)
     // spends credits — guard ALL of those, not just forced re-scans. Cached searches are
     // free and stay allowed even when capped.
-    const resolvedSources = sources?.length ? sources : ["google", "facebook"];
-    const willSpend = await willSearchSpend({ userId: req.userId, niche, city, state, sources: resolvedSources, limit: limit || 30, forceRefresh: !!forceRefresh });
+    const willSpend = await willSearchSpend({ userId: req.userId, niche, city, state, sources: resolvedSources, limit, forceRefresh: !!forceRefresh });
     if (await blockedBySpendCap(res, { live: willSpend })) return;
     if (await blockedByAllotment(req, res, { live: willSpend })) return;
-    const { prospects, stats, cached, cachedAt, alsoSeen } = await discover({
+    const { prospects: found, stats, cached, cachedAt, alsoSeen } = await discover({
       userId: req.userId,
       niche,
       city,
       state,
       sources: resolvedSources,
-      limit: limit || 30,
+      limit,
       forceRefresh: !!forceRefresh,
     });
     // The qualifying leads plus the in-niche businesses the scan saw but skipped (the ones
     // that already have a website). They arrive pre-slimmed and carry hasWebsite, so the
     // page's own grouping drops each into the right section.
+    const prospects = found.map(slimProspect).concat(alsoSeen || []);
+    // A cached replay saves too: moveToCrm skips every row that is already there, so this
+    // costs one dedup pass and keeps a re-run honest about what it added (nothing).
+    const saved = await autoSaveResults(req.userId, prospects);
     res.json({
       ok: true,
+      mode: "standard",
       stats,
       cached: !!cached,
       cachedAt: cachedAt || null,
-      prospects: prospects.map(slimProspect).concat(alsoSeen || []),
+      saved: saved.buckets,
+      savedTotals: { added: saved.added, skipped: saved.skipped },
+      prospects,
     });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
@@ -229,16 +342,25 @@ app.post("/api/search-batch", async (req, res) => {
   try {
     if (await blockedBySpendCap(res, { live: true })) return;
     if (await blockedByAllotment(req, res, { live: true })) return;
-    const { prospects, stats, alsoSeen } = await discoverMany({
+    const { prospects: found, stats, alsoSeen } = await discoverMany({
       userId: req.userId,
       niches: nicheList,
       cities: cityList,
       state,
       sources: sources?.length ? sources : ["google", "facebook"],
-      limit: limit || 30,
+      limit: Number(limit) > 0 ? Number(limit) : STANDARD_DEPTH,
       forceRefresh: !!forceRefresh,
     });
-    res.json({ ok: true, stats, prospects: prospects.map(slimProspect).concat(alsoSeen || []) });
+    const prospects = found.map(slimProspect).concat(alsoSeen || []);
+    const saved = await autoSaveResults(req.userId, prospects);
+    res.json({
+      ok: true,
+      mode: "standard",
+      stats,
+      saved: saved.buckets,
+      savedTotals: { added: saved.added, skipped: saved.skipped },
+      prospects,
+    });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
@@ -401,6 +523,9 @@ function slimProspect(l) {
     phone: l.phone,
     email: l.email || "",
     source: l.source,
+    // The Google/Facebook/Instagram page this business was found on, so the Source cell
+    // can open the actual listing instead of just naming the platform.
+    listingUrl: listingUrlFor({ source: l.source, external_id: l.external_id, ...lj }),
     website: l.website || "",
     // Same rule the search filter uses: a Facebook/Yelp/free-builder page is NOT a website.
     hasWebsite: isRealWebsiteUrl(l.website || ""),
@@ -426,11 +551,14 @@ app.get("/api/last-search", route(async (req, res) => {
   const alsoSeen = Array.isArray(ls.alsoSeen) ? ls.alsoSeen : [];
   res.json({
     ok: true,
-    query: { niche: ls.niche, city: ls.city, state: ls.state, sources: ls.sources, limit: ls.limit },
+    query: { niche: ls.niche, city: ls.city, state: ls.state, sources: ls.sources, limit: ls.limit, mode: ls.mode || "standard" },
     stats: ls.stats,
     prospects: rows.map(slimProspect).concat(alsoSeen),
   });
 }));
+// Note: a restore deliberately does NOT save anything. The rows it hands back were already
+// filed when the search itself ran, and re-filing them on every page load would let a
+// company the user has since removed from their companies quietly come back.
 
 // ── WINS: the user's closed-deal trophy case ──
 // One page: a headline stat, a "log a win" form, and the list of wins. The API is
@@ -547,6 +675,17 @@ const TABLE_CSS = `
   .cotable .c-mut{color:var(--muted)}
   .cotable .c-ic{display:inline-flex;align-items:center;gap:5px;color:var(--muted)}
   .cotable .c-em{color:var(--accent)}
+  /* A phone number is a call, not a link to read: it keeps body colour so a table of
+     them doesn't turn into a wall of blue, and only underlines when you reach for it. */
+  .cotable a.c-tel{color:var(--text);text-decoration:none}
+  .cotable a.c-tel:hover{color:var(--accent-ink);text-decoration:underline}
+  /* The listing the scan found this business on. Quiet by default, same size as the
+     source name it replaces, with the arrow only hinting that it leaves the page. */
+  a.c-src{color:var(--muted);text-decoration:none;border-bottom:1px solid transparent}
+  a.c-src:hover{color:var(--accent-ink);border-bottom-color:var(--accent-ink)}
+  a.c-src svg{flex:none;opacity:.75;margin-left:3px}
+  .cotable a.c-src{display:inline-flex;align-items:center}
+  .cotable .c-tags a.c-src{font-size:11px;font-weight:600}
   .cotable .c-act{text-align:right;white-space:nowrap;padding-right:0}
   .co-empty{padding:24px 0;color:var(--muted);font-size:14px}
   @media (max-width:760px){.copanel{padding:16px 14px}.btabs{gap:18px}}
@@ -630,14 +769,12 @@ async function renderSearchPage(req) {
   .grp-sub{font-size:13px;color:var(--muted);flex:1 1 100%;margin:-4px 0 0;order:2}
   .grp-body{padding:0 14px 14px}
   .grp-act{margin-left:auto;display:flex;gap:8px;align-items:center}
-  .moveall{display:inline-flex;align-items:center;gap:7px;font-family:inherit;background:var(--accent);color:var(--on-accent);border:none;border-radius:8px;padding:9px 16px;font-weight:700;font-size:13px;cursor:pointer;white-space:nowrap}
-  .moveall:hover{filter:brightness(.96)}
-  .moveall:disabled{opacity:.6;cursor:wait}
-  .moveall.ghost{background:transparent;border:1px solid var(--border-strong);color:var(--text)}
-  .moveall.ghost:hover{background:var(--surface2);filter:none}
-  .grp-done{display:flex;align-items:center;gap:10px;background:var(--panel);border:1px solid var(--border);border-left:3px solid var(--accent);border-radius:12px;padding:14px 18px;margin-bottom:14px;font-size:14px;color:var(--text)}
-  .grp-done .ok{display:inline-flex;color:var(--accent)}
-  .grp-done a{font-weight:700;margin-left:auto;text-decoration:none;white-space:nowrap}
+  /* The receipt: what filing this list changed. It sits where the bulk-move button used
+     to, and reads as a statement rather than a control, because it is one. */
+  .receipt{display:inline-flex;align-items:center;gap:9px;font-size:13px;color:var(--muted);white-space:nowrap}
+  .receipt b{color:var(--text)}
+  .receipt .ok{display:inline-flex;color:var(--accent)}
+  .receipt a{font-weight:700;text-decoration:none;white-space:nowrap}
   .statuserr{display:inline-flex;align-items:center;gap:7px;color:var(--danger)}
   .grp .lead{margin:10px 0 0}
 
@@ -653,7 +790,7 @@ async function renderSearchPage(req) {
   /* The panel, tabs, toolbar and table styling are shared with the Leads page. */
 ${TABLE_CSS}
   .copanel .scanline{margin:8px 0 0}
-  .cotools .moveall{margin-left:auto}
+  .cotools .receipt{margin-left:auto}
   table.cotable{min-width:940px}
   /* Fixed column widths, sized so nothing needs a scrollbar at a normal desktop width.
      The action column is budgeted for its widest state: "In your companies" plus dismiss. */
@@ -669,7 +806,7 @@ ${TABLE_CSS}
   .cotable .fresh-badge{margin:0;font-size:11.5px;padding:2px 8px}
   .cotable .c-act .save{padding:6px 11px;font-size:12px}
   .cotable .c-act .hide{padding:6px 9px;font-size:12px;margin-left:6px}
-  .copanel .grp-done{margin:16px 0 0}
+  @media (max-width:760px){.cotools .receipt{margin-left:0;white-space:normal}}
   .save{display:inline-flex;align-items:center;gap:6px}
   .fresh-badge svg,.lic-badge svg,.save svg,.hide svg{flex:none}
   .lic-badge{display:inline-flex;align-items:center;gap:5px}
@@ -741,7 +878,7 @@ ${sidebar("search", { isAdmin: req.isAdmin, demo: req.isDemo })}<div class="page
   </div>
 
   <div class="fgroup">
-    <div class="glabel">How deep</div>
+    <div class="glabel">How to search</div>
     <div class="frow deep">
       <div class="f"><label for="source">Sources</label><select id="source">
         <option value="all">All (Google + Facebook + Instagram)</option>
@@ -749,10 +886,9 @@ ${sidebar("search", { isAdmin: req.isAdmin, demo: req.isDemo })}<div class="page
         <option value="instagram">Instagram only</option>
         <option value="google">Google only</option>
       </select></div>
-      <div class="f"><label for="limit">Depth <span class="hint">deeper finds more, takes longer</span></label><select id="limit" onchange="updateEstimate()">
-        <option value="20">Quick</option>
-        <option value="60">Standard</option>
-        <option value="150">Thorough</option>
+      <div class="f"><label for="mode">Search <span class="hint">a set amount of looking, or a set result</span></label><select id="mode" onchange="updateEstimate()">
+        <option value="standard">Scan ${STANDARD_DEPTH} businesses</option>
+        <option value="guaranteed">Guaranteed ${GUARANTEE_TARGET} companies</option>
       </select></div>
     </div>
   </div>
@@ -769,7 +905,10 @@ ${sidebar("search", { isAdmin: req.isAdmin, demo: req.isDemo })}<div class="page
   var NICHE_KEYS = ${JSON.stringify(NICHES.map((n) => n.key))};
   var RATE_PER_1K = ${RATE_PER_1K};
   var TOKENS_PER_USD = ${TOKENS_PER_USD};
-  ${iconScript(["crm", "check", "x", "warn", "clock", "mail", "dot", "badge", "refresh", "undo", "search", "companies"], 14)}
+  var STANDARD_DEPTH = ${STANDARD_DEPTH};
+  var GUARANTEE_TARGET = ${GUARANTEE_TARGET};
+  var GUARANTEE_TOKENS = ${GUARANTEED_FIVE_TOKENS};
+  ${iconScript(["check", "x", "warn", "clock", "mail", "dot", "badge", "refresh", "undo", "search", "companies", "external"], 14)}
   var BUCKETS = ${JSON.stringify(BUCKET_META)};
 </script>
 
@@ -806,22 +945,28 @@ function stopProgress(){clearInterval(progTimer);progTimer=null;}
 function parseCities(){return document.getElementById('city').value.split(',').map(s=>s.trim()).filter(Boolean)}
 function chosenSources(){const s=document.getElementById('source').value;return s==='all'?['google','facebook','instagram']:[s]}
 function chosenNiches(){return document.getElementById('allNiches').checked?NICHE_KEYS.slice():[document.getElementById('niche').value.trim()].filter(Boolean)}
+function chosenMode(){var m=document.getElementById('mode');return m&&m.value==='guaranteed'?'guaranteed':'standard'}
 
-// Live "this will scan ≈ N places (≈ $X)" estimate. Multiplies cities × niches × sources × depth.
+// Live estimate. The two modes promise different things, so they read differently: the
+// standard one prices the looking, the guaranteed one prices the result.
 function updateEstimate(){
-  const cities=parseCities().length||1, niches=chosenNiches().length||1, sources=chosenSources().length, depth=parseInt(document.getElementById('limit').value)||0;
+  const el=document.getElementById('estimate');
+  if(chosenMode()==='guaranteed'){
+    el.className='estimate';
+    el.innerHTML='<b>'+GUARANTEE_TARGET+' no-website companies</b> or you pay standard rate · usually <b>2 to 8 min</b> · <b>'+GUARANTEE_TOKENS.toLocaleString()+' tokens</b>';
+    return;
+  }
+  const cities=parseCities().length||1, niches=chosenNiches().length||1, sources=chosenSources().length, depth=STANDARD_DEPTH;
   const cells=cities*niches;
   const places=cells*sources*depth;
   const tokens=Math.round((places/1000)*RATE_PER_1K*TOKENS_PER_USD);
   const totalSec=cells*estSeconds(sources,depth);
-  const el=document.getElementById('estimate');
   const big=totalSec>700; // near the server's run limit
   el.className='estimate'+(big?' big':'');
-  if(cells>1){
-    el.innerHTML=(big?ICONS.warn+' ':'')+'Batch of <b>'+cells+'</b> searches · scans <b>~'+places.toLocaleString()+' businesses</b> · about <b>'+fmtMin(totalSec)+'</b> · ~<b>'+tokens.toLocaleString()+' tokens</b>'+(big?' <span style="opacity:.85">(may be too big to finish in one run)</span>':'');
-    return;
-  }
-  el.innerHTML='Scans <b>~'+places.toLocaleString()+' businesses</b> · about <b>'+fmtMin(totalSec)+'</b> · ~<b>'+tokens.toLocaleString()+' tokens</b>, <span style="opacity:.65">more than you could check by hand</span>';
+  el.innerHTML=(big?ICONS.warn+' ':'')+'Scans <b>'+STANDARD_DEPTH+' businesses</b> per city and trade combo'+
+    (cells>1?' (<b>'+cells+'</b> of them, ~'+places.toLocaleString()+' businesses)':'')+
+    ' · about <b>'+fmtMin(totalSec)+'</b> · ~<b>'+tokens.toLocaleString()+' tokens</b>'+
+    (big?' <span style="opacity:.85">(may be too big to finish in one run)</span>':'');
 }
 
 async function runSearch(force){
@@ -830,29 +975,35 @@ async function runSearch(force){
   const niches=chosenNiches();
   if(!niches.length){stErr('Enter a niche, or tick All trades.');return}
   const sources=chosenSources();
-  const depth=parseInt(document.getElementById('limit').value);
+  const mode=chosenMode();
+  const state=document.getElementById('state').value;
   const multi=cities.length>1||niches.length>1;
-  const places=cities.length*niches.length*sources.length*depth;
+  // A guaranteed run stops as soon as it has five, so its clock is the observed spread
+  // rather than a depth calculation. A standard one is the same arithmetic as the estimate.
+  const expSec=mode==='guaranteed'?300:(cities.length*niches.length)*estSeconds(sources.length,STANDARD_DEPTH);
 
   // A single search must finish inside the server's run limit. Warn before one whose
   // estimate is long enough to risk timing out.
-  const expSec=(cities.length*niches.length)*estSeconds(sources.length,depth);
-  if(expSec>700&&!confirm('This search could take about '+Math.round(expSec/60)+' minutes, which may be too big to finish in one run. Try fewer trades/cities or a lower depth. Run it anyway?')) return;
+  if(mode!=='guaranteed'&&expSec>700&&!confirm('This search could take about '+Math.round(expSec/60)+' minutes, which may be too big to finish in one run. Try fewer trades or cities. Run it anyway?')) return;
 
   const btn=document.getElementById('goBtn'),rb=document.getElementById('rescanBtn');btn.disabled=true;rb.disabled=true;
   document.getElementById('results').innerHTML='';document.getElementById('statsWrap').innerHTML='';
 
   startProgress(expSec);
   let r;
-  if(multi){
-    r=await post('/api/search-batch',{niches,cities,state:document.getElementById('state').value,sources,limit:depth,forceRefresh:!!force});
+  if(mode==='guaranteed'){
+    // Every city (and trade) entered is the expansion pool: the run works city 1 until it
+    // runs out of room there, then moves on, so one request covers the whole list.
+    r=await post('/api/search',{mode:'guaranteed',niches,cities,state,sources,forceRefresh:!!force});
+  }else if(multi){
+    r=await post('/api/search-batch',{niches,cities,state,sources,limit:STANDARD_DEPTH,forceRefresh:!!force});
   }else{
-    r=await post('/api/search',{niche:niches[0],city:cities[0],state:document.getElementById('state').value,sources,limit:depth,forceRefresh:!!force});
+    r=await post('/api/search',{niche:niches[0],city:cities[0],state,sources,limit:STANDARD_DEPTH,forceRefresh:!!force});
   }
   stopProgress();
   btn.disabled=false;rb.disabled=false;
   if(!r.ok){stErr(r.error);return}
-  render(r.stats,r.prospects,multi?'batch':(r.cached?'cached':'fresh'));
+  render(r.stats,r.prospects,mode==='guaranteed'?'guaranteed':(multi?'batch':(r.cached?'cached':'fresh')),r);
   loadMemory();
 }
 async function loadMemory(){
@@ -903,7 +1054,9 @@ function prDismissWelcome(){
 //   qualified    no website, still active      call these today
 //   inactive     no website, but gone quiet    backups for later
 //   has_website  already online                grab-later rebuild pitches
-// GROUPS is kept around after render so "Move all to CRM" can post the whole group.
+// Every one of them is already in the user's companies by the time this runs: the server
+// files a search's results before it answers, so these groups are a view of what was
+// saved, not a staging area waiting on a click.
 var GROUP_KEYS=['qualified','inactive','has_website'];
 var GROUPS={qualified:[],inactive:[],has_website:[]};
 function bucketOf(p){
@@ -930,12 +1083,12 @@ function searchSummary(){
   var stv=(document.getElementById('state').value||'').trim();
   var all=document.getElementById('allNiches').checked;
   var trade=all?'All trades':((document.getElementById('niche').value||'').trim()||'any trade');
-  var dsel=document.getElementById('limit');
-  var depth=dsel?dsel.options[dsel.selectedIndex].text:'';
+  var msel=document.getElementById('mode');
+  var modeTxt=msel?msel.options[msel.selectedIndex].text:'';
   var src=document.getElementById('source');
   var srcTxt=src&&src.value!=='all'?srcName(src.value):'all sources';
   return esc(trade)+' in '+esc(cities)+(stv?', '+esc(stv):'')+
-    ' <span class="muted">'+esc(depth)+', '+esc(srcTxt)+'</span>';
+    ' <span class="muted">'+esc(modeTxt)+', '+esc(srcTxt)+'</span>';
 }
 function collapseSearch(){
   var p=document.getElementById('searchpanel'),b=document.getElementById('srchbar');
@@ -956,13 +1109,13 @@ function openSearch(){
 // different types of lead, and they sit behind tabs: only one list is on screen at a
 // time, so every business gets the whole row rather than a third of it.
 var TAB='qualified';   // which bucket's table is showing
-var MOVED={};          // bucket -> {added,skipped} once its "Move all" has gone through
+var SAVED={};          // bucket -> {added,skipped}, the server's receipt for this search
 function firstFilled(){
   for(var i=0;i<GROUP_KEYS.length;i++){var k=GROUP_KEYS[i];if((GROUPS[k]||[]).length)return k}
   return GROUP_KEYS[0];
 }
-// What a tab counts: businesses in that list you haven't taken yet.
-function leftIn(key){return (GROUPS[key]||[]).filter(function(p){return !p.moved}).length}
+// What a tab counts: how many businesses this scan put in that list.
+function leftIn(key){return (GROUPS[key]||[]).length}
 function totalFound(){var n=0;GROUP_KEYS.forEach(function(k){n+=(GROUPS[k]||[]).length});return n}
 
 function tabsHtml(){
@@ -990,13 +1143,25 @@ function paintTabs(){
 }
 function pickTab(key){TAB=key;paintTabs();paintBody();}
 
+// The receipt: what filing this list actually changed. It replaces the bulk-move button,
+// because there is nothing left to press: the saving already happened.
+function receiptText(added,skipped){
+  var a=added===1?'<b>1</b> new company added to your lists':'<b>'+added.toLocaleString()+'</b> new companies added to your lists';
+  if(!added&&skipped)return skipped===1?'That one was already in your lists':'All <b>'+skipped.toLocaleString()+'</b> were already in your lists';
+  if(!skipped)return a;
+  return a+', '+(skipped===1?'<b>1</b> was':'<b>'+skipped.toLocaleString()+'</b> were')+' already there';
+}
 function toolsHtml(key){
-  var lead=key==='qualified';
+  // A restore has no receipt to show: the saving happened when the search itself ran, so
+  // the line states where these companies already are instead of claiming a change.
+  var s=SAVED&&SAVED[key];
+  var line=s?receiptText(Number(s.added)||0,Number(s.skipped)||0):'These are all in your companies';
   return '<div class="cotools">'+
     '<div class="cofind"><span class="cf-i">'+ICONS.search+'</span>'+
       '<input id="cofind" type="text" autocomplete="off" placeholder="Search these results" oninput="filterRows()"></div>'+
-    '<button class="moveall'+(lead?'':' ghost')+'" id="mv-'+key+'" onclick="moveGroup(event,\\''+key+'\\')"'+
-      (leftIn(key)?'':' disabled')+'>'+ICONS.crm+' Move all to CRM</button>'+
+    '<div class="receipt" id="rc-'+key+'"><span class="ok">'+ICONS.check+'</span>'+
+      '<span>'+line+'</span>'+
+      '<a href="/leads">Open companies</a></div>'+
   '</div>';
 }
 function tableHtml(key,list){
@@ -1007,34 +1172,43 @@ function tableHtml(key,list){
       '<tr id="conone" class="norow gone"><td colspan="8" class="co-empty">No businesses here match that search.</td></tr>'+
     '</tbody></table></div>';
 }
-// The table area for whichever tab is selected: the receipt if it's been moved, an
-// empty-state line if the scan put nothing here, otherwise the toolbar and the table.
+// The table area for whichever tab is selected: an empty-state line if the scan put
+// nothing here, otherwise the toolbar (filter plus receipt) and the table.
 function paintBody(){
   var host=document.getElementById('cobody');
   if(!host)return;
   var key=TAB;
-  if(MOVED[key]){host.innerHTML=doneHtml(key,MOVED[key].added,MOVED[key].skipped);return}
   var list=GROUPS[key]||[];
   if(!list.length){host.innerHTML='<div class="co-empty">Nothing in this list from the last scan.</div>';return}
   host.innerHTML=toolsHtml(key)+tableHtml(key,list);
-}
-// Once a list has been moved, its table shrinks to a one-line receipt so the eye moves on.
-function collapseGroup(key,added,skipped){
-  MOVED[key]={added:added,skipped:skipped};
-  paintTabs();
-  if(TAB===key)paintBody();
-}
-function doneHtml(key,added,skipped){
-  var meta=BUCKETS[key]||{title:key};
-  var extra=skipped?', <span class="muted"><b>'+skipped+'</b> already in your CRM</span>':'';
-  return '<div class="grp-done" id="done-'+key+'"><span class="ok">'+ICONS.check+'</span>'+
-    '<span>'+esc(meta.title)+': <b>'+added+'</b> moved to your companies'+extra+'</span>'+
-    '<a href="/leads">Open companies</a></div>';
 }
 
 // ── One row ──
 function dash(){return '<span class="c-mut">--</span>'}
 function cell(v){return v?'<span class="c-mut">'+esc(String(v))+'</span>':dash()}
+// A phone number on a table is something you dial, so it is a tel: link. The href is the
+// bare digits (a leading + survives, since it is what makes an international number work);
+// what you read stays exactly as the scan found it.
+function telHref(v){
+  var s=String(v||'').trim();
+  if(!s)return '';
+  var plus=s.charAt(0)==='+';
+  var d=s.replace(/[^0-9]/g,'');
+  return d?(plus?'+':'')+d:'';
+}
+function phoneCell(v){
+  var href=telHref(v);
+  if(!href)return cell(v);
+  return '<a class="c-tel" href="tel:'+esc(href)+'">'+esc(String(v))+'</a>';
+}
+// The source cell opens the listing the scan actually found: the Maps place, the Facebook
+// page, the Instagram profile. With no URL on the row it stays the plain platform name.
+function sourceCell(p){
+  var name=srcName(p.source);
+  var url=p.listingUrl||'';
+  if(!/^https?:\\/\\//i.test(url))return cell(name);
+  return '<a class="c-src" href="'+esc(url)+'" target="_blank" rel="noopener" title="Open this '+esc(name)+' listing">'+esc(name)+ICONS.external+'</a>';
+}
 // Why this business landed in the list it did, kept to one line.
 function activityCell(p){
   if(p.activeStatus==='active'){
@@ -1053,9 +1227,9 @@ function row(p,bucket){
   var hideBtn = isStored(p.id)
     ? '<button class="hide" onclick="hideLead(\\''+p.id+'\\')" title="Mark off so it never shows in a future search">'+ICONS.x+'</button>'
     : '';
-  var addBtn = p.saved||p.moved
-    ? '<button class="save saved-on" id="s-'+p.id+'" disabled>'+ICONS.check+' In your companies</button>'
-    : '<button class="save" id="s-'+p.id+'" onclick="addLead(\\''+p.id+'\\',\\''+bucket+'\\')">'+ICONS.crm+' Add</button>';
+  // Nothing to add: the server filed this row before the page ever saw it, so the state
+  // it renders in is the finished one.
+  var addBtn = '<button class="save saved-on" id="s-'+p.id+'" disabled>'+ICONS.check+' In your companies</button>';
   // License/registration signal, from the business's own profile text. Only worth a
   // badge when there is one; "nothing found" is the normal case and just adds noise.
   var lic=p.license||{};
@@ -1070,9 +1244,9 @@ function row(p,bucket){
     '<td class="c-name"><span class="c-nm">'+esc(p.name||'')+'</span>'+tags+'</td>'+
     '<td>'+cell(p.category)+'</td>'+
     '<td>'+cell(place)+'</td>'+
-    '<td>'+cell(p.phone)+'</td>'+
+    '<td>'+phoneCell(p.phone)+'</td>'+
     '<td>'+(p.email?'<span class="c-em" title="'+esc(p.email)+'">'+esc(p.email)+'</span>':dash())+'</td>'+
-    '<td>'+cell(srcName(p.source))+'</td>'+
+    '<td>'+sourceCell(p)+'</td>'+
     '<td>'+activityCell(p)+'</td>'+
     '<td class="c-act">'+addBtn+hideBtn+'</td>'+
   '</tr>';
@@ -1093,37 +1267,7 @@ function filterRows(){
   var none=document.getElementById('conone');
   if(none)none.classList.toggle('gone',shown>0);
 }
-async function moveGroup(e,key){
-  if(e){e.preventDefault();e.stopPropagation()}
-  var list=(GROUPS[key]||[]).filter(function(p){return !p.moved});
-  if(!list.length)return;
-  var b=document.getElementById('mv-'+key);
-  if(b){b.disabled=true;b.innerHTML=ICONS.clock+' Moving…'}
-  var r=await post('/api/crm/move',{prospects:list,bucket:key});
-  if(!r||!r.ok){if(b){b.disabled=false;b.innerHTML=ICONS.warn+' Try again'}return}
-  list.forEach(function(p){p.moved=true});
-  collapseGroup(key,r.added||0,r.skipped||0);
-}
-function findProspect(id){
-  for(var i=0;i<GROUP_KEYS.length;i++){
-    var l=GROUPS[GROUP_KEYS[i]]||[];
-    for(var j=0;j<l.length;j++)if(String(l[j].id)===String(id))return l[j];
-  }
-  return null;
-}
-async function addLead(id,bucket){
-  var p=findProspect(id);
-  if(!p)return;
-  var b=document.getElementById('s-'+id);
-  if(b)b.disabled=true;
-  var r=await post('/api/crm/move',{prospects:[p],bucket:bucket});
-  if(!r||!r.ok){if(b){b.disabled=false;b.innerHTML=ICONS.warn+' Try again'}return}
-  p.moved=true;
-  if(b){b.innerHTML=ICONS.check+' In your companies';b.classList.add('saved-on');b.onclick=null}
-  paintTabs(); // one fewer left in this list
-}
-
-function render(s,prospects,mode){
+function render(s,prospects,mode,resp){
   document.getElementById('statsWrap').innerHTML=
     '<div class="stats" style="grid-template-columns:repeat(3,1fr)">'+
     stat(s.qualified,'No-website companies','good')+stat(s.scanned||0,'Scanned')+stat(s.hasWebsite!=null?s.hasWebsite:0,'Already had a site')+
@@ -1131,9 +1275,17 @@ function render(s,prospects,mode){
   // After a search the user just ran, glide down to the results so they don't have to
   // scroll to find them. Skip on 'restored' (that fires on page load, so jumping would jar).
   if(mode!=='restored'){var __sw=document.getElementById('statsWrap');if(__sw)setTimeout(function(){__sw.scrollIntoView({behavior:'smooth',block:'start'});},80);}
-  if(!prospects.length){st(mode==='fresh'||mode==='batch'?'Nothing came back. Try a higher Depth, more cities, or All trades.':'No results yet. Hit Search to find some.');return}
+  SAVED=(resp&&resp.saved)||null;
+  if(!prospects.length){st(mode==='fresh'||mode==='batch'||mode==='guaranteed'?'Nothing came back. Try more cities, another trade, or All trades.':'No results yet. Hit Search to find some.');return}
   GROUPS=groupProspects(prospects);
-  var msg = mode==='cached' ? 'Saved results, <b>no credits used</b>. Hit Re-scan for fresh data.'
+  var g=(resp&&resp.guarantee)||null;
+  // When the guarantee was met the headline is the promise kept. When a cap stopped it
+  // short, say so plainly and say what it cost, because the price changed with it.
+  var gmsg = !g ? ''
+    : g.met ? 'Found your <b>'+g.target+' no-website companies</b>.'
+    : 'Found <b>'+g.found+' of '+g.target+'</b>. You were charged for the scan, not the guarantee.';
+  var msg = mode==='guaranteed' ? gmsg
+          : mode==='cached' ? 'Saved results, <b>no credits used</b>. Hit Re-scan for fresh data.'
           : mode==='restored' ? 'Restored your last search. No credits used.'
           : mode==='batch' ? 'Batch scan done across <b>'+(s.cells||'?')+'</b> trade and city combos.'
           : 'Scan finished.';
@@ -1147,8 +1299,7 @@ function render(s,prospects,mode){
   st(msg+' &nbsp;<span class="muted">('+prospects.length+' shown)</span>'+hid+merged);
   // The value story first: how much ground the scan covered for them.
   var scanned=Number(s.scanned||0);
-  var head=scanned?'<div class="scanline">We scanned <b>'+scanned.toLocaleString()+' businesses</b> for you and sorted them into the three lists below.</div>':'';
-  MOVED={};
+  var head=scanned?'<div class="scanline">We scanned <b>'+scanned.toLocaleString()+' businesses</b> for you, and every one below is already saved to your companies.</div>':'';
   TAB=firstFilled();
   document.getElementById('results').innerHTML=
     '<section class="copanel">'+
@@ -1173,8 +1324,10 @@ async function restoreLast(){
   if(q.state)document.getElementById('state').value=q.state;
   if(q.niche)document.getElementById('niche').value=q.niche;
   if(q.sources){const v=q.sources.length>1?'all':q.sources[0];document.getElementById('source').value=v;}
-  if(q.limit)document.getElementById('limit').value=String(q.limit);
-  render(r.stats,r.prospects,'restored');
+  const ms=document.getElementById('mode');
+  if(ms)ms.value=q.mode==='guaranteed'?'guaranteed':'standard';
+  updateEstimate();
+  render(r.stats,r.prospects,'restored',r);
 }
 restoreLast();
 // Keep the cost estimate live as the user changes city/niche/source/depth.
@@ -1278,6 +1431,34 @@ function licenseTagHtml(l) {
 const dashCell = () => '<span class="c-mut">--</span>';
 const mutedCell = (v) => (v ? `<span class="c-mut">${esc(String(v))}</span>` : dashCell());
 
+// A phone number is something you dial, so it is a tel: link on every page that shows one.
+// The href is the bare digits (a leading + survives, since that is what makes an
+// international number dial); the number you read stays exactly as it was scraped.
+function telHref(v) {
+  const s = String(v ?? "").trim();
+  if (!s) return "";
+  const plus = s.startsWith("+");
+  const digits = s.replace(/[^0-9]/g, "");
+  return digits ? (plus ? "+" : "") + digits : "";
+}
+function phoneCell(v) {
+  const href = telHref(v);
+  if (!href) return mutedCell(v);
+  return `<a class="c-tel" href="tel:${esc(href)}">${esc(String(v))}</a>`;
+}
+
+// The listing this company was found on, as a small link in its name's tag line: the Maps
+// place, the Facebook page, the Instagram profile. Nothing at all when the source gave us
+// no URL, rather than a link that goes nowhere.
+function listingLinkHtml(l) {
+  let lj = {};
+  try { lj = l.lead_json ? JSON.parse(l.lead_json) : {}; } catch {}
+  const url = listingUrlFor({ source: l.source, external_id: l.external_id, ...lj });
+  if (!url) return "";
+  const name = srcLabel(l.source);
+  return `<a class="c-src" href="${esc(url)}" target="_blank" rel="noopener" title="Open this ${esc(name)} listing">${esc(name)}${icon("external", 11)}</a>`;
+}
+
 const CRM_COLS = 7;
 
 // One lead: the table row, plus the notes row that expands underneath it. Notes, the
@@ -1302,7 +1483,8 @@ function renderCrmRow(l) {
   const stage = l.crm_stage || "";
   const tag = bucket === "has_website" ? "" : '<span class="badge">no website</span>';
   const lic = licenseTagHtml(l);
-  const tags = tag || lic ? `<span class="c-tags">${tag}${lic}</span>` : "";
+  const listing = listingLinkHtml(l);
+  const tags = tag || lic || listing ? `<span class="c-tags">${tag}${lic}${listing}</span>` : "";
   // What the toolbar filter matches on. Stage and notes are in here too, so the page
   // script rewrites data-k whenever either of them changes.
   const base = [l.name, l.category, l.city, l.state, l.phone, l.email].filter(Boolean).join(" ").toLowerCase();
@@ -1317,7 +1499,7 @@ function renderCrmRow(l) {
   return `<tr class="crmrow" id="crm-${l.id}" data-bucket="${bucket}" data-fu="${fu.ts || 0}" data-base="${esc(base)}" data-stage="${esc(stage)}" data-notes="${esc(notes)}" data-k="${esc(`${base} ${stage} ${notes}`.toLowerCase())}">
     <td class="c-name"><span class="c-nm">${esc(l.name)}</span>${tags}</td>
     <td>${mutedCell(place)}</td>
-    <td>${mutedCell(l.phone)}</td>
+    <td>${phoneCell(l.phone)}</td>
     <td><select class="stage" title="Where this company stands" onchange="setStage(${l.id},this.value)">${opts}</select></td>
     <td class="fucell">${fuCell}</td>
     <td class="c-note"><button type="button" class="notebtn${notes ? " on" : ""}" id="nb-${l.id}" aria-expanded="false" aria-controls="note-${l.id}" title="${notes ? "Notes on this company" : "Add notes"}" onclick="toggleNote(${l.id})">${icon("note", 14)}</button></td>
