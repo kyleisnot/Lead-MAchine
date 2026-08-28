@@ -8,6 +8,12 @@ import { dirname, join } from "path";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const db = new Database(join(__dirname, "leads.db"));
 db.pragma("journal_mode = WAL");
+// SQLite enforces foreign keys per connection, and only when asked. better-sqlite3 already
+// turns them on for us, so this is a restatement rather than a change: wins.lead_id is the
+// one foreign key in this file, it is declared ON DELETE SET NULL, and that clause is what
+// makes deleting a company blank the link instead of erasing the revenue it closed. Saying
+// it out loud means a driver default flipping later cannot quietly cost us that.
+db.pragma("foreign_keys = ON");
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS leads (
@@ -530,6 +536,10 @@ export function removeFollowup(id) {
 }
 
 // ── Wins: a user's closed deals — their trophy case (mirrors the Supabase `wins` table) ──
+// A win is one of two things:
+//   linked  → lead_id points at a saved company, and the win mirrors that company's Won stage.
+//   manual  → lead_id is null, a deal typed in by hand for work that came from outside the tool.
+// Stage changes only ever touch linked wins, so a manual win is never disturbed.
 db.exec(`CREATE TABLE IF NOT EXISTS wins (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
   client_name TEXT NOT NULL,
@@ -537,21 +547,178 @@ db.exec(`CREATE TABLE IF NOT EXISTS wins (
   note        TEXT NOT NULL DEFAULT '',
   created_at  TEXT NOT NULL DEFAULT (datetime('now'))
 )`);
-// clientName is required; amount is a number-or-null (a win with no dollar figure is fine).
-export function addWin({ clientName, amount, note } = {}) {
+
+// Guarded column add, the same PRAGMA probe the leads and profiles tables use, so a database
+// created by an older build picks lead_id up on the next boot. The column defaults to NULL,
+// which is both what SQLite requires to add a REFERENCES column in place and the value that
+// means "manual win". ON DELETE SET NULL is the point of the whole design: deleting a company
+// must blank the link, never erase closed revenue.
+{
+  const wcols = new Set(db.prepare(`PRAGMA table_info(wins)`).all().map((c) => c.name));
+  if (!wcols.has("lead_id")) {
+    db.exec(`ALTER TABLE wins ADD COLUMN lead_id INTEGER REFERENCES leads(id) ON DELETE SET NULL`);
+  }
+}
+// SQLite is single-user, so the Postgres (user_id, lead_id) pair is just lead_id here. The
+// index names match Postgres so the two schemas read the same.
+db.exec(`CREATE INDEX IF NOT EXISTS wins_user_lead_idx ON wins (lead_id)`);
+// At most one linked win per company. Partial, so any number of manual wins (lead_id null) fit.
+db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS wins_user_lead_uniq ON wins (lead_id) WHERE lead_id IS NOT NULL`);
+
+// A lead id as a positive number, or null for "not linked". Anything unparseable is null,
+// so a stray value can never point a win at a company that is not there.
+function winLeadId(v) {
+  if (v === "" || v === null || v === undefined) return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+// The camelCase shape the store hands back for a single win.
+function winShape(r) {
+  if (!r) return null;
+  return {
+    id: r.id,
+    clientName: r.client_name,
+    amount: r.amount == null ? null : Number(r.amount),
+    note: r.note ?? "",
+    createdAt: r.created_at,
+    leadId: r.lead_id ?? null,
+  };
+}
+
+// clientName is required; amount is a number-or-null (a win with no dollar figure is fine);
+// leadId is optional and defaults to null (a manual win).
+export function addWin({ clientName, amount, note, leadId } = {}) {
   const info = db
-    .prepare(`INSERT INTO wins (client_name, amount, note) VALUES (?,?,?)`)
-    .run(String(clientName), amount == null ? null : Number(amount), note ? String(note) : "");
+    .prepare(`INSERT INTO wins (client_name, amount, note, lead_id) VALUES (?,?,?,?)`)
+    .run(
+      String(clientName),
+      amount == null ? null : Number(amount),
+      note ? String(note) : "",
+      winLeadId(leadId)
+    );
   return info.lastInsertRowid;
 }
-// Newest first; id breaks ties when two wins share a created_at second.
+
+// Newest first; id breaks ties when two wins share a created_at second. Each row carries the
+// linked company's name/city/state, or nulls when the win is manual or its company is gone.
 export function listWins() {
-  return db.prepare(`SELECT * FROM wins ORDER BY created_at DESC, id DESC`).all();
+  return db
+    .prepare(
+      `SELECT w.id, w.client_name, w.amount, w.note, w.created_at, w.lead_id,
+              l.name AS lead_name, l.city AS lead_city, l.state AS lead_state
+       FROM wins w LEFT JOIN leads l ON l.id = w.lead_id
+       ORDER BY w.created_at DESC, w.id DESC`
+    )
+    .all()
+    .map((r) => ({
+      id: r.id,
+      client_name: r.client_name,
+      amount: r.amount,
+      note: r.note,
+      created_at: r.created_at,
+      lead_id: r.lead_id ?? null,
+      leadId: r.lead_id ?? null,
+      name: r.lead_name ?? null,
+      city: r.lead_city ?? null,
+      state: r.lead_state ?? null,
+    }));
 }
+
+// The win linked to one company, or null. Never returns a manual win.
+export function winForLead(leadId) {
+  const lead = winLeadId(leadId);
+  if (lead == null) return null;
+  return winShape(db.prepare(`SELECT * FROM wins WHERE lead_id=?`).get(lead));
+}
+
+// Create the linked win if it is missing, otherwise edit the one that is there. Fields left
+// undefined are left alone, so flipping a company to Won a second time cannot wipe an amount
+// the user typed. Runs in one transaction, and the partial unique index is the backstop.
+export const setWinForLead = db.transaction((leadId, { clientName, amount, note } = {}) => {
+  const lead = winLeadId(leadId);
+  if (lead == null) throw new Error("setWinForLead: a leadId is required");
+  const existing = db.prepare(`SELECT * FROM wins WHERE lead_id=?`).get(lead);
+  const client = String(clientName ?? "").trim();
+
+  if (!existing) {
+    // No name given (a plain stage flip): borrow the company's own name.
+    const name = client || String(db.prepare(`SELECT name FROM leads WHERE id=?`).get(lead)?.name || "").trim();
+    if (!name) throw new Error("setWinForLead: a client/trade name is required");
+    db.prepare(`INSERT INTO wins (client_name, amount, note, lead_id) VALUES (?,?,?,?)`).run(
+      name,
+      amount === undefined || amount === null ? null : Number(amount),
+      note === undefined || note === null ? "" : String(note),
+      lead
+    );
+    return winShape(db.prepare(`SELECT * FROM wins WHERE lead_id=?`).get(lead));
+  }
+
+  if (amount !== undefined) {
+    db.prepare(`UPDATE wins SET amount=? WHERE id=?`).run(amount === null ? null : Number(amount), existing.id);
+  }
+  if (note !== undefined) {
+    db.prepare(`UPDATE wins SET note=? WHERE id=?`).run(note === null ? "" : String(note), existing.id);
+  }
+  if (client && client !== existing.client_name) {
+    db.prepare(`UPDATE wins SET client_name=? WHERE id=?`).run(client, existing.id);
+  }
+  return winShape(db.prepare(`SELECT * FROM wins WHERE id=?`).get(existing.id));
+});
+
+// Delete ONLY the win linked to this company. A manual win (lead_id null) is never matched.
+export function removeWinForLead(leadId) {
+  const lead = winLeadId(leadId);
+  if (lead == null) return { removed: 0 };
+  const info = db.prepare(`DELETE FROM wins WHERE lead_id=?`).run(lead);
+  return { removed: info.changes ? 1 : 0 };
+}
+
+// count/total are every win ever; monthCount/monthTotal are the current calendar month;
+// valuedCount is the wins that carry a real dollar figure (not null, not zero) and avgValued
+// is the all-time total spread across those, so unpriced wins never drag the average down.
 export function winStats() {
-  const row = db.prepare(`SELECT COUNT(*) count, COALESCE(SUM(amount),0) total FROM wins`).get();
-  return { count: row.count || 0, total: row.total || 0 };
+  const row = db
+    .prepare(
+      `SELECT COUNT(*) count,
+              COALESCE(SUM(amount),0) total,
+              COALESCE(SUM(CASE WHEN created_at >= datetime('now','start of month') THEN 1 ELSE 0 END),0) monthCount,
+              COALESCE(SUM(CASE WHEN created_at >= datetime('now','start of month') THEN amount ELSE 0 END),0) monthTotal,
+              COALESCE(SUM(CASE WHEN amount IS NOT NULL AND amount <> 0 THEN 1 ELSE 0 END),0) valuedCount
+       FROM wins`
+    )
+    .get();
+  const count = row.count || 0;
+  const total = row.total || 0;
+  const valuedCount = row.valuedCount || 0;
+  return {
+    count,
+    total,
+    monthCount: row.monthCount || 0,
+    monthTotal: row.monthTotal || 0,
+    valuedCount,
+    avgValued: valuedCount ? total / valuedCount : 0,
+  };
 }
+
+// Won/lost out of the companies the user actually works, scoped exactly like the Companies
+// page: saved and not dismissed. decided is what a rate can be computed from; inPlay is
+// everything still open. ratePct is 0 rather than NaN when nothing has been decided yet.
+export function winRate() {
+  const row = db
+    .prepare(
+      `SELECT COALESCE(SUM(CASE WHEN crm_stage='Won'  THEN 1 ELSE 0 END),0) won,
+              COALESCE(SUM(CASE WHEN crm_stage='Lost' THEN 1 ELSE 0 END),0) lost,
+              COALESCE(SUM(CASE WHEN crm_stage NOT IN ('Won','Lost') THEN 1 ELSE 0 END),0) inPlay
+       FROM leads WHERE saved=1 AND dismissed=0`
+    )
+    .get();
+  const won = row.won || 0;
+  const lost = row.lost || 0;
+  const decided = won + lost;
+  return { won, lost, decided, ratePct: decided ? Math.round((won / decided) * 100) : 0, inPlay: row.inPlay || 0 };
+}
+
 export function removeWin(id) {
   db.prepare(`DELETE FROM wins WHERE id=?`).run(id);
 }

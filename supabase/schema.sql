@@ -169,15 +169,28 @@ create trigger on_auth_user_created
   for each row execute function public.handle_new_user();
 
 -- ── wins: a user's closed deals — their trophy case, and the operator's "did they sell" signal ──
+-- A win is one of two things:
+--   linked  → lead_id points at a saved company, and the win mirrors that company's Won stage.
+--             Setting a company to Won creates it; moving it off Won removes it.
+--   manual  → lead_id is null, a deal typed in by hand for work from outside the tool.
+-- lead_id is deliberately nullable with ON DELETE SET NULL, not cascade: deleting a company
+-- must blank the link and keep the win, because closed revenue has to outlive the record it
+-- came from.
 create table if not exists public.wins (
   id          bigint generated always as identity primary key,
   user_id     uuid not null default auth.uid() references auth.users(id) on delete cascade,
   client_name text not null,
   amount      numeric,
   note        text not null default '',
-  created_at  timestamptz not null default now()
+  created_at  timestamptz not null default now(),
+  lead_id     bigint references public.leads(id) on delete set null
 );
 create index if not exists wins_user_idx on public.wins (user_id, created_at desc);
+create index if not exists wins_user_lead_idx on public.wins (user_id, lead_id);
+-- One linked win per company, per user. Partial, so any number of manual wins (lead_id null)
+-- still fit: a NULL is not equal to another NULL, but being explicit is what makes the intent
+-- unmistakable and keeps the index small.
+create unique index if not exists wins_user_lead_uniq on public.wins (user_id, lead_id) where lead_id is not null;
 alter table public.wins enable row level security;
 create policy "own wins" on public.wins
   for all using (user_id = auth.uid()) with check (user_id = auth.uid());

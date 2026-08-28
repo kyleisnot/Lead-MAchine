@@ -37,7 +37,7 @@ export const adminRouter = express.Router();
 // other hand-edited string) are NOT migrated: normalizeTier / planFor tolerate an
 // unknown tier, so such a user still renders, still saves, and counts $0 toward
 // MRR until the operator reassigns them by hand.
-const PLANS = {
+export const PLANS = {
   prospect: { label: "Prospect (demo)", tokens: 1, price: 0 },
   trial: { label: "Trial", tokens: 300, price: 0 },
   starter: { label: "Starter", tokens: 800, price: 50 },

@@ -21,7 +21,10 @@ import { isRealWebsiteUrl } from "../scrapers/filter.js";
 import { THEME_INIT_SCRIPT, SHELL_TAIL_SCRIPT, SHARED_CSS, sidebar, FAVICON } from "./shell.js";
 import { authRouter, requireUser } from "./auth.js";
 import { accountRouter } from "./account.js";
-import { adminRouter } from "./admin.js";
+// PLANS is the operator's price list (admin.js owns it). The Wins page reads the current
+// tier's monthly price from it to work out what the month's closed revenue is worth
+// against what the plan costs. admin.js does not import this file, so nothing circles.
+import { adminRouter, PLANS } from "./admin.js";
 import { demoRouter } from "./demo.js";
 import "dotenv/config";
 
@@ -53,6 +56,8 @@ function icon(key, size = 15) {
     dot: '<circle cx="12" cy="12" r="5"></circle>',
     badge: '<rect x="2" y="5" width="20" height="14" rx="2"></rect><circle cx="8.5" cy="12" r="2.5"></circle><path d="M14 10.5h4M14 14h4"></path>',
     calendar: '<rect x="3" y="5" width="18" height="16" rx="2"></rect><path d="M3 10h18M8 3v4M16 3v4"></path>',
+    // The same trophy the sidebar draws for Wins, so the nav mark and the page header agree.
+    wins: '<path d="M8 21h8M12 17v4M7 4h10v4a5 5 0 0 1-10 0z"></path><path d="M7 6H4v1a4 4 0 0 0 3 3.9M17 6h3v1a4 4 0 0 1-3 3.9"></path>',
     // A written-on page: the per-row notes toggle on the Leads table.
     note: '<path d="M14.5 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8.5z"></path><path d="M14 3v6h6"></path><path d="M8.5 13h7M8.5 16.5h4.5"></path>',
     refresh: '<path d="M21 12a9 9 0 1 1-2.6-6.4"></path><polyline points="21 3 21 9 15 9"></polyline>',
@@ -453,9 +458,15 @@ app.post("/api/activity-feedback/:id", route(async (req, res) => {
   await store.setActivityFeedback(req.userId, req.params.id, verdict, seen || "");
   res.json({ ok: true, counts: await store.activityFeedbackCounts(req.userId) });
 }));
+// Stage, notes, or both. A stage change also settles this company's win (see
+// syncWinToStage), so the client never has to make two calls and can never end up looking
+// at a stage and a win that disagree. A notes-only save sends no stage and touches nothing.
 app.post("/api/crm/update/:id", route(async (req, res) => {
-  await store.updateCrm(req.userId, req.params.id, { stage: req.body.stage, notes: req.body.notes });
-  res.json({ ok: true });
+  const stage = req.body?.stage;
+  await store.updateCrm(req.userId, req.params.id, { stage, notes: req.body?.notes });
+  if (stage === undefined || stage === null || String(stage) === "") return res.json({ ok: true });
+  const { win, removed } = await syncWinToStage(req.userId, req.params.id, stage);
+  res.json({ ok: true, stage: String(stage), win: winPayload(win), removed });
 }));
 
 // ── LEADS: one page, three bucket tabs, each with a working + follow-up list ──
@@ -563,10 +574,75 @@ app.get("/api/last-search", route(async (req, res) => {
 // filed when the search itself ran, and re-filing them on every page load would let a
 // company the user has since removed from their companies quietly come back.
 
-// ── WINS: the user's closed-deal trophy case ──
-// One page: a headline stat, a "log a win" form, and the list of wins. The API is
-// user-scoped through ../data/store.js exactly like every other data call here.
+// ── WINS: the user's closed-deal scoreboard ──
+// A win is not a separate thing you type up. Marking a company Won on the Companies page
+// IS logging the win, moving it off Won takes that win back off the board, and the amount
+// is filled in from the row. Hand-typed wins still exist for deals done outside the tool:
+// those carry no lead and nothing here ever touches them. The API is user-scoped through
+// ../data/store.js exactly like every other data call in this file.
 app.get("/wins", route(async (req, res) => res.send(await renderWinsPage(req))));
+
+// "$1,200" / " 1200 " / "1,200.50" → 1200 / 1200.5. A blank field, or anything that
+// isn't a usable non-negative number, is null: a win with no dollar figure on it. That is
+// the Skip case, and it still counts as a win: the deal closed, the revenue is unknown.
+function moneyOrNull(v) {
+  if (v === null || v === undefined) return null;
+  const s = String(v).replace(/[^0-9.]/g, "").trim();
+  if (!s) return null;
+  const n = Number(s);
+  return Number.isFinite(n) && n >= 0 ? n : null;
+}
+
+// The win shape the page scripts read back: amount is a number or null, never a string.
+function winPayload(w) {
+  if (!w) return null;
+  const amt = w.amount;
+  return {
+    id: w.id,
+    clientName: w.clientName ?? "",
+    amount: amt === null || amt === undefined || amt === "" ? null : Number(amt),
+    note: w.note || "",
+    leadId: w.leadId ?? null,
+  };
+}
+
+// Keep one company's win in step with the stage it just moved to. Won gets a win; every
+// other stage takes it away. The Won half deliberately leaves an existing win alone, so
+// marking the same company Won twice can never log it twice and can never wipe an amount
+// that was already recorded.
+async function syncWinToStage(userId, leadId, stage) {
+  if (String(stage) !== "Won") {
+    const r = await store.removeWinForLead(userId, leadId);
+    return { win: null, removed: Number(r?.removed) || 0 };
+  }
+  const existing = await store.winForLead(userId, leadId);
+  if (existing) return { win: existing, removed: 0 };
+  const lead = await store.getLead(userId, leadId);
+  const win = await store.setWinForLead(userId, leadId, {
+    clientName: (lead && lead.name) || "This company",
+    amount: null,
+    note: "",
+  });
+  return { win, removed: 0 };
+}
+
+// The amount (and note) on a company's win: what the prompt in the Companies row saves,
+// and what the row's "add amount" affordance fills in later. An upsert, so saving twice
+// edits the one win instead of logging a second. Guarded on the stage, because a win
+// that doesn't mirror a Won company is exactly the contradiction this model removes.
+app.post("/api/leads/:id/win", route(async (req, res) => {
+  const lead = await store.getLead(req.userId, req.params.id);
+  if (!lead) return res.status(404).json({ ok: false, error: "That company is not in your list." });
+  if (String(lead.crm_stage || "") !== "Won") {
+    return res.status(400).json({ ok: false, error: "Mark this company Won first." });
+  }
+  const win = await store.setWinForLead(req.userId, req.params.id, {
+    clientName: lead.name || "This company",
+    amount: moneyOrNull(req.body?.amount),
+    note: String(req.body?.note ?? "").trim(),
+  });
+  res.json({ ok: true, win: winPayload(win) });
+}));
 
 app.post("/api/wins", route(async (req, res) => {
   const { clientName, amount, note } = req.body || {};
@@ -1607,7 +1683,44 @@ const CRM_COLS = 7;
 // contact details and the license signal don't fit a 52px row, so they live in that
 // expansion instead of being dropped. Both lists render identical rows so a row can
 // move between them without the columns shifting; only the follow-up cell changes.
-function renderCrmRow(l) {
+// The amount already recorded against a Won company, sitting under its stage picker: the
+// figure itself when there is one, a quiet "add amount" when the win was logged without
+// one (the Skip case, or an amount not known yet). Either way it reopens the same editor.
+// Rendered on every row and shown only on the Won ones, so a stage change can reveal it
+// without the page having to build anything.
+function winChipHtml(id, win, stage) {
+  const raw = win ? win.amount : null;
+  const amt = raw === null || raw === undefined || raw === "" ? null : Number(raw);
+  const known = amt !== null && Number.isFinite(amt);
+  return `<button type="button" class="winchip${known ? "" : " addamt"}" id="wc-${id}" title="${
+    known ? "What this deal was worth. Click to change it." : "Add what this deal was worth"
+  }" onclick="openWin(${id})"${stage === "Won" ? "" : " hidden"}>${known ? esc(fmtMoney(amt)) : "add amount"}</button>`;
+}
+
+// The win prompt, as a row that expands under the company's own row: the same shape the
+// notes editor uses, so marking a company Won asks for the amount in place and the table
+// never jumps. It rides along hidden on every row and opens when the stage turns Won.
+function winRowHtml(l, win) {
+  const raw = win ? win.amount : null;
+  const amt = raw === null || raw === undefined || raw === "" ? "" : String(Number(raw));
+  const note = win && win.note ? String(win.note) : "";
+  return `<tr class="winrow" id="winrow-${l.id}" hidden><td class="wincell" colspan="${CRM_COLS}">
+    <div class="winpanel">
+      <div class="wintitle">${icon("wins", 15)}<span>Nice one. <b>${esc(l.name)}</b> is a win.</span></div>
+      <div class="winfields">
+        <label class="wf"><span class="wcap">Amount <span class="wopt">optional</span></span>
+          <span class="winput"><span class="wcur">$</span><input id="wa-${l.id}" type="text" inputmode="decimal" autocomplete="off" placeholder="2400" value="${esc(amt)}" onkeydown="winKey(event,${l.id})"></span></label>
+        <label class="wf wf-note"><span class="wcap">Note <span class="wopt">optional</span></span>
+          <input id="wn-${l.id}" type="text" autocomplete="off" placeholder="What closed it" value="${esc(note)}" onkeydown="winKey(event,${l.id})"></label>
+        <div class="wact"><button type="button" class="winsave" onclick="saveWin(${l.id})">Save</button><button type="button" class="winskip" onclick="skipWin(${l.id})">Skip</button></div>
+      </div>
+      <div class="winhint" id="wh-${l.id}">Skip and it still counts as a win. Add the amount from this row whenever you know it.</div>
+    </div>
+  </td></tr>`;
+}
+
+function renderCrmRow(l, winByLead) {
+  const win = (winByLead && winByLead.get(String(l.id))) || null;
   const opts = CRM_STAGES.map(
     (s) => `<option value="${s}"${l.crm_stage === s ? " selected" : ""}>${s}</option>`
   ).join("");
@@ -1642,7 +1755,7 @@ function renderCrmRow(l) {
     <td class="c-name"><span class="c-nm">${esc(l.name)}</span>${tags}</td>
     <td>${mutedCell(place)}</td>
     <td>${phoneCell(l.phone)}</td>
-    <td><select class="stage" title="Where this company stands" onchange="setStage(${l.id},this.value)">${opts}</select></td>
+    <td class="c-stage"><select class="stage" title="Where this company stands" onchange="setStage(${l.id},this.value)">${opts}</select>${winChipHtml(l.id, win, stage)}</td>
     <td class="fucell">${fuCell}</td>
     <td class="c-note"><button type="button" class="notebtn${notes ? " on" : ""}" id="nb-${l.id}" aria-expanded="false" aria-controls="note-${l.id}" title="${notes ? "Notes on this company" : "Add notes"}" onclick="toggleNote(${l.id})">${icon("note", 14)}</button></td>
     <td class="c-act"><div class="actwrap">${followMenu(l.id)}<select class="movebucket" title="Move this company to another list" onchange="moveBucket(${l.id},this.value,this)"><option value="">Move to</option>${moveOpts}</select><button class="rm" onclick="removeCrm(${l.id})">Remove</button></div></td>
@@ -1653,17 +1766,18 @@ function renderCrmRow(l) {
       <textarea class="notes" id="nt-${l.id}" rows="2" placeholder="What happened on this one" onchange="saveNote(${l.id})">${esc(notes)}</textarea>
       <div class="nact"><button type="button" class="nsave" onclick="saveNote(${l.id})">Save notes</button><span class="nok" id="nok-${l.id}"></span></div>
     </div>
-  </td></tr>`;
+  </td></tr>
+  ${winRowHtml(l, win)}`;
 }
 
 // One list as a table, in the same wrapper and with the same header the Search page uses.
 // Two tail rows ride along: the empty-state line, and the no-match line the filter shows.
-function crmTable(bucket, list, rows) {
+function crmTable(bucket, list, rows, winByLead) {
   const empty =
     list === "working" ? "Nothing in the working list." : "No follow-ups scheduled in this list.";
   return `<div class="cotwrap"><table class="cotable">
     <thead><tr><th>Company name</th><th>City, state</th><th>Phone</th><th>Stage</th><th>Follow up</th><th>Notes</th><th class="c-act"></th></tr></thead>
-    <tbody id="tb-${bucket}-${list}">${rows.map(renderCrmRow).join("")}<tr class="emptyrow"${
+    <tbody id="tb-${bucket}-${list}">${rows.map((l) => renderCrmRow(l, winByLead)).join("")}<tr class="emptyrow"${
       rows.length ? ' style="display:none"' : ""
     }><td colspan="${CRM_COLS}">${empty}</td></tr><tr class="norow gone"><td colspan="${CRM_COLS}" class="co-empty">No companies here match that search.</td></tr></tbody>
   </table></div>`;
@@ -1715,7 +1829,7 @@ function segBar(key, workingN, followupsN, due, seg) {
 // One bucket's whole content: the toggle and filter toolbar, then whichever of the two
 // lists is selected, full width. Both tables stay in the page (the hidden one included),
 // so a row can move between lists or buckets without a reload and the counts still add up.
-function bucketPane(key, data, active) {
+function bucketPane(key, data, active, winByLead) {
   const working = data.working || [];
   const followups = data.followups || [];
   const all = working.length + followups.length;
@@ -1731,10 +1845,10 @@ function bucketPane(key, data, active) {
       <div class="cofind"><span class="cf-i">${icon("search", 14)}</span><input id="find-${key}" type="text" autocomplete="off" placeholder="Search these companies" oninput="filterRows('${key}')"></div>
       <div class="cosum" id="sum-${key}">${sumText(working.length, followups.length)}</div>
     </div>
-    ${pane("working", crmTable(key, "working", working))}
+    ${pane("working", crmTable(key, "working", working, winByLead))}
     ${pane(
       "followups",
-      `<div class="lnote">Soonest first, so anything due sits at the top.</div>${crmTable(key, "followups", followups)}`
+      `<div class="lnote">Soonest first, so anything due sits at the top.</div>${crmTable(key, "followups", followups, winByLead)}`
     )}
   </div>
   <div class="co-empty" id="none-${key}"${all ? " hidden" : ""}>Nothing in this list yet. Move companies over from a search.</div>
@@ -1789,8 +1903,21 @@ function normalizeCrm(raw) {
 }
 
 async function renderLeadsPage(req) {
-  const [crmRaw, reminders] = await Promise.all([store.listCrm(req.userId), store.listFollowups(req.userId)]);
+  const [crmRaw, reminders, wins] = await Promise.all([
+    store.listCrm(req.userId),
+    store.listFollowups(req.userId),
+    // Same deploy-order safety net getProfile() carries: if the linked-win migration has
+    // not reached this project yet, the Companies page renders without the amounts rather
+    // than 500ing. The Wins page still fails loudly, which is where that belongs.
+    store.listWins(req.userId).catch(() => []),
+  ]);
   const crm = normalizeCrm(crmRaw);
+  // A win belongs to the company it came from, so every Won row can show its own amount
+  // (and reopen its own editor) without a second request. Hand-typed wins carry no lead
+  // and simply aren't in here.
+  const winByLead = new Map(
+    (wins || []).filter((w) => w.leadId !== null && w.leadId !== undefined).map((w) => [String(w.leadId), w])
+  );
 
   let total = 0;
   let scheduled = 0;
@@ -1817,7 +1944,7 @@ async function renderLeadsPage(req) {
   const activeTab =
     CRM_BUCKETS.find((b) => crm[b].working.length + crm[b].followups.length) || CRM_BUCKETS[0];
   const tabs = bucketTabs(crm, activeTab);
-  const panes = CRM_BUCKETS.map((b) => bucketPane(b, crm[b], b === activeTab)).join("");
+  const panes = CRM_BUCKETS.map((b) => bucketPane(b, crm[b], b === activeTab, winByLead)).join("");
 
   return `<!doctype html><html><head>${THEME_INIT_SCRIPT}<meta charset="utf-8">${FAVICON}<title>Prospector · Companies</title>
 <style>
@@ -1893,6 +2020,44 @@ ${TABLE_CSS}
   .nact{display:flex;align-items:center;gap:10px}
   .nsave{font-family:inherit;background:var(--accent);color:var(--on-accent);border:none;border-radius:8px;padding:7px 15px;font-size:13px;font-weight:700;cursor:pointer}
   .nok{font-size:12.5px;font-weight:600;color:var(--accent-ink)}
+  /* ── The win prompt ──
+     Marking a company Won is how a win gets logged, so the amount is asked for right
+     there in the row. Same expanding-row idiom as the notes editor above, for the same
+     reason: the table must not jump under the pointer that just changed the stage. */
+  .cotable td.wincell{height:auto;padding:0 0 14px}
+  .cotable tbody tr.winrow:hover{background:transparent}
+  .winpanel{display:flex;flex-direction:column;gap:10px;background:var(--surface2);border:1px solid var(--border);border-radius:10px;padding:12px 14px}
+  .wintitle{display:flex;align-items:center;gap:8px;font-size:13.5px;color:var(--muted)}
+  .wintitle svg{color:var(--accent);flex:none}
+  .wintitle b{color:var(--text)}
+  /* The table this sits in is 1040px wide and scrolls sideways, so the controls are
+     capped and packed left: Save and Skip must never end up off the visible edge. */
+  .winfields{display:flex;align-items:flex-end;flex-wrap:wrap;gap:10px;max-width:660px}
+  .wf{display:flex;flex-direction:column;gap:5px}
+  .wcap{font-size:12px;font-weight:600;color:var(--muted)}
+  .wopt{font-weight:400;color:var(--faint)}
+  .wf-note{flex:0 1 250px;min-width:150px}
+  /* The amount reads as money before anything is typed in it, so the currency mark is
+     part of the field rather than something the user has to type. */
+  .winput{display:flex;align-items:center;background:var(--surface);border:1px solid var(--border-strong);border-radius:8px;padding:0 11px}
+  .winput:focus-within{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-weak)}
+  .winput .wcur{font-size:13.5px;color:var(--faint)}
+  .winput input{width:104px;background:transparent;border:0;padding:9px 4px;color:var(--text);font-size:13.5px;font-family:inherit;font-variant-numeric:tabular-nums}
+  .winput input:focus{outline:none;box-shadow:none;border-color:transparent}
+  .wf-note input{width:100%;background:var(--surface);border:1px solid var(--border-strong);border-radius:8px;padding:9px 11px;color:var(--text);font-size:13.5px;font-family:inherit}
+  .wact{display:flex;align-items:center;gap:8px}
+  .winsave{font-family:inherit;background:var(--accent);color:var(--on-accent);border:none;border-radius:8px;padding:9px 17px;font-size:13px;font-weight:700;cursor:pointer}
+  .winsave:hover{filter:brightness(.96)}
+  .winskip{font-family:inherit;background:transparent;border:1px solid var(--border-strong);color:var(--muted);border-radius:8px;padding:9px 15px;font-size:13px;font-weight:600;cursor:pointer}
+  .winskip:hover{color:var(--text)}
+  .winhint{font-size:12px;color:var(--faint);line-height:1.5}
+  .winhint.bad{color:var(--danger)}
+  /* The amount a Won row carries, under its stage picker. Quiet and outlined while the
+     figure is still missing, filled once there is one. */
+  .winchip{display:inline-flex;align-items:center;max-width:100%;margin-top:6px;font-family:inherit;background:var(--accent-weak);border:1px solid transparent;color:var(--accent-ink);border-radius:7px;padding:2px 8px;font-size:11.5px;font-weight:700;cursor:pointer;font-variant-numeric:tabular-nums;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+  .winchip.addamt{background:transparent;border-color:var(--border-strong);color:var(--muted);font-weight:600}
+  .winchip.addamt:hover{color:var(--text);border-color:var(--accent)}
+  .winchip[hidden]{display:none}
   /* ── Follow-up control ── */
   .fudate{display:inline-flex;align-items:center;gap:5px;font-size:13px;font-weight:600;white-space:nowrap;color:var(--muted)}
   .fudate.soon{color:var(--warn)}.fudate.od{color:var(--danger)}
@@ -1995,10 +2160,68 @@ function pickSeg(key,list){
 }
 
 // ── stage / notes / remove ──
+// The stage IS the win: the server logs one the moment a company turns Won and takes it
+// away again the moment it leaves, both inside this one call, so the row can never show a
+// stage and a win that disagree. All this has to do is open the prompt for the amount.
 async function setStage(id,stage){
-  await post('/api/crm/update/'+id,{stage:stage});
+  var r=await post('/api/crm/update/'+id,{stage:stage});
   var row=document.getElementById('crm-'+id);
   if(row){row.setAttribute('data-stage',stage);refreshKey(row)}
+  if(!r||!r.ok)return;
+  paintWin(id,r.win,stage);
+  if(stage==='Won'&&r.win)openWin(id);else closeWin(id);
+}
+
+// ── the win on a row ──
+function fmtMoney(n){var v=Number(n)||0,c=v%1?2:0;return '$'+v.toLocaleString('en-US',{minimumFractionDigits:c,maximumFractionDigits:c})}
+function winRowOf(row){return document.getElementById('winrow-'+leadId(row))}
+// The chip under the stage picker, plus the editor's fields, from one win object.
+function paintWin(id,win,stage){
+  var amt=win&&win.amount!==null&&win.amount!==undefined&&win.amount!==''?Number(win.amount):null;
+  if(amt!==null&&!isFinite(amt))amt=null;
+  var chip=document.getElementById('wc-'+id);
+  if(chip){
+    chip.hidden=stage!=='Won';
+    chip.textContent=amt===null?'add amount':fmtMoney(amt);
+    chip.classList.toggle('addamt',amt===null);
+    chip.title=amt===null?'Add what this deal was worth':'What this deal was worth. Click to change it.';
+  }
+  var a=document.getElementById('wa-'+id);
+  if(a)a.value=amt===null?'':String(amt);
+  var n=document.getElementById('wn-'+id);
+  if(n)n.value=win&&win.note?win.note:'';
+  var h=document.getElementById('wh-'+id);
+  if(h){h.classList.remove('bad');h.textContent='Skip and it still counts as a win. Add the amount from this row whenever you know it.'}
+}
+// Open the prompt and put the caret in the amount, so the one thing being asked for can
+// be typed without a second click.
+function openWin(id){
+  var row=document.getElementById('crm-'+id);
+  if(!row)return;
+  row.classList.add('winopen');
+  syncSubRows(row);
+  var a=document.getElementById('wa-'+id);
+  if(a){a.focus();try{a.setSelectionRange(a.value.length,a.value.length)}catch(e){}}
+}
+function closeWin(id){
+  var row=document.getElementById('crm-'+id);
+  if(!row)return;
+  row.classList.remove('winopen');
+  syncSubRows(row);
+}
+async function saveWin(id){
+  var a=document.getElementById('wa-'+id),n=document.getElementById('wn-'+id),h=document.getElementById('wh-'+id);
+  var r=await post('/api/leads/'+id+'/win',{amount:a?a.value:'',note:n?n.value:''});
+  if(!r||!r.ok){if(h){h.classList.add('bad');h.textContent=(r&&r.error)||'Could not save that.'}return}
+  paintWin(id,r.win,'Won');
+  closeWin(id);
+}
+// Skip closes the prompt and nothing else: the win was already recorded when the stage
+// turned Won, so the count stays right even when the revenue is unknown.
+function skipWin(id){closeWin(id)}
+function winKey(e,id){
+  if(e.key==='Enter'){e.preventDefault();saveWin(id)}
+  else if(e.key==='Escape'){e.preventDefault();closeWin(id)}
 }
 async function setNotes(id,notes){await post('/api/crm/update/'+id,{notes:notes})}
 // The filter matches on data-k, which carries the stage and the notes, so it is rebuilt
@@ -2018,16 +2241,19 @@ function toggleNote(id){
   row.classList.toggle('noteon',on);
   var b=document.getElementById('nb-'+id);
   if(b)b.setAttribute('aria-expanded',on?'true':'false');
-  syncNote(row);
+  syncSubRows(row);
   if(on){
     var t=document.getElementById('nt-'+id);
     if(t){t.focus();try{t.setSelectionRange(t.value.length,t.value.length)}catch(e){}}
   }
 }
-// That row shows only while its lead row is both expanded and past the filter.
-function syncNote(row){
+// The two rows that expand under a company (its notes, its win prompt) show only while
+// that company is both expanded on that panel and past the filter.
+function syncSubRows(row){
   var nr=noteRow(row);
   if(nr)nr.hidden=!(row.classList.contains('noteon')&&!row.classList.contains('gone'));
+  var wr=winRowOf(row);
+  if(wr)wr.hidden=!(row.classList.contains('winopen')&&!row.classList.contains('gone'));
 }
 async function saveNote(id){
   var t=document.getElementById('nt-'+id);
@@ -2044,7 +2270,7 @@ async function saveNote(id){
 async function removeCrm(id){
   await post('/api/crm/remove/'+id,{});
   var row=document.getElementById('crm-'+id);
-  if(row){var nr=noteRow(row);if(nr)nr.remove();row.remove()}
+  if(row){var nr=noteRow(row);if(nr)nr.remove();var wr=winRowOf(row);if(wr)wr.remove();row.remove()}
   paintCounts();
 }
 
@@ -2111,12 +2337,14 @@ function moveRowTo(row,bucket,list){
   void row.offsetWidth;
   row.classList.add('justmoved');
 }
-// A lead row always travels with its notes row, and the two tail rows (empty state,
-// no-match line) stay at the bottom of the list.
+// A lead row always travels with the rows that expand under it (its notes, its win
+// prompt), and the two tail rows (empty state, no-match line) stay at the bottom.
 function place(tb,row){
   tb.appendChild(row);
   var nr=noteRow(row);
   if(nr)tb.appendChild(nr);
+  var wr=winRowOf(row);
+  if(wr)tb.appendChild(wr);
   keepTail(tb);
 }
 function keepTail(tb){
@@ -2130,7 +2358,7 @@ function dataRows(tb){
 }
 function sortFollowups(tb){
   dataRows(tb).sort(function(a,b){return (Number(a.getAttribute('data-fu'))||0)-(Number(b.getAttribute('data-fu'))||0)})
-    .forEach(function(r){tb.appendChild(r);var nr=noteRow(r);if(nr)tb.appendChild(nr)});
+    .forEach(function(r){tb.appendChild(r);var nr=noteRow(r);if(nr)tb.appendChild(nr);var wr=winRowOf(r);if(wr)tb.appendChild(wr)});
   keepTail(tb);
 }
 function sumText(w,f){return w+' working, '+f+' follow-up'+(f===1?'':'s')}
@@ -2245,7 +2473,7 @@ function filterRows(key){
     rows.forEach(function(r){
       var hit=!q||(r.getAttribute('data-k')||'').indexOf(q)>-1;
       r.classList.toggle('gone',!hit);
-      syncNote(r);
+      syncSubRows(r);
       if(hit)shown++;
     });
     var blank=tb.querySelector('tr.emptyrow');
@@ -2274,10 +2502,12 @@ if(location.hash==='#followups'){
 }
 
 // ── WINS PAGE (the closed-deal trophy case) ──
-// "$2,400" — commas, no cents unless the amount actually has them.
+// "$2,400": commas, and no cents unless the amount actually has them, in which case it
+// gets both of them ("$750.50", never "$750.5").
 function fmtMoney(n) {
   const v = Number(n) || 0;
-  return "$" + v.toLocaleString("en-US", { maximumFractionDigits: v % 1 ? 2 : 0 });
+  const cents = v % 1 ? 2 : 0;
+  return "$" + v.toLocaleString("en-US", { minimumFractionDigits: cents, maximumFractionDigits: cents });
 }
 
 // A win's date, from either a SQLite UTC datetime ("2026-08-26 14:03:00") or a
@@ -2290,113 +2520,232 @@ function winDate(dt) {
   if (isNaN(d.getTime())) return esc(s);
   return d.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
 }
-
+// One row of the wins list. A win that came off a Won company links back to it and says
+// so; a hand-typed one says that instead, so the two are never confusable.
 function winRow(w) {
-  const amt = w.amount === null || w.amount === undefined || w.amount === ""
-    ? '<span class="muted">no amount</span>'
-    : esc(fmtMoney(w.amount));
-  return `<tr id="win-${w.id}" data-amount="${Number(w.amount) || 0}">
-    <td><b>${esc(w.client_name)}</b></td>
-    <td class="amt">${amt}</td>
-    <td>${w.note ? esc(w.note) : '<span class="muted">no note</span>'}</td>
-    <td class="d">${winDate(w.created_at)}</td>
-    <td class="actions"><button class="rm" onclick="removeWin(${w.id})">Remove</button></td>
+  const linked = w.leadId !== null && w.leadId !== undefined;
+  // The list row keeps the store's column names alongside the camelCase ones, so read
+  // either: the company's live name when the win is linked, the name typed on the win
+  // itself when it is not.
+  const typed = w.clientName ?? w.client_name;
+  const name = String(w.name || typed || "").trim() || "This company";
+  const place = [w.city, w.state].filter(Boolean).join(", ");
+  const amt =
+    w.amount === null || w.amount === undefined || w.amount === ""
+      ? '<span class="c-mut">no amount</span>'
+      : esc(fmtMoney(w.amount));
+  const nameCell = linked
+    ? `<a class="c-nm winlink" href="/leads" title="Open this company on the Companies page">${esc(name)}</a>`
+    : `<span class="c-nm">${esc(name)}</span>`;
+  const tag = linked
+    ? `<span class="badge">from your companies</span>${place ? `<span class="c-mut">${esc(place)}</span>` : ""}`
+    : '<span class="tag">added by hand</span>';
+  return `<tr id="win-${w.id}">
+    <td class="c-name">${nameCell}<span class="c-tags">${tag}</span></td>
+    <td class="w-amt">${amt}</td>
+    <td>${w.note ? esc(w.note) : '<span class="c-mut">no note</span>'}</td>
+    <td class="w-date">${winDate(w.createdAt ?? w.created_at)}</td>
+    <td class="c-act"><button class="rm" onclick="removeWin(${w.id})">Remove</button></td>
   </tr>`;
 }
 
+// One hero figure: a label, the number, and the line underneath that says what it counts.
+function heroStat(label, value, sub) {
+  return `<div class="wstat"><div class="wk">${esc(label)}</div><div class="wv">${esc(
+    value
+  )}</div><div class="ws">${sub}</div></div>`;
+}
+
+// "12.5x", "69x", "102x". One decimal until the number gets big enough that the decimal is
+// noise, and never rounded up to a multiple the month did not actually earn. Only ever
+// called with a real price and real revenue behind it, so no divide by zero to answer for.
+function multipleLabel(revenue, price) {
+  const r = Number(revenue) / Number(price);
+  if (!Number.isFinite(r) || r <= 0) return "";
+  return `${r >= 100 ? Math.round(r) : Math.round(r * 10) / 10}x`;
+}
+
+// ── The return line ──
+// The most important thing on this page: what the month closed, against what the plan
+// costs per month. There is no payments table in this app, so this is the ONLY billing
+// claim that can be made honestly. It never totals what has been spent, never talks
+// about a year, and says nothing at all about a ratio unless the current plan actually
+// carries a monthly price and something has actually closed this month. A tier the
+// operator does not sell (a legacy or hand-edited one) has no known price, so the plan
+// is left out of the sentence entirely rather than guessed at.
+function returnLine(monthTotal, tier) {
+  const plan = PLANS[String(tier || "").toLowerCase()] || null;
+  const price = plan ? Number(plan.price) || 0 : 0;
+  const revenue = Number(monthTotal) || 0;
+  const nudge = 'Mark a company Won on the <a href="/leads">Companies page</a> and the deal shows up here.';
+  let main;
+  let sub;
+  if (revenue > 0 && price > 0) {
+    main = `You closed <b>${esc(fmtMoney(revenue))}</b> this month. Your plan is <b>${esc(
+      fmtMoney(price)
+    )}</b> a month.`;
+    sub = `That is <b>${esc(multipleLabel(revenue, price))}</b> what the plan costs.`;
+  } else if (revenue > 0 && plan) {
+    main = `You closed <b>${esc(fmtMoney(revenue))}</b> this month. Your ${esc(plan.label)} plan does not cost anything.`;
+    sub = "There is no monthly price on this plan, so there is nothing to earn back.";
+  } else if (revenue > 0) {
+    main = `You closed <b>${esc(fmtMoney(revenue))}</b> this month.`;
+    sub = "";
+  } else if (price > 0) {
+    main = `Your plan is <b>${esc(fmtMoney(price))}</b> a month. Nothing has closed yet this month.`;
+    sub = nudge;
+  } else {
+    main = "Nothing has closed yet this month.";
+    sub = nudge;
+  }
+  return `<section class="retline">
+  <div class="ret-k">Your return this month</div>
+  <div class="ret-main">${main}</div>
+  ${sub ? `<div class="ret-sub">${sub}</div>` : ""}
+</section>`;
+}
+
 async function renderWinsPage(req) {
-  const [stats, wins] = await Promise.all([
+  const [stats, rate, wins, profile] = await Promise.all([
     store.winStats(req.userId),
+    store.winRate(req.userId),
     store.listWins(req.userId),
+    store.getProfile(req.userId),
   ]);
-  const count = stats.count || 0;
-  const total = stats.total || 0;
-  const rows = wins.map(winRow).join("");
-  const statLine = `${count} win${count === 1 ? "" : "s"} · ${fmtMoney(total)} closed`;
+  const count = Number(stats?.count) || 0;
+  const total = Number(stats?.total) || 0;
+  const monthCount = Number(stats?.monthCount) || 0;
+  const monthTotal = Number(stats?.monthTotal) || 0;
+  const valuedCount = Number(stats?.valuedCount) || 0;
+  const avgValued = Number(stats?.avgValued) || 0;
+  const won = Number(rate?.won) || 0;
+  const decided = Number(rate?.decided) || 0;
+  const ratePct = Number(rate?.ratePct) || 0;
+  const inPlay = Number(rate?.inPlay) || 0;
+  const rows = (wins || []).map(winRow).join("");
+
+  const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
+  const heroes = [
+    heroStat("Closed this month", fmtMoney(monthTotal), plural(monthCount, "deal", "deals")),
+    heroStat("Closed all time", fmtMoney(total), plural(count, "win", "wins")),
+    heroStat(
+      "Average deal size",
+      valuedCount ? fmtMoney(avgValued) : "--",
+      valuedCount
+        ? `across ${plural(valuedCount, "win", "wins")} with an amount on it`
+        : "no amounts recorded yet"
+    ),
+    heroStat(
+      "Win rate",
+      decided ? `${ratePct}%` : "--",
+      decided
+        ? `${won} of ${plural(decided, "decided deal", "decided deals")}<br>${plural(
+            inPlay,
+            "company",
+            "companies"
+          )} still in play`
+        : `nothing decided yet<br>${plural(inPlay, "company", "companies")} still in play`
+    ),
+  ].join("");
 
   return `<!doctype html><html><head>${THEME_INIT_SCRIPT}<meta charset="utf-8">${FAVICON}<title>Prospector · Wins</title>
 <style>
   *{box-sizing:border-box;margin:0;padding:0}
   body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
-  .wins-stat{font-size:20px;font-weight:800;color:var(--text);margin-bottom:20px;font-variant-numeric:tabular-nums}
-  .winform{padding:20px 22px;margin-bottom:22px}
-  .winform h3{font-size:15px;font-weight:700;color:var(--text);margin-bottom:14px}
-  .wrow{display:grid;grid-template-columns:1.5fr .8fr 1.7fr auto;gap:12px;align-items:end}
+${TABLE_CSS}
+  /* ── The hero row: the four numbers that answer "is this working" ── */
+  .wstats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:16px}
+  .wstat{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:15px 17px}
+  .wk{font-size:12px;font-weight:600;color:var(--muted)}
+  .wv{font-size:26px;font-weight:800;color:var(--text);margin-top:8px;line-height:1.15;font-variant-numeric:tabular-nums}
+  .ws{font-size:12.5px;color:var(--faint);margin-top:6px;line-height:1.5}
+  /* ── The return line: this month's closed revenue against what the plan costs ── */
+  .retline{background:var(--panel);border:1px solid var(--border);border-left:3px solid var(--accent);border-radius:12px;padding:18px 20px;margin-bottom:18px}
+  .ret-k{font-size:12px;font-weight:600;color:var(--muted)}
+  .ret-main{font-size:19px;font-weight:700;color:var(--text);line-height:1.45;margin-top:8px;letter-spacing:-.1px}
+  .ret-main b{color:var(--accent-ink)}
+  .ret-sub{font-size:14px;color:var(--muted);margin-top:8px;line-height:1.5}
+  .ret-sub b{color:var(--text);font-weight:700}
+  /* ── The list, in the Companies page's table ── */
+  table.cotable{min-width:720px}
+  table.cotable th:nth-child(1),table.cotable td:nth-child(1){width:30%}
+  table.cotable th:nth-child(2),table.cotable td:nth-child(2){width:14%}
+  table.cotable th:nth-child(3),table.cotable td:nth-child(3){width:30%}
+  table.cotable th:nth-child(4),table.cotable td:nth-child(4){width:14%}
+  table.cotable th:nth-child(5),table.cotable td:nth-child(5){width:12%}
+  .cotable td.w-amt{font-variant-numeric:tabular-nums;font-weight:700;color:var(--text);white-space:nowrap}
+  .cotable td.w-date{color:var(--muted);white-space:nowrap}
+  .cotable a.winlink{color:var(--text);text-decoration:none;border-bottom:1px solid transparent}
+  .cotable a.winlink:hover{color:var(--accent-ink);border-bottom-color:var(--accent-ink)}
+  .cotable .c-tags .badge,.cotable .c-tags .tag{font-size:10.5px;padding:2px 7px;border-radius:6px;font-weight:600}
+  .cotable .c-tags .c-mut{font-size:11.5px}
+  .rm{font-family:inherit;background:transparent;border:1px solid var(--border);color:var(--muted);border-radius:8px;padding:6px 11px;cursor:pointer;font-size:12.5px}
+  .rm:hover{color:var(--danger);border-color:var(--danger)}
+  .winnote{margin-top:14px;font-size:12.5px;color:var(--faint);line-height:1.55}
+  /* ── The escape hatch: a deal that never went through the tool ── */
+  .addwin{margin-top:18px}
+  .addwin .ex-body{padding-top:4px}
+  .wrow{display:grid;grid-template-columns:1.4fr .7fr 1.6fr auto;gap:12px;align-items:end;margin-top:4px}
   .wrow .f{min-width:0}
   .wrow label{display:block;font-size:12px;font-weight:600;color:var(--muted);margin-bottom:6px}
-  .wrow input{width:100%}
-  .wrow .go{white-space:nowrap}
+  .wrow input{width:100%;border-radius:8px;padding:9px 12px;font-size:13.5px;font-family:inherit}
+  .wrow .go{white-space:nowrap;border-radius:8px;padding:10px 20px;font-size:13.5px;font-weight:700;font-family:inherit;cursor:pointer}
   #winMsg{margin-top:10px;font-size:13px;color:var(--danger);min-height:16px}
-  table{width:100%;border-collapse:collapse;border-radius:12px;overflow:hidden}
-  th{text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.5px;padding:12px 14px}
-  td{padding:12px 14px;font-size:14px;vertical-align:middle}
-  tr:last-child td{border-bottom:none}
-  td.amt{font-variant-numeric:tabular-nums;font-weight:600;white-space:nowrap}
-  td.d{color:var(--muted);white-space:nowrap}
-  td.actions{text-align:right;white-space:nowrap}
-  .rm{background:transparent;border:1px solid var(--border);color:var(--muted);border-radius:6px;padding:5px 10px;cursor:pointer;font-size:12px}
-  .rm:hover{color:var(--danger);border-color:var(--danger)}
-  .empty{color:var(--muted);text-align:center;margin-top:44px;font-size:15px}
-  @media(max-width:640px){.wrow{grid-template-columns:1fr 1fr}.wrow .go{grid-column:1/-1;width:100%}}
+  @media(max-width:900px){.wstats{grid-template-columns:repeat(2,minmax(0,1fr))}}
+  @media(max-width:640px){.wstats{grid-template-columns:1fr}.wrow{grid-template-columns:1fr}.wrow .go{width:100%}}
 ${SHARED_CSS}</style></head><body>
-${sidebar("wins", { isAdmin: req.isAdmin, demo: req.isDemo })}<div class="pagehead"><div class="titlewrap"><h1>Wins</h1><div class="pagesub">The deals you've closed</div></div><div class="spacer"></div></div>
-<div class="wins-stat" id="winStat">${esc(statLine)}</div>
+${sidebar("wins", { isAdmin: req.isAdmin, demo: req.isDemo })}<div class="pagehead"><div class="titlewrap"><h1>Wins</h1><div class="pagesub">Every deal you have closed, and what it came to</div></div><div class="spacer"></div></div>
 
-<div class="panel winform">
-  <h3>Log a win</h3>
-  <div class="wrow">
-    <div class="f"><label for="wClient">Client / trade</label><input id="wClient" placeholder="Acme Roofing" autocomplete="off"></div>
-    <div class="f"><label for="wAmount">Amount <span class="muted" style="font-weight:400">optional</span></label><input id="wAmount" type="number" min="0" step="any" placeholder="2400"></div>
-    <div class="f"><label for="wNote">Note <span class="muted" style="font-weight:400">optional</span></label><input id="wNote" placeholder="quoted, signed…" autocomplete="off"></div>
-    <button class="go" onclick="addWin()">Add win</button>
-  </div>
-  <div id="winMsg"></div>
-</div>
+<div class="wstats">${heroes}</div>
 
-<div id="winsWrap">
-  <table id="winsTable"${count ? "" : ' style="display:none"'}>
-    <thead><tr><th>Client / trade</th><th>Amount</th><th>Note</th><th>Date</th><th></th></tr></thead>
+${returnLine(monthTotal, profile?.tier)}
+
+<section class="copanel">
+  <div class="cohead"><span class="co-ic">${icon("wins")}</span>
+    <span class="co-ttl">Closed deals</span>
+    <span class="co-n">${count.toLocaleString()} win${count === 1 ? "" : "s"}</span></div>
+  ${
+    count
+      ? `<div class="cotwrap"><table class="cotable">
+    <thead><tr><th>Company</th><th>Amount</th><th>Note</th><th>Date</th><th class="c-act"></th></tr></thead>
     <tbody id="winRows">${rows}</tbody>
-  </table>
-  <div id="winsEmpty" class="empty"${count ? ' style="display:none"' : ""}>No wins logged yet. Add your first closed deal.</div>
-</div>
+  </table></div>
+  <div class="winnote">Removing a win here does not change the company's stage. If it is still marked Won on the <a href="/leads">Companies page</a>, its row will offer to log the deal again.</div>`
+      : `<div class="co-empty">Wins land here on their own: mark a company Won on the <a href="/leads">Companies page</a> and the deal shows up in this list. Anything you closed outside Prospector goes in by hand below.</div>`
+  }
+</section>
+
+<details class="explain addwin">
+  <summary><span class="ex-ttl">Add a deal from outside Prospector</span><span class="ex-sub">For work that never came through a search</span></summary>
+  <div class="ex-body">
+    <div class="wrow">
+      <div class="f"><label for="wClient">Client or trade</label><input id="wClient" placeholder="Acme Roofing" autocomplete="off"></div>
+      <div class="f"><label for="wAmount">Amount <span class="muted" style="font-weight:400">optional</span></label><input id="wAmount" type="number" min="0" step="any" placeholder="2400"></div>
+      <div class="f"><label for="wNote">Note <span class="muted" style="font-weight:400">optional</span></label><input id="wNote" placeholder="What closed it" autocomplete="off"></div>
+      <button class="go" onclick="addWin()">Add win</button>
+    </div>
+    <div id="winMsg"></div>
+  </div>
+</details>
 
 <script>
-var winCount=${count}, winTotal=${total};
-function esc(s){return (s||'').replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]})}
 async function post(url,data){var r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data||{})});return r.json()}
-function fmtMoney(n){var v=Number(n)||0;return '$'+v.toLocaleString('en-US',{maximumFractionDigits:v%1?2:0})}
-function paintStat(){document.getElementById('winStat').textContent=winCount+' win'+(winCount===1?'':'s')+' · '+fmtMoney(winTotal)+' closed'}
-function paintChrome(){document.getElementById('winsTable').style.display=winCount?'':'none';document.getElementById('winsEmpty').style.display=winCount?'none':''}
+// Every number on this page is the server's arithmetic over the whole list (the month,
+// the average of the valued wins, the win rate against the stages). Recomputing that in
+// the browser is how a scoreboard starts disagreeing with itself, so an add or a remove
+// simply asks the server for the page again.
 async function addWin(){
   var c=document.getElementById('wClient'),a=document.getElementById('wAmount'),n=document.getElementById('wNote'),msg=document.getElementById('winMsg');
   msg.textContent='';
   if(!c.value.trim()){msg.textContent='Add a client name.';c.focus();return}
-  var body={clientName:c.value.trim(),amount:a.value.trim(),note:n.value.trim()};
-  var r=await post('/api/wins',body);
-  if(!r||!r.ok){msg.textContent=(r&&r.error)||'Could not add win.';return}
-  var amt=body.amount===''?null:Number(body.amount);
-  if(!isFinite(amt))amt=null;
-  var tr=document.createElement('tr');
-  tr.id='win-'+r.id;
-  tr.setAttribute('data-amount',amt||0);
-  tr.innerHTML='<td><b>'+esc(body.clientName)+'</b></td>'+
-    '<td class="amt">'+(amt==null?'<span class="muted">no amount</span>':esc(fmtMoney(amt)))+'</td>'+
-    '<td>'+(body.note?esc(body.note):'<span class="muted">no note</span>')+'</td>'+
-    '<td class="d">just now</td>'+
-    '<td class="actions"><button class="rm" onclick="removeWin('+r.id+')">Remove</button></td>';
-  winCount++;winTotal+=(amt||0);
-  paintChrome();
-  var tb=document.getElementById('winRows');tb.insertBefore(tr,tb.firstChild);
-  paintStat();
-  c.value='';a.value='';n.value='';c.focus();
+  var r=await post('/api/wins',{clientName:c.value.trim(),amount:a.value.trim(),note:n.value.trim()});
+  if(!r||!r.ok){msg.textContent=(r&&r.error)||'Could not add that win.';return}
+  location.reload();
 }
 async function removeWin(id){
   var r=await post('/api/wins/remove/'+id,{});
   if(!r||!r.ok)return;
-  var tr=document.getElementById('win-'+id);
-  if(tr){var amt=Number(tr.getAttribute('data-amount'))||0;winCount=Math.max(0,winCount-1);winTotal=Math.max(0,winTotal-amt);tr.remove()}
-  paintStat();paintChrome();
+  location.reload();
 }
 </script>${SHELL_TAIL_SCRIPT}</main></div></body></html>`;
 }

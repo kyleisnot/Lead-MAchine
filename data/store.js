@@ -956,18 +956,53 @@ export async function listTokenRequests(userId) {
 }
 
 // ── Wins (a user's closed deals) ─────────────────────────────────────────────
-// client_name is required; amount is parsed to a number-or-null; note is optional.
-export async function addWin(userId, { clientName, amount, note } = {}) {
+// A win is one of two things:
+//   linked  → wins.lead_id points at a saved company, and the win mirrors its Won stage.
+//             Setting a company to Won creates it; moving it off Won removes it.
+//   manual  → lead_id is null, a deal typed in by hand for work from outside the tool.
+// Only the linked ones ever move with a stage change, so a manual win is never disturbed.
+// Deleting a company blanks lead_id (ON DELETE SET NULL) and keeps the win: closed revenue
+// must survive the company record it came from.
+
+// "" / null / undefined and anything unparseable all mean "no amount".
+function winAmount(v) {
+  const parsed = v === "" || v === null || v === undefined ? null : Number(v);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+// A lead id as a number, or null for "not linked".
+function winLeadId(v) {
+  if (v === "" || v === null || v === undefined) return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+// The camelCase shape callers get back for a single win.
+function winShape(r) {
+  if (!r) return null;
+  return {
+    id: r.id,
+    clientName: r.client_name,
+    amount: r.amount == null ? null : Number(r.amount),
+    note: r.note ?? "",
+    createdAt: r.created_at,
+    leadId: r.lead_id ?? null,
+  };
+}
+
+// client_name is required; amount is parsed to a number-or-null; note is optional;
+// leadId is optional and defaults to null, which is what makes the win a manual one.
+export async function addWin(userId, { clientName, amount, note, leadId } = {}) {
   const client = String(clientName ?? "").trim();
   if (!client) throw new Error("addWin: a client/trade name is required");
-  const parsed = amount === "" || amount === null || amount === undefined ? null : Number(amount);
-  const cleanAmount = Number.isFinite(parsed) ? parsed : null;
-  if (!isSupabase()) return (await db()).addWin({ clientName: client, amount: cleanAmount, note });
+  const cleanAmount = winAmount(amount);
+  const lead = winLeadId(leadId);
+  if (!isSupabase()) return (await db()).addWin({ clientName: client, amount: cleanAmount, note, leadId: lead });
   const c = await getSupabase();
   const data = must(
     await c
       .from("wins")
-      .insert({ user_id: userId, client_name: client, amount: cleanAmount, note: note ? String(note) : "" })
+      .insert({ user_id: userId, client_name: client, amount: cleanAmount, note: note ? String(note) : "", lead_id: lead })
       .select("id")
       .single(),
     "addWin"
@@ -975,34 +1010,192 @@ export async function addWin(userId, { clientName, amount, note } = {}) {
   return data?.id;
 }
 
-// This user's wins, newest first.
+// This user's wins, newest first. Each row keeps its own columns and gains leadId plus the
+// linked company's name/city/state, which are null for a manual win or a deleted company.
+// The companies are fetched in one follow-up query rather than an embedded select, so this
+// never depends on PostgREST having picked the foreign key up in its schema cache.
 export async function listWins(userId) {
   if (!isSupabase()) return (await db()).listWins();
   const c = await getSupabase();
-  return (
+  const rows =
     must(
       await c
         .from("wins")
         .select("*")
         .eq("user_id", userId)
         .order("created_at", { ascending: false })
+        .order("id", { ascending: false })
         .range(0, BIG),
       "listWins"
-    ) || []
-  );
+    ) || [];
+
+  const ids = [...new Set(rows.map((r) => r.lead_id).filter((v) => v !== null && v !== undefined))];
+  const byId = new Map();
+  if (ids.length) {
+    const leads =
+      must(
+        await c.from("leads").select("id,name,city,state").eq("user_id", userId).in("id", ids).range(0, BIG),
+        "listWins companies"
+      ) || [];
+    for (const l of leads) byId.set(l.id, l);
+  }
+  return rows.map((r) => {
+    const l = r.lead_id == null ? null : byId.get(r.lead_id);
+    return {
+      id: r.id,
+      client_name: r.client_name,
+      amount: r.amount,
+      note: r.note,
+      created_at: r.created_at,
+      lead_id: r.lead_id ?? null,
+      leadId: r.lead_id ?? null,
+      name: l?.name ?? null,
+      city: l?.city ?? null,
+      state: l?.state ?? null,
+    };
+  });
 }
 
-// { count, total } — total is the sum of every win's amount (null amounts count as 0).
+// { count, total, monthCount, monthTotal, valuedCount, avgValued }.
+// count/total are every win ever (null amounts count as 0) and keep the exact meaning older
+// callers rely on. month* is the current calendar month. valuedCount is the wins carrying a
+// real dollar figure (not null, not zero); avgValued spreads the all-time total across those,
+// so wins logged without a price never drag the average down. avgValued is 0 when none.
 export async function winStats(userId) {
   if (!isSupabase()) return (await db()).winStats();
   const c = await getSupabase();
   const data = must(
-    await c.from("wins").select("amount").eq("user_id", userId).range(0, BIG),
+    await c.from("wins").select("amount,created_at").eq("user_id", userId).range(0, BIG),
     "winStats"
   );
-  let count = 0, total = 0;
-  for (const r of data || []) { count++; total += Number(r.amount) || 0; }
-  return { count, total };
+  const monthStart = Date.parse(monthStartIso());
+  let count = 0, total = 0, monthCount = 0, monthTotal = 0, valuedCount = 0;
+  for (const r of data || []) {
+    const amt = Number(r.amount) || 0;
+    count++;
+    total += amt;
+    if (r.amount !== null && r.amount !== undefined && amt !== 0) valuedCount++;
+    const at = Date.parse(r.created_at);
+    if (Number.isFinite(at) && at >= monthStart) { monthCount++; monthTotal += amt; }
+  }
+  return { count, total, monthCount, monthTotal, valuedCount, avgValued: valuedCount ? total / valuedCount : 0 };
+}
+
+// The win linked to one company, or null. A manual win is never returned here.
+export async function winForLead(userId, leadId) {
+  const lead = winLeadId(leadId);
+  if (lead == null) return null;
+  if (!isSupabase()) return (await db()).winForLead(lead);
+  const c = await getSupabase();
+  const data = must(
+    await c.from("wins").select("*").eq("user_id", userId).eq("lead_id", lead).maybeSingle(),
+    "winForLead"
+  );
+  return winShape(data);
+}
+
+// Upsert the win linked to one company: create it when it is missing, otherwise edit the one
+// that is already there. Returns the win. Fields left undefined are left alone, so flipping a
+// company to Won again cannot wipe an amount the user typed; pass "" or null to clear one.
+// clientName is optional: with none we borrow the company's own name. Safe to call twice:
+// the partial unique index makes a duplicate impossible, and a lost race is retried as an edit.
+export async function setWinForLead(userId, leadId, { clientName, amount, note } = {}) {
+  const lead = winLeadId(leadId);
+  if (lead == null) throw new Error("setWinForLead: a leadId is required");
+  const client = String(clientName ?? "").trim();
+  const amountGiven = amount !== undefined;
+  const noteGiven = note !== undefined;
+  const cleanAmount = amountGiven ? winAmount(amount) : undefined;
+  const cleanNote = noteGiven ? (note === null ? "" : String(note)) : undefined;
+
+  if (!isSupabase()) {
+    const patch = { clientName: client };
+    if (amountGiven) patch.amount = cleanAmount;
+    if (noteGiven) patch.note = cleanNote;
+    return (await db()).setWinForLead(lead, patch);
+  }
+
+  const c = await getSupabase();
+  // Two passes at most: if another writer inserts the linked win between our read and our
+  // insert, the unique index rejects us and the second pass finds the row and edits it.
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const existing = must(
+      await c.from("wins").select("*").eq("user_id", userId).eq("lead_id", lead).maybeSingle(),
+      "setWinForLead"
+    );
+    if (existing) {
+      const patch = {};
+      if (amountGiven) patch.amount = cleanAmount;
+      if (noteGiven) patch.note = cleanNote;
+      if (client && client !== existing.client_name) patch.client_name = client;
+      if (!Object.keys(patch).length) return winShape(existing);
+      const data = must(
+        await c.from("wins").update(patch).eq("user_id", userId).eq("id", existing.id).select("*").single(),
+        "setWinForLead"
+      );
+      return winShape(data);
+    }
+
+    const name = client || String((await getLead(userId, lead))?.name || "").trim();
+    if (!name) throw new Error("setWinForLead: a client/trade name is required");
+    const res = await c
+      .from("wins")
+      .insert({
+        user_id: userId,
+        lead_id: lead,
+        client_name: name,
+        amount: amountGiven ? cleanAmount : null,
+        note: noteGiven ? cleanNote : "",
+      })
+      .select("*")
+      .single();
+    if (!res.error) return winShape(res.data);
+    if (String(res.error.code) !== "23505") throw new Error(`setWinForLead: ${res.error.message}`);
+  }
+  throw new Error("setWinForLead: could not upsert the linked win");
+}
+
+// Delete ONLY the win linked to this company; returns { removed: 0|1 }. A manual win
+// (lead_id null) is never matched, so moving a company off Won cannot touch one.
+export async function removeWinForLead(userId, leadId) {
+  const lead = winLeadId(leadId);
+  if (lead == null) return { removed: 0 };
+  if (!isSupabase()) return (await db()).removeWinForLead(lead);
+  const c = await getSupabase();
+  const data = must(
+    await c.from("wins").delete().eq("user_id", userId).eq("lead_id", lead).select("id"),
+    "removeWinForLead"
+  );
+  return { removed: (data || []).length ? 1 : 0 };
+}
+
+// { won, lost, decided, ratePct, inPlay } across the companies the user actually works,
+// scoped exactly like the Companies page: saved and not dismissed. decided is what a rate can
+// be computed from, and ratePct is 0 (not NaN) while nothing has been decided. inPlay counts
+// everything still open, which is every saved, undismissed company that is neither Won nor Lost.
+export async function winRate(userId) {
+  if (!isSupabase()) return (await db()).winRate();
+  const c = await getSupabase();
+  const base = () =>
+    c.from("leads").select("*", { count: "exact", head: true }).eq("user_id", userId).eq("saved", true).eq("dismissed", false);
+  const tally = (q, what) =>
+    q.then(({ count, error }) => {
+      if (error) throw new Error(`winRate: ${what}: ${error.message}`);
+      return count || 0;
+    });
+  const [saved, won, lost] = await Promise.all([
+    tally(base(), "saved"),
+    tally(base().eq("crm_stage", "Won"), "won"),
+    tally(base().eq("crm_stage", "Lost"), "lost"),
+  ]);
+  const decided = won + lost;
+  return {
+    won,
+    lost,
+    decided,
+    ratePct: decided ? Math.round((won / decided) * 100) : 0,
+    inPlay: Math.max(0, saved - decided),
+  };
 }
 
 export async function removeWin(userId, id) {
