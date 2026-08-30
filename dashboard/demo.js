@@ -4,6 +4,12 @@
 // and trade, hits "Find leads", and the room watches the machine scan, filter and
 // surface businesses with no website. Big type, no chrome, nothing to explain.
 //
+// The pitch order on this page is deliberate and load-bearing. TIME first: checking one
+// business by hand is roughly five minutes of googling, and the scan does the whole city
+// in about two. The leads are the SECOND beat, not the opening line. Third: every list it
+// hands back is workable (no site = call first, has a site = sell them something else,
+// gone quiet = still worth a call). Do not put the lead count back on top.
+//
 // It runs on the EXISTING search stack — the page just posts to /api/search with
 // the session cookie, so results, caching, metering and dedup are identical to the
 // normal Prospector page. The theatre (staged progress, count-up stats, cards that
@@ -931,8 +937,8 @@ ${sidebar("demo", { isAdmin: true, demo: !!req.isDemo })}
 <div class="demo">
   ${adminTabs("demo")}
   <div class="dhead">
-    <h1>Which businesses near you have no website?</h1>
-    <p>Pick a city and a trade. The machine scans Google, Facebook and Instagram, drops everyone who already has a site, and hands back the ones still open for business.</p>
+    <h1>Five minutes a business by hand. The whole city in two.</h1>
+    <p>By hand, each one is: google them, real site or just a Facebook page, find the socials, check if they still post, dig out a phone and an email. Five minutes a business, and there are dozens. This does the lot in about two minutes.</p>
   </div>
 
   <div class="dform">
@@ -967,7 +973,7 @@ var STAGES = [
   'Scanning Google Maps\\u2026',
   'Checking Facebook pages\\u2026',
   'Checking Instagram profiles\\u2026',
-  'Dropping businesses that already have websites\\u2026',
+  'Sorting real websites from Facebook-only pages\\u2026',
   'Checking who is still active\\u2026'
 ];
 var CACHED = {};       // cache key -> true (a search we can replay for free)
@@ -1084,9 +1090,12 @@ async function reveal(r){
   await sleep(boxes.length*180 + 500);
 
   var note = $('note');
+  // Beat two and beat three, in that order: the count, then the reminder that the
+  // businesses the scan set aside are lists of their own, not offcuts.
   note.innerHTML = leads
     ? '<b>'+nfmt(leads)+'</b> business'+(leads===1?'':'es')+' in '+esc(tc(val('city'))||'this city')+' with no website of their own'+
-      (r.cached ? ' &nbsp;\\u00b7&nbsp; saved demo, no credits used' : '')
+      (r.cached ? ' &nbsp;\\u00b7&nbsp; saved demo, no credits used' : '')+
+      '<br>Call them first. The ones that already had a site are a services pitch, and the quiet ones are still worth a call.'
     : 'No no-website leads this time. Try another trade or a nearby city.';
   note.style.display='';
 

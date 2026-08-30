@@ -88,15 +88,15 @@ const CRM_BUCKETS = store.CRM_BUCKETS;
 const BUCKET_META = {
   qualified: {
     title: "No-website companies",
-    sub: "no website and still active, the ones worth calling first",
+    sub: "no website and still active, call these first",
   },
   inactive: {
     title: "Not active",
-    sub: "no website, but nothing posted lately, backups to work later",
+    sub: "no website, quiet lately, still worth a call",
   },
   has_website: {
     title: "Has a website",
-    sub: "already online, worth a rebuild pitch when you have room",
+    sub: "already online, sell them rebuilds, invoicing, or marketing",
   },
 };
 const isBucket = (b) => CRM_BUCKETS.includes(String(b || ""));
@@ -134,6 +134,32 @@ const usdToTokens = (usd) => Math.max(0, Math.round((Number(usd) || 0) * TOKENS_
 // Tokens back to the USD the meter stores, so a flat price and a per-place scan land in
 // the same usage_log column and every downstream total keeps adding up.
 const tokensToUsd = (tokens) => (Number(tokens) || 0) / TOKENS_PER_USD;
+
+// ── What a scan is worth, in time ───────────────────────────────────────
+// Checking one business by hand (google it, tell a real website from a Facebook page,
+// find the socials, see whether they have posted lately, dig out the phone and the email)
+// takes about this many minutes. It is the operator's estimate, not a measurement, so it
+// is an env var: MINUTES_PER_BUSINESS moves every hour figure in the app without a deploy.
+const MINUTES_PER_BUSINESS = (() => {
+  const n = parseFloat(process.env.MINUTES_PER_BUSINESS || "5");
+  return Number.isFinite(n) && n > 0 ? n : 5;
+})();
+
+// The one place a count of businesses becomes a sentence about time. Under an hour it
+// counts minutes; up to 20 hours it keeps a single decimal (and 4.0 prints as "4"); past
+// that the decimal is noise, so it rounds. The source of this function is also shipped to
+// the search page verbatim (handTime.toString()), so the estimate, the results line and
+// the wins scoreboard can never quietly disagree with each other.
+function handTime(businesses) {
+  var mins = Math.max(0, Number(businesses) || 0) * MINUTES_PER_BUSINESS;
+  if (mins < 60) {
+    var m = Math.round(mins);
+    return "about " + m + (m === 1 ? " minute" : " minutes");
+  }
+  var h = mins / 60;
+  var v = h > 20 ? Math.round(h) : Math.round(h * 10) / 10;
+  return "about " + v + (v === 1 ? " hour" : " hours");
+}
 
 // ── The two search modes ─────────────────────────────────────────────────────
 // "Scan 50 businesses" is the everyday one: a fixed amount of looking, billed per place.
@@ -1147,6 +1173,8 @@ ${setupHtml}
   var STANDARD_DEPTH = ${STANDARD_DEPTH};
   var GUARANTEE_TARGET = ${GUARANTEE_TARGET};
   var GUARANTEE_TOKENS = ${GUARANTEED_FIVE_TOKENS};
+  var MINUTES_PER_BUSINESS = ${MINUTES_PER_BUSINESS};
+  ${handTime.toString()}
   ${iconScript(["check", "x", "warn", "clock", "mail", "dot", "badge", "refresh", "undo", "search", "companies", "external"], 14)}
   var BUCKETS = ${JSON.stringify(BUCKET_META)};
 </script>
@@ -1192,7 +1220,7 @@ function updateEstimate(){
   const el=document.getElementById('estimate');
   if(chosenMode()==='guaranteed'){
     el.className='estimate';
-    el.innerHTML='<b>'+GUARANTEE_TARGET+' no-website companies</b> or you pay standard rate · usually <b>2 to 8 min</b> · <b>'+GUARANTEE_TOKENS.toLocaleString()+' tokens</b>';
+    el.innerHTML='<b>'+GUARANTEE_TARGET+' no-website companies</b> or you pay standard rate · usually <b>2 to 8 min</b> of scanning instead of an afternoon of checking by hand · <b>'+GUARANTEE_TOKENS.toLocaleString()+' tokens</b>';
     return;
   }
   const cities=parseCities().length||1, niches=chosenNiches().length||1, sources=chosenSources().length, depth=STANDARD_DEPTH;
@@ -1204,7 +1232,8 @@ function updateEstimate(){
   el.className='estimate'+(big?' big':'');
   el.innerHTML=(big?ICONS.warn+' ':'')+'Scans <b>'+STANDARD_DEPTH+' businesses</b> per city and trade combo'+
     (cells>1?' (<b>'+cells+'</b> of them, ~'+places.toLocaleString()+' businesses)':'')+
-    ' · about <b>'+fmtMin(totalSec)+'</b> · ~<b>'+tokens.toLocaleString()+' tokens</b>'+
+    ' · <b>'+handTime(places)+'</b> of checking by hand'+
+    ' · finished in about <b>'+fmtMin(totalSec)+'</b> · ~<b>'+tokens.toLocaleString()+' tokens</b>'+
     (big?' <span style="opacity:.85">(may be too big to finish in one run)</span>':'');
 }
 
@@ -1515,9 +1544,9 @@ function render(s,prospects,mode,resp){
   var hid = s.inactive ? ' &nbsp;<span class="muted">· hid '+s.inactive+' inactive'+since+(parts.length?' ('+parts.join(', ')+')':'')+'</span>' : '';
   var merged = s.crossSourceMerged ? ' &nbsp;<span class="muted">· merged '+s.crossSourceMerged+' cross-source duplicate'+(s.crossSourceMerged===1?'':'s')+'</span>' : '';
   st(msg+' &nbsp;<span class="muted">('+prospects.length+' shown)</span>'+hid+merged);
-  // The value story first: how much ground the scan covered for them.
+  // The value story first: the hand-checking the scan just did instead of them.
   var scanned=Number(s.scanned||0);
-  var head=scanned?'<div class="scanline">We scanned <b>'+scanned.toLocaleString()+' businesses</b> for you, and every one below is already saved to your companies.</div>':'';
+  var head=scanned?'<div class="scanline">We checked <b>'+scanned.toLocaleString()+' businesses</b> for you, '+handTime(scanned)+' of research done by hand.</div>':'';
   TAB=firstFilled();
   document.getElementById('results').innerHTML=
     '<section class="copanel">'+
@@ -2573,7 +2602,11 @@ function multipleLabel(revenue, price) {
 // carries a monthly price and something has actually closed this month. A tier the
 // operator does not sell (a legacy or hand-edited one) has no known price, so the plan
 // is left out of the sentence entirely rather than guessed at.
-function returnLine(monthTotal, tier) {
+//
+// The last line is the other half of the return: money is only what has closed, and the
+// research the tool did instead of them counts too. It is left off entirely when nothing
+// has been checked yet, because "about 0 minutes" is not a selling point.
+function returnLine(monthTotal, tier, checkedCount) {
   const plan = PLANS[String(tier || "").toLowerCase()] || null;
   const price = plan ? Number(plan.price) || 0 : 0;
   const revenue = Number(monthTotal) || 0;
@@ -2598,19 +2631,25 @@ function returnLine(monthTotal, tier) {
     main = "Nothing has closed yet this month.";
     sub = nudge;
   }
+  const checked = Math.max(0, Number(checkedCount) || 0);
+  const saved = checked
+    ? `Prospector has also done <b>${handTime(checked)}</b> of research you did not have to.`
+    : "";
   return `<section class="retline">
   <div class="ret-k">Your return this month</div>
   <div class="ret-main">${main}</div>
   ${sub ? `<div class="ret-sub">${sub}</div>` : ""}
+  ${saved ? `<div class="ret-sub">${saved}</div>` : ""}
 </section>`;
 }
 
 async function renderWinsPage(req) {
-  const [stats, rate, wins, profile] = await Promise.all([
+  const [stats, rate, wins, profile, checked] = await Promise.all([
     store.winStats(req.userId),
     store.winRate(req.userId),
     store.listWins(req.userId),
     store.getProfile(req.userId),
+    store.checkedStats(req.userId),
   ]);
   const count = Number(stats?.count) || 0;
   const total = Number(stats?.total) || 0;
@@ -2622,6 +2661,9 @@ async function renderWinsPage(req) {
   const decided = Number(rate?.decided) || 0;
   const ratePct = Number(rate?.ratePct) || 0;
   const inPlay = Number(rate?.inPlay) || 0;
+  // Every business this account has ever had checked, which is the whole point of the
+  // fifth hero stat: that count is hours of googling somebody did not have to do.
+  const checkedCount = Math.max(0, Number(checked?.total) || 0);
   const rows = (wins || []).map(winRow).join("");
 
   const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
@@ -2646,6 +2688,11 @@ async function renderWinsPage(req) {
           )} still in play`
         : `nothing decided yet<br>${plural(inPlay, "company", "companies")} still in play`
     ),
+    heroStat(
+      "Hours saved",
+      checkedCount ? handTime(checkedCount) : "0 hours",
+      "of research you did not do by hand"
+    ),
   ].join("");
 
   return `<!doctype html><html><head>${THEME_INIT_SCRIPT}<meta charset="utf-8">${FAVICON}<title>Prospector · Wins</title>
@@ -2653,8 +2700,8 @@ async function renderWinsPage(req) {
   *{box-sizing:border-box;margin:0;padding:0}
   body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
 ${TABLE_CSS}
-  /* ── The hero row: the four numbers that answer "is this working" ── */
-  .wstats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:16px}
+  /* ── The hero row: the five numbers that answer "is this working" ── */
+  .wstats{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:12px;margin-bottom:16px}
   .wstat{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:15px 17px}
   .wk{font-size:12px;font-weight:600;color:var(--muted)}
   .wv{font-size:26px;font-weight:800;color:var(--text);margin-top:8px;line-height:1.15;font-variant-numeric:tabular-nums}
@@ -2691,6 +2738,7 @@ ${TABLE_CSS}
   .wrow input{width:100%;border-radius:8px;padding:9px 12px;font-size:13.5px;font-family:inherit}
   .wrow .go{white-space:nowrap;border-radius:8px;padding:10px 20px;font-size:13.5px;font-weight:700;font-family:inherit;cursor:pointer}
   #winMsg{margin-top:10px;font-size:13px;color:var(--danger);min-height:16px}
+  @media(max-width:1200px){.wstats{grid-template-columns:repeat(3,minmax(0,1fr))}}
   @media(max-width:900px){.wstats{grid-template-columns:repeat(2,minmax(0,1fr))}}
   @media(max-width:640px){.wstats{grid-template-columns:1fr}.wrow{grid-template-columns:1fr}.wrow .go{width:100%}}
 ${SHARED_CSS}</style></head><body>
@@ -2698,7 +2746,7 @@ ${sidebar("wins", { isAdmin: req.isAdmin, demo: req.isDemo })}<div class="pagehe
 
 <div class="wstats">${heroes}</div>
 
-${returnLine(monthTotal, profile?.tier)}
+${returnLine(monthTotal, profile?.tier, checkedCount)}
 
 <section class="copanel">
   <div class="cohead"><span class="co-ic">${icon("wins")}</span>

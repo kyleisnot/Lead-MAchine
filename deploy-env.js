@@ -22,3 +22,7 @@ process.env.GUARANTEED_FIVE_TOKENS ||= "60";
 // serverless limit on a SMALL result set, and the pass grows with lead yield — so the
 // best-performing searches were the likeliest to time out. 8 keeps it ~255s worst case.
 process.env.DEEP_CHECK_MAX ||= "8";
+// About how long it takes to check one business by hand: google it, tell a real website
+// from a Facebook page, find the socials, see whether they have posted lately, dig out the
+// phone and the email. The operator's estimate, so it is tunable without a deploy.
+process.env.MINUTES_PER_BUSINESS ||= "5";
