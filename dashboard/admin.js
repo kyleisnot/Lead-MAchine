@@ -15,6 +15,7 @@
 //   POST /admin/api/user/:id/topup         - {tokens} -> adds N to monthly_token_allotment
 //   POST /admin/api/user/:id/reset-usage   - clears THIS calendar month's usage_log rows
 //   GET  /admin/inbox                      - operator inbox (token requests + support messages)
+//   GET  /admin/api/pending                - {ok, pending} -> the sidebar's Inbox badge count
 //   POST /admin/api/request/:id/approve    - {tokens, priceUsd, note} -> grants and closes a request
 //   POST /admin/api/request/:id/decline    - {note} -> closes a request, grants nothing
 //   POST /admin/api/support/:id/reply      - {reply} -> stores the reply, status answered
@@ -287,47 +288,20 @@ async function loadOverview() {
 
 // ── render ───────────────────────────────────────────────────────────────────
 
-// The admin console's tab bar. Five tabs: Overview (/admin, where the users table
-// lives too), Analytics (/admin/analytics), Inbox (/admin/inbox), Pricing
-// (/admin/pricing) and Demo (/demo), so Demo reads as part of the console rather
-// than a stray nav item. Exported: demo.js renders it too, so the same bar sits
-// above every console page. The `.tabs`/`.tab`/`.pill` colours come from SHARED_CSS;
-// page() (here) and demo.js each add the shared layout rules.
+// The console pages no longer draw their own tab bar. Overview, Analytics, Inbox,
+// Pricing and Demo are sidebar items now, so each page just tells sidebar() which
+// one it is via `active`, and the Inbox badge is filled in by the sidebar itself
+// from GET /admin/api/pending.
 //
-// `pending` is the count of work waiting in the inbox. It is optional so the old
-// one-argument call (demo.js) keeps working: 0 or missing means no badge at all.
-export function adminTabs(active, pending = 0) {
-  const n = Math.max(0, Math.round(Number(pending) || 0));
-  const badge = n
-    ? `<span class="pill" id="lm-inbox-badge" title="${n} waiting in the inbox">${
-        n > 99 ? "99+" : n
-      }</span>`
-    : "";
-  const tab = (href, key, label, extra = "") =>
-    `<a class="tab${active === key ? " active" : ""}" href="${href}">${label}${extra}</a>`;
-  return `<div class="tabs">${tab("/admin", "overview", "Overview")}${tab(
-    "/admin/analytics",
-    "analytics",
-    "Analytics"
-  )}${tab("/admin/inbox", "inbox", "Inbox", badge)}${tab("/admin/pricing", "pricing", "Pricing")}${tab(
-    "/demo",
-    "demo",
-    "Demo"
-  )}</div>`;
-}
-
-// `sub` overrides the page subtitle; the default is the operator overview's wording,
-// so Overview and Analytics render byte-for-byte as before.
-function page(body, extraScript = "", demo = false, active = null, sub = null, pending = 0) {
+// `active` is the sidebar key for this page: `admin` (the overview, labelled Users),
+// `analytics`, `inbox` or `pricing`. It falls back to `admin` so a caller that omits
+// it still lights up the console in the rail.
+// `sub` overrides the page subtitle; the default is the operator overview's wording.
+function page(body, extraScript = "", demo = false, active = null, sub = null) {
   return `<!doctype html><html><head>${THEME_INIT_SCRIPT}<meta charset="utf-8">${FAVICON}<title>Admin · Prospector</title>
 <style>
   *{box-sizing:border-box;margin:0;padding:0}
   body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
-  /* Console tab bar layout (colours live in SHARED_CSS). */
-  .tabs{display:flex;gap:8px;margin:0 0 20px;flex-wrap:wrap}
-  .tab{display:inline-flex;align-items:center;gap:6px;text-decoration:none;font-weight:700;font-size:14px;border-radius:9px;padding:9px 16px}
-  /* Pending-work badge on the Inbox tab (colours live in SHARED_CSS). */
-  .tab .pill{display:inline-block;min-width:19px;text-align:center;font-size:11px;font-weight:800;line-height:1;border-radius:999px;padding:4px 6px;font-variant-numeric:tabular-nums}
   .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(168px,1fr));gap:12px;margin-bottom:20px}
   .stat{border-radius:10px;padding:16px}
   .stat .n{font-size:26px;font-weight:800;line-height:1.15}
@@ -421,10 +395,9 @@ function page(body, extraScript = "", demo = false, active = null, sub = null, p
   .inboxnote b{color:var(--text)}
   @media(max-width:900px){.stats{grid-template-columns:repeat(2,1fr)}}
 ${SHARED_CSS}</style></head><body>
-${sidebar("admin", { isAdmin: true, demo })}<div class="pagehead"><div class="titlewrap"><h1>Admin</h1><div class="pagesub">${
+${sidebar(active || "admin", { isAdmin: true, demo })}<div class="pagehead"><div class="titlewrap"><h1>Admin</h1><div class="pagesub">${
     sub ? esc(sub) : "Operator overview: every user, their usage this month, and their plan"
   }</div></div><div class="spacer"></div></div>
-${active ? adminTabs(active, pending) : ""}
 ${body}
 ${extraScript}${SHELL_TAIL_SCRIPT}</main></div></body></html>`;
 }
@@ -511,7 +484,7 @@ function userRow(u, meEmail = "") {
 </tr>`;
 }
 
-function renderOverview(d, spend, demo = false, meEmail = "", pending = 0) {
+function renderOverview(d, spend, demo = false, meEmail = "") {
   const cards = `<div class="stats">
 ${statCard(num(d.totalUsers), "Users")}
 ${statCard(`$${num(d.mrr)}<span class="per">/mo</span>`, "MRR", mixLine(d.mix))}
@@ -639,7 +612,7 @@ async function lmResetUsage(id,btn){
 }
 </script>`;
 
-  return page(cards + table, script, demo, "overview", null, pending);
+  return page(cards + table, script, demo, "admin");
 }
 
 // ── analytics ─────────────────────────────────────────────────────────────────
@@ -715,7 +688,7 @@ async function loadAnalytics() {
   return { signedUp, activated, paying, won, revenue, winCount, recent };
 }
 
-function renderAnalytics(d, demo = false, pending = 0) {
+function renderAnalytics(d, demo = false) {
   const cards = `<div class="stats">
 ${statCard(num(d.signedUp), "Signed up", "accounts, excluding demo")}
 ${statCard(num(d.activated), "Activated", pctOfSignups(d.activated, d.signedUp))}
@@ -743,7 +716,7 @@ ${statCard(money(d.revenue), "Closed revenue", `${num(d.winCount)} win${d.winCou
     cards +
     `<div class="sectionhead">Recent wins</div>` +
     winsTable;
-  return page(body, "", demo, "analytics", null, pending);
+  return page(body, "", demo, "analytics");
 }
 
 // ── pricing ──────────────────────────────────────────────────────────────────
@@ -1188,7 +1161,7 @@ function pricingFootnote(m) {
 </ul></div>`;
 }
 
-function renderPricing(m, demo = false, pending = 0) {
+function renderPricing(m, demo = false) {
   const body =
     `<div class="sectionhead">Money flow, supplier cost to plan price</div>` +
     flowDiagram(m) +
@@ -1206,8 +1179,7 @@ function renderPricing(m, demo = false, pending = 0) {
     "",
     demo,
     "pricing",
-    "What a scan costs us, what the meter charges for it, and what each plan earns",
-    pending
+    "What a scan costs us, what the meter charges for it, and what each plan earns"
   );
 }
 
@@ -1501,13 +1473,16 @@ function lmSetStatus(elId,txt,cls){
   var s=document.getElementById(elId); if(!s)return;
   s.className='rstatus'+(cls?' '+cls:''); s.textContent=txt;
 }
-// Keeps the Inbox tab badge honest without a reload: one less piece of work waiting.
+// Keeps the sidebar's Inbox badge honest without a reload: one less piece of work
+// waiting. The span is shell.js's #lmNavInboxBadge, which hides itself with the
+// hidden attribute, so match that rather than a display style.
 function lmBadge(delta){
   LM_INBOX_PENDING=Math.max(0,LM_INBOX_PENDING+delta);
-  var b=document.getElementById('lm-inbox-badge'); if(!b)return;
-  if(!LM_INBOX_PENDING){b.style.display='none';b.textContent='';b.title='';return}
-  b.style.display=''; b.textContent=LM_INBOX_PENDING>99?'99+':String(LM_INBOX_PENDING);
-  b.title=LM_INBOX_PENDING+' waiting in the inbox';
+  var b=document.getElementById('lmNavInboxBadge'); if(!b)return;
+  if(!LM_INBOX_PENDING){b.setAttribute('hidden','');b.textContent='';b.title='';return}
+  b.textContent=LM_INBOX_PENDING>99?'99+':String(LM_INBOX_PENDING);
+  b.title=LM_INBOX_PENDING+(LM_INBOX_PENDING===1?' item':' items')+' waiting in the inbox';
+  b.removeAttribute('hidden');
 }
 async function lmPost(url,body){
   var r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});
@@ -1596,8 +1571,7 @@ async function lmCloseMsg(id,btn){
     script,
     demo,
     "inbox",
-    "Token requests and support messages waiting on you",
-    pending
+    "Token requests and support messages waiting on you"
   );
 }
 
@@ -1699,19 +1673,14 @@ adminRouter.get("/admin", requireUser, requireAdmin, async (req, res) => {
         ),
         "",
         false,
-        "overview"
+        "admin"
       )
     );
   }
   try {
-    // The spend lookup is a third-party call: never let it fail the page. The
-    // inbox count is best-effort for the same reason and resolves to 0 on trouble.
-    const [data, spend, pending] = await Promise.all([
-      loadOverview(),
-      apifySpend().catch(() => null),
-      pendingInboxCount(),
-    ]);
-    res.send(renderOverview(data, spend, !!req.isDemo, req.userEmail || "", pending));
+    // The spend lookup is a third-party call: never let it fail the page.
+    const [data, spend] = await Promise.all([loadOverview(), apifySpend().catch(() => null)]);
+    res.send(renderOverview(data, spend, !!req.isDemo, req.userEmail || ""));
   } catch (e) {
     res
       .status(500)
@@ -1723,7 +1692,7 @@ adminRouter.get("/admin", requireUser, requireAdmin, async (req, res) => {
           ),
           "",
           !!req.isDemo,
-          "overview"
+          "admin"
         )
       );
   }
@@ -1747,8 +1716,7 @@ adminRouter.get("/admin/analytics", requireUser, requireAdmin, async (req, res) 
     );
   }
   try {
-    const [data, pending] = await Promise.all([loadAnalytics(), pendingInboxCount()]);
-    res.send(renderAnalytics(data, !!req.isDemo, pending));
+    res.send(renderAnalytics(await loadAnalytics(), !!req.isDemo));
   } catch (e) {
     res
       .status(500)
@@ -1771,8 +1739,7 @@ adminRouter.get("/admin/analytics", requireUser, requireAdmin, async (req, res) 
 // just as useful against a local sqlite instance.
 adminRouter.get("/admin/pricing", requireUser, requireAdmin, async (req, res) => {
   try {
-    const pending = await pendingInboxCount();
-    res.send(renderPricing(pricingModel(), !!req.isDemo, pending));
+    res.send(renderPricing(pricingModel(), !!req.isDemo));
   } catch (e) {
     res
       .status(500)
@@ -1829,6 +1796,14 @@ adminRouter.get("/admin/inbox", requireUser, requireAdmin, async (req, res) => {
         )
       );
   }
+});
+
+// How much work is waiting in the inbox, for the sidebar's Inbox badge. Same guard
+// chain as the admin pages, and deliberately NOT gated on supabase mode:
+// pendingInboxCount() never throws and answers 0 on sqlite, so a local instance gets
+// {ok:true, pending:0} and simply draws no badge.
+adminRouter.get("/admin/api/pending", requireUser, requireAdmin, async (_req, res) => {
+  res.json({ ok: true, pending: await pendingInboxCount() });
 });
 
 // Set a user's plan + allotment outright.

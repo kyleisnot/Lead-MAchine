@@ -31,6 +31,14 @@ export function icon(key, size = 18) {
   if (key === "wins") return s + '<path d="M8 21h8M12 17v4M7 4h10v4a5 5 0 0 1-10 0z"></path><path d="M7 6H4v1a4 4 0 0 0 3 3.9M17 6h3v1a4 4 0 0 1-3 3.9"></path></svg>';
   if (key === "demo") return s + '<circle cx="12" cy="12" r="9"></circle><path d="M10 8.5l6 3.5-6 3.5z"></path></svg>';
   if (key === "admin") return s + '<path d="M12 3l7 4v5c0 4.4-3 8.4-7 9-4-.6-7-4.6-7-9V7z"></path><path d="M9.5 12l2 2 3.5-3.5"></path></svg>';
+  // The operator section's marks (see sidebar below). Additive: every key here was
+  // previously an empty svg, so nothing that already calls icon() changes.
+  // "chart" is analytics: a baseline with three bars of rising height.
+  if (key === "chart") return s + '<path d="M4 3v16a2 2 0 0 0 2 2h15"></path><path d="M8 17v-4M13 17v-8M18 17v-5"></path></svg>';
+  // "inbox" is the operator's work tray, with the notch the mail drops through.
+  if (key === "inbox") return s + '<path d="M22 12h-6l-2 3h-4l-2-3H2"></path><path d="M5.4 5.1L2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.4-6.9A2 2 0 0 0 16.8 4H7.2a2 2 0 0 0-1.8 1.1z"></path></svg>';
+  // "tag" is pricing: a price tag with its eyelet.
+  if (key === "tag") return s + '<path d="M20.6 13.4l-7.2 7.2a2 2 0 0 1-2.8 0L2 12V2h10l8.6 8.6a2 2 0 0 1 0 2.8z"></path><path d="M7 7h.01"></path></svg>';
   if (key === "sun") return s + '<circle cx="12" cy="12" r="4"></circle><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"></path></svg>';
   if (key === "moon") return s + '<path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"></path></svg>';
   if (key === "warning") return s + '<path d="M10.3 3.9L1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"></path><path d="M12 9v4M12 17h.01"></path></svg>';
@@ -142,6 +150,19 @@ if(r.unassigned){if(t)t.textContent='No tokens yet';if(s)s.textContent='ask to a
 else if(Number(r.allotment)>0){if(t)t.textContent=(Number(r.tokens)||0).toLocaleString()+' / '+Number(r.allotment).toLocaleString();if(s)s.textContent='resets '+(r.resetsOn||'')+' · '+(r.searches||0)+' searches';if(w&&bar){var pct=Math.min(100,Math.round((Number(r.tokens)||0)/Number(r.allotment)*100));w.style.display='block';bar.style.width=pct+'%';w.className='tokbar'+(pct>=85?' warn':'');}}
 else{if(t)t.textContent=(Number(r.tokens)||0).toLocaleString()+' tokens';if(s)s.textContent=(r.searches||0)+' searches';if(w)w.style.display='none';}
 lmPaintAcct(r);}catch(e){}}u();setInterval(u,30000);})();
+// The Inbox nav item's pending-work badge. The span only exists in the operator section,
+// so a normal account never asks. One read per page load and no polling: the count tells
+// an operator there is something to look at, and the inbox page itself is the live view.
+(function(){
+  var b=document.getElementById('lmNavInboxBadge');if(!b)return;
+  fetch('/admin/api/pending').then(function(r){return r.json();}).then(function(d){
+    if(!d||!d.ok)return;
+    var n=Math.max(0,Math.round(Number(d.pending)||0));if(!n)return;
+    b.textContent=n>99?'99+':String(n);
+    b.title=n+(n===1?' item':' items')+' waiting in the inbox';
+    b.removeAttribute('hidden');
+  }).catch(function(){});
+})();
 </script>`;
 
 // Favicon: the wordmark's gem, inlined as SVG so there is no image file to keep in sync.
@@ -159,17 +180,34 @@ function navIcon(key) {
 const DEMO_BANNER = "";
 
 // The left rail + opening <main>. Pages close it with `</main></div>` (in SHELL footer).
-// opts.isAdmin adds the Admin link (only render it for admin users).
+// opts.isAdmin appends the operator section (only render it for admin users): the
+// console's destinations are nav items now rather than an in-page tab bar, so an
+// operator reaches Users, Analytics, Inbox, Pricing and Demo from wherever they are.
+// A normal account still sees exactly the three everyday items and nothing else.
 // opts.demo adds the demo-workspace banner (set from req.isDemo).
 export function sidebar(active, { isAdmin = false, demo = false } = {}) {
-  const link = (href, key, label) =>
-    `<a class="navlink${active === key ? " active" : ""}" href="${href}"><span class="ic">${navIcon(key)}</span><span class="lbl">${label}</span></a>`;
+  // `key` is the active key the page passes in; `ico` is the mark, which defaults to it
+  // and is given separately only where no icon key shares the destination's name.
+  // `extra` rides after the label: only Inbox uses it, for its pending-work badge.
+  const link = (href, key, label, extra = "", ico = key) =>
+    `<a class="navlink${active === key ? " active" : ""}" href="${href}"><span class="ic">${navIcon(ico)}</span><span class="lbl">${label}</span>${extra}</a>`;
+  // Empty and hidden at render: SHELL_TAIL_SCRIPT fills it in from /admin/api/pending,
+  // so a page never ships a stale count baked into its HTML.
+  const inboxBadge = `<span class="pill" id="lmNavInboxBadge" hidden></span>`;
+  const operator = isAdmin
+    ? `<div class="navsep">Operator</div>
+  ${link("/admin", "admin", "Users")}
+  ${link("/admin/analytics", "analytics", "Analytics", "", "chart")}
+  ${link("/admin/inbox", "inbox", "Inbox", inboxBadge)}
+  ${link("/admin/pricing", "pricing", "Pricing", "", "tag")}
+  ${link("/demo", "demo", "Demo")}`
+    : "";
   return `<div class="app"><nav class="side">
   <div class="brand"><span class="bmark"><svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linejoin="round" aria-hidden="true"><path d="M6 3h12l3 6-9 12L3 9z"/><path d="M3 9h18M9 3l-2 6 5 12 5-12-2-6"/></svg></span><span class="bname">Prospector</span></div>
   ${link("/", "search", "Search")}
   ${link("/leads", "leads", "Companies")}
   ${link("/wins", "wins", "Wins")}
-  ${isAdmin ? link("/admin", "admin", "Admin") : ""}
+  ${operator}
   <div class="grow"></div>
   <div class="foot">
     <button class="themebtn" id="themeBtn" onclick="lmToggleTheme()" aria-label="Toggle light or dark mode"><span class="ti">${icon("sun", 16)}</span><span class="tl">Light mode</span></button>
@@ -195,6 +233,15 @@ a{color:var(--accent)}
 .navlink .ic{display:inline-flex;color:currentColor}
 .navlink:hover{background:var(--surface2);color:var(--text)}
 .navlink.active{background:var(--accent-weak);color:var(--accent-ink)}
+/* Operator section: a labelled rule between the everyday nav and the console
+   destinations, plus the Inbox item's pending-work badge. All additive, so the
+   three everyday items render exactly as they did. The rail can now hold eight
+   items, so it scrolls on a short viewport rather than squashing them. */
+.side{overflow-y:auto}
+.side .navlink,.side .navsep{flex:none}
+.side .navsep{margin:14px 0 4px;padding:13px 11px 0;border-top:1px solid var(--sidebar-border);font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.7px;color:var(--faint)}
+.navlink .pill{margin-left:auto;display:inline-block;min-width:19px;text-align:center;font-size:10.5px;font-weight:800;line-height:1;border-radius:999px;padding:3px 6px;font-variant-numeric:tabular-nums;background:var(--accent);color:var(--on-accent)}
+.navlink .pill[hidden]{display:none}
 .side .grow{flex:1}
 .side .foot{border-top:1px solid var(--sidebar-border);padding-top:12px;display:flex;flex-direction:column;gap:10px}
 .themebtn{display:flex;align-items:center;gap:8px;padding:8px 12px;border-radius:9px;border:1px solid var(--border-strong);background:var(--surface);color:var(--muted);font-weight:600;font-size:13px;cursor:pointer}
@@ -358,5 +405,8 @@ input,select{padding:11px 13px}
 @media(max-width:860px){.acctdock{top:16px;right:16px}}
 @media(max-width:860px){.side{width:60px;padding:14px 8px}.side .brand{justify-content:center;padding:6px 0}.side .bname{display:none}.navlink .lbl,.themebtn .tl{display:none}.themebtn{justify-content:center}.main{padding:18px 16px}}
 @media(max-width:700px){.row{grid-template-columns:1fr 1fr}.statbox{width:100%}}
+/* Collapsed rail (icons only): the section label shrinks to its rule, and the badge
+   becomes a corner count on the Inbox icon since there is no label to sit beside. */
+@media(max-width:860px){.side .navsep{margin:10px 0 2px;padding:10px 0 0;font-size:0;letter-spacing:0}.navlink{position:relative}.navlink .pill{position:absolute;top:2px;right:4px;margin-left:0;min-width:0;padding:2px 5px;font-size:9px}}
 `;
 
