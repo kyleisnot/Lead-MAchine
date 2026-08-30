@@ -27,7 +27,9 @@ export function icon(key, size = 18) {
       "</svg>"
     );
   if (key === "brain") return s + '<path d="M9 4a3 3 0 0 0-3 3 3 3 0 0 0-1.5 5.6V17a2 2 0 0 0 2 2h1"></path><path d="M15 4a3 3 0 0 1 3 3 3 3 0 0 1 1.5 5.6V17a2 2 0 0 1-2 2h-1"></path><path d="M12 4v15"></path></svg>';
-  // "wins" is the closed-deal trophy case, drawn as a trophy cup.
+  // "wins" is the closed-deal trophy case, drawn as a trophy cup. No longer a nav item
+  // (Wins lives inside the Companies page now), but server.js still draws this mark on
+  // the won list, so the key stays.
   if (key === "wins") return s + '<path d="M8 21h8M12 17v4M7 4h10v4a5 5 0 0 1-10 0z"></path><path d="M7 6H4v1a4 4 0 0 0 3 3.9M17 6h3v1a4 4 0 0 1-3 3.9"></path></svg>';
   if (key === "demo") return s + '<circle cx="12" cy="12" r="9"></circle><path d="M10 8.5l6 3.5-6 3.5z"></path></svg>';
   if (key === "admin") return s + '<path d="M12 3l7 4v5c0 4.4-3 8.4-7 9-4-.6-7-4.6-7-9V7z"></path><path d="M9.5 12l2 2 3.5-3.5"></path></svg>';
@@ -86,6 +88,7 @@ export const THEME_INIT_SCRIPT = `<script>(function(){try{var t=localStorage.get
 // the top-right account menu.
 export const SHELL_TAIL_SCRIPT = `<script>
 var LM_ICON_SUN=${JSON.stringify(icon("sun", 16))},LM_ICON_MOON=${JSON.stringify(icon("moon", 16))};
+var LM_ICON_HELP=${JSON.stringify(icon("help", 16))};
 // Two toggles now share one state: the sidebar's (#themeBtn) and the account menu's
 // mirror (#lmAcctTheme). Both carry a .ti icon slot and a .tl label, so one loop paints
 // them; the sidebar button behaves exactly as it did before.
@@ -163,6 +166,60 @@ lmPaintAcct(r);}catch(e){}}u();setInterval(u,30000);})();
     b.removeAttribute('hidden');
   }).catch(function(){});
 })();
+// ── answered support messages ──
+// The operator answers from the Inbox, and until now the customer only found out by
+// wandering back to /account/help. One read per page load turns that into a dot on the
+// avatar and an item at the top of the account menu.
+//
+// Seen-tracking is one string in localStorage, 'lm_replies_seen': the newest repliedAt
+// the customer has already looked at. Anything newer is unseen; with no key stored
+// (a new browser) every reply is unseen. /account/help writes the key as it renders, so
+// reading the answers is what clears the dot, on this page and every other one after it.
+// Nothing here can break a page: a failed fetch, a missing route, a browser that refuses
+// localStorage or an empty list all leave the menu exactly as the server rendered it.
+var LM_REPLIES_SEEN_KEY='lm_replies_seen';
+function lmRepliesSeen(){try{return String(localStorage.getItem(LM_REPLIES_SEEN_KEY)||'');}catch(e){return '';}}
+// The API sends normalised ISO timestamps, which sort as strings, so newer than the
+// stored mark is a plain string compare.
+function lmUnseenReplies(list){
+  var seen=lmRepliesSeen(),n=0;
+  for(var i=0;i<list.length;i++){
+    var t=String((list[i]&&list[i].repliedAt)||'');
+    if(t&&(!seen||t>seen))n++;
+  }
+  return n;
+}
+// Both marks are additive and only ever appear: with nothing unseen this is never called,
+// so a quiet account sees the avatar and menu it has always seen.
+function lmPaintReplies(n){
+  if(!n)return;
+  var btn=document.getElementById('lmAcctBtn'),menu=document.getElementById('lmAcctMenu');
+  if(!btn||!menu)return;
+  var label=(n===1?'1 answer':n+' answers')+' waiting';
+  if(!document.getElementById('lmAcctDot')){
+    var dot=document.createElement('span');dot.id='lmAcctDot';dot.className='acctdot';dot.setAttribute('aria-hidden','true');
+    btn.appendChild(dot);
+  }
+  var a=document.getElementById('lmAcctReplies');
+  if(!a){
+    a=document.createElement('a');a.id='lmAcctReplies';a.className='acct-item replies';a.href='/account/help';
+    a.innerHTML='<span class="ai"></span><span class="rl"></span>';
+    var ai=a.querySelector('.ai');if(ai)ai.innerHTML=LM_ICON_HELP;
+    menu.insertBefore(a,menu.firstChild);
+  }
+  var rl=a.querySelector('.rl');if(rl)rl.textContent=label;
+  btn.setAttribute('aria-label','Account menu, '+label);
+}
+(function(){
+  try{
+    fetch('/api/account/replies').then(function(r){return r.json();}).then(function(d){
+      try{
+        if(!d||!d.ok||!d.replies||!d.replies.length)return;
+        lmPaintReplies(lmUnseenReplies(d.replies));
+      }catch(e){}
+    }).catch(function(){});
+  }catch(e){}
+})();
 </script>`;
 
 // Favicon: the wordmark's gem, inlined as SVG so there is no image file to keep in sync.
@@ -183,7 +240,9 @@ const DEMO_BANNER = "";
 // opts.isAdmin appends the operator section (only render it for admin users): the
 // console's destinations are nav items now rather than an in-page tab bar, so an
 // operator reaches Users, Analytics, Inbox, Pricing and Demo from wherever they are.
-// A normal account still sees exactly the three everyday items and nothing else.
+// A normal account still sees exactly the two everyday items and nothing else: Wins
+// folded into Companies, which now holds the won list, so a separate rail item would
+// only be a second door onto the same page.
 // opts.demo adds the demo-workspace banner (set from req.isDemo).
 export function sidebar(active, { isAdmin = false, demo = false } = {}) {
   // `key` is the active key the page passes in; `ico` is the mark, which defaults to it
@@ -206,7 +265,6 @@ export function sidebar(active, { isAdmin = false, demo = false } = {}) {
   <div class="brand"><span class="bmark"><svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linejoin="round" aria-hidden="true"><path d="M6 3h12l3 6-9 12L3 9z"/><path d="M3 9h18M9 3l-2 6 5 12 5-12-2-6"/></svg></span><span class="bname">Prospector</span></div>
   ${link("/", "search", "Search")}
   ${link("/leads", "leads", "Companies")}
-  ${link("/wins", "wins", "Wins")}
   ${operator}
   <div class="grow"></div>
   <div class="foot">
@@ -235,8 +293,8 @@ a{color:var(--accent)}
 .navlink.active{background:var(--accent-weak);color:var(--accent-ink)}
 /* Operator section: a labelled rule between the everyday nav and the console
    destinations, plus the Inbox item's pending-work badge. All additive, so the
-   three everyday items render exactly as they did. The rail can now hold eight
-   items, so it scrolls on a short viewport rather than squashing them. */
+   everyday items render exactly as they did. The rail can hold the operator's
+   seven items, so it scrolls on a short viewport rather than squashing them. */
 .side{overflow-y:auto}
 .side .navlink,.side .navsep{flex:none}
 .side .navsep{margin:14px 0 4px;padding:13px 11px 0;border-top:1px solid var(--sidebar-border);font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.7px;color:var(--faint)}
@@ -402,6 +460,14 @@ input,select{padding:11px 13px}
 .acct-item.danger:hover{color:var(--danger)}
 .acct-sep{height:1px;background:var(--border);margin:5px 0}
 .acct-out{margin:0}
+/* Answered support messages: a corner dot on the avatar and an accent item at the top of
+   the menu. Both are injected by the tail script only when something is unseen, so these
+   rules are additive and an account with nothing waiting never draws either. The dot is
+   ringed in the page background so it reads as a marker on the button, not part of it. */
+.acctbtn{position:relative}
+.acctdot{position:absolute;top:-1px;right:-1px;width:10px;height:10px;box-sizing:border-box;border-radius:50%;background:var(--accent);border:2px solid var(--bg)}
+.acct-item.replies{background:var(--accent-weak);color:var(--accent-ink);border-color:var(--accent);font-weight:700}
+.acct-item.replies:hover{background:var(--accent);color:var(--on-accent);border-color:var(--accent)}
 @media(max-width:860px){.acctdock{top:16px;right:16px}}
 @media(max-width:860px){.side{width:60px;padding:14px 8px}.side .brand{justify-content:center;padding:6px 0}.side .bname{display:none}.navlink .lbl,.themebtn .tl{display:none}.themebtn{justify-content:center}.main{padding:18px 16px}}
 @media(max-width:700px){.row{grid-template-columns:1fr 1fr}.statbox{width:100%}}

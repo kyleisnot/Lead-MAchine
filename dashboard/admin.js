@@ -14,6 +14,8 @@
 //   POST /admin/api/user/:id               - {tier, monthly_token_allotment} -> updates profiles
 //   POST /admin/api/user/:id/topup         - {tokens} -> adds N to monthly_token_allotment
 //   POST /admin/api/user/:id/reset-usage   - clears THIS calendar month's usage_log rows
+//   POST /admin/api/user/:id/delete        - {confirmEmail} -> deletes the auth user, and
+//                                            with it (on delete cascade) everything it owns
 //   GET  /admin/inbox                      - operator inbox (token requests + support messages)
 //   GET  /admin/api/pending                - {ok, pending} -> the sidebar's Inbox badge count
 //   POST /admin/api/request/:id/approve    - {tokens, priceUsd, note} -> grants and closes a request
@@ -21,7 +23,7 @@
 //   POST /admin/api/support/:id/reply      - {reply} -> stores the reply, status answered
 //   POST /admin/api/support/:id/close      - status closed
 import express from "express";
-import { requireUser, requireAdmin } from "./auth.js";
+import { requireUser, requireAdmin, isAdminEmail } from "./auth.js";
 import { dataProvider, getSupabase } from "../lib/supabase.js";
 import { apifySpend } from "../lib/spend.js";
 import { THEME_INIT_SCRIPT, SHELL_TAIL_SCRIPT, SHARED_CSS, sidebar, FAVICON } from "./shell.js";
@@ -340,6 +342,16 @@ function page(body, extraScript = "", demo = false, active = null, sub = null) {
   .minibtn:hover{color:var(--text);border-color:var(--accent)}
   .minibtn:disabled{opacity:.55;cursor:wait}
   .minibtn.danger:hover{color:var(--danger);border-color:var(--danger)}
+  /* Delete an account: an in-place confirm inside the row, opened by the row's Delete
+     button, that will not fire until the operator has typed the address back. */
+  .delwrap{margin-top:9px;max-width:330px;border:1px solid var(--danger);border-radius:9px;padding:10px 11px;background:var(--surface2)}
+  .delwrap[hidden]{display:none} /* explicit: never let a SHARED_CSS div rule out-specify the UA sheet */
+  .delmsg{font-size:12px;line-height:1.5;color:var(--muted);white-space:normal}
+  .delmsg b{color:var(--text);word-break:break-all}
+  .delrow{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-top:8px}
+  input.delin{border-radius:7px;padding:5px 7px;font-size:12px;width:100%;max-width:306px}
+  .delgo{background:var(--danger);color:var(--on-accent);border:none;border-radius:7px;padding:6px 11px;font-weight:700;font-size:12px;cursor:pointer;font-family:inherit}
+  .delgo:disabled{opacity:.55;cursor:wait}
   .flag{font-size:12px;font-weight:700;min-width:14px}
   .flag.ok{color:var(--accent-ink)}
   .flag.err{color:var(--danger);white-space:normal;max-width:190px;display:inline-block;line-height:1.3}
@@ -402,8 +414,13 @@ ${body}
 ${extraScript}${SHELL_TAIL_SCRIPT}</main></div></body></html>`;
 }
 
-function statCard(n, label, sub = "", cls = "") {
-  return `<div class="stat${cls ? " " + cls : ""}"><div class="n">${n}</div><div class="l">${esc(
+// `id` and `value` are only used by the overview's header counts, which are repainted in
+// place when a user is deleted. `value` is the raw number behind the formatted `n`, parked
+// in data-v so the repaint never has to unpick "$1,250/mo" to find 1250.
+function statCard(n, label, sub = "", cls = "", id = "", value = null) {
+  return `<div class="stat${cls ? " " + cls : ""}"${id ? ` id="${esc(id)}"` : ""}${
+    value == null ? "" : ` data-v="${Number(value) || 0}"`
+  }><div class="n">${n}</div><div class="l">${esc(
     label
   )}</div>${sub ? `<div class="s">${esc(sub)}</div>` : ""}</div>`;
 }
@@ -456,9 +473,13 @@ function userRow(u, meEmail = "") {
     (isMe ? `<span class="utag you">you</span>` : "") +
     (u.isDemoAccount ? `<span class="utag demo">demo account</span>` : "");
 
+  // data-price / data-leads / data-demo are what the header counts are decremented by when
+  // this row is deleted, so the cards never have to be re-derived from the table.
   return `<tr id="u-${id}" data-tokens="${u.tokens}" data-allot="${u.allotment}" data-email="${esc(
     u.email
-  )}">
+  )}" data-tier="${esc(String(u.tier || "").toLowerCase())}" data-price="${
+    u.isDemoAccount ? 0 : priceOf(u.tier)
+  }" data-leads="${u.leads}">
   <td class="usercell"><div class="who">${esc(u.email)}${tags}</div><div class="sub muted">${id.slice(0, 8)}</div></td>
   <td><select class="tier" onchange="lmPlanPick('${id}')" aria-label="Plan for ${esc(
     u.email
@@ -479,17 +500,26 @@ function userRow(u, meEmail = "") {
     <div class="rowact"><button class="savebtn" onclick="lmSaveUser('${id}',this)">Save</button><span class="flag" id="f-${id}"></span></div>
     <div class="rowact2"><input class="topup" type="number" min="1" step="100" placeholder="+ tokens" aria-label="Tokens to add for ${esc(
       u.email
-    )}"><button class="minibtn" onclick="lmTopUp('${id}',this)">Add</button><button class="minibtn danger" onclick="lmResetUsage('${id}',this)">Reset month</button></div>
+    )}"><button class="minibtn" onclick="lmTopUp('${id}',this)">Add</button><button class="minibtn danger" onclick="lmResetUsage('${id}',this)">Reset month</button><button class="minibtn danger" onclick="lmAskDelete('${id}')">Delete</button></div>
+    <div class="delwrap" id="del-${id}" hidden>
+      <div class="delmsg">This deletes the login for <b>${esc(
+        u.email
+      )}</b> and every row it owns: their companies, their wins and their usage history. It cannot be undone. Type the address to confirm.</div>
+      <div class="delrow"><input class="delin" id="deli-${id}" type="text" autocomplete="off" spellcheck="false" autocapitalize="off" placeholder="${esc(
+        u.email
+      )}" aria-label="Type ${esc(u.email)} to confirm deleting this account"></div>
+      <div class="delrow"><button class="delgo" onclick="lmDeleteUser('${id}',this)">Delete account</button><button class="minibtn" onclick="lmCancelDelete('${id}')">Cancel</button></div>
+    </div>
   </td>
 </tr>`;
 }
 
 function renderOverview(d, spend, demo = false, meEmail = "") {
   const cards = `<div class="stats">
-${statCard(num(d.totalUsers), "Users")}
-${statCard(`$${num(d.mrr)}<span class="per">/mo</span>`, "MRR", mixLine(d.mix))}
-${statCard(num(d.totalLeads), "Leads, all users")}
-${statCard(num(d.monthTokens), "Tokens this month", `at ${num(tokensPerUsd())} tokens per $1`)}
+${statCard(num(d.totalUsers), "Users", "", "", "cdUsers", d.totalUsers)}
+${statCard(`$${num(d.mrr)}<span class="per">/mo</span>`, "MRR", mixLine(d.mix), "", "cdMrr", d.mrr)}
+${statCard(num(d.totalLeads), "Leads, all users", "", "", "cdLeads", d.totalLeads)}
+${statCard(num(d.monthTokens), "Tokens this month", `at ${num(tokensPerUsd())} tokens per $1`, "", "cdTokens", d.monthTokens)}
 ${statCard(
   spend == null ? "n/a" : "$" + Number(spend).toFixed(2),
   "Apify spend, month to date",
@@ -521,6 +551,7 @@ ${statCard(
 
   const script = `<script>
 var LM_PLANS=${JSON.stringify(PLANS)};
+var LM_MIX=${JSON.stringify(d.mix)};
 function lmRow(id){return document.getElementById('u-'+id)}
 function lmNum(n){return Number(n||0).toLocaleString('en-US')}
 function lmFlag(id,cls,txt,hold){
@@ -608,6 +639,79 @@ async function lmResetUsage(id,btn){
       lmFlag(id,'ok','Cleared '+lmNum(j.deleted));
     }else lmFlag(id,'err',(j&&j.error)?j.error:'Reset failed',true);
   }catch(e){lmFlag(id,'err','Reset failed',true)}
+  btn.disabled=false;
+}
+
+// ── delete an account ────────────────────────────────────────────────────────
+// Two locks, because this one is not undoable: the operator has to open the confirm and
+// then type the address back, character for character. The server checks the typed address
+// against the row it is about to delete anyway, so neither lock is load-bearing on its own.
+function lmDelBox(id){return document.getElementById('del-'+id)}
+function lmAskDelete(id){
+  var box=lmDelBox(id); if(!box)return;
+  box.hidden=false;
+  lmFlag(id,'','');
+  var inp=document.getElementById('deli-'+id);
+  if(inp){inp.value='';inp.focus()}
+}
+function lmCancelDelete(id){
+  var box=lmDelBox(id); if(box)box.hidden=true;
+  var inp=document.getElementById('deli-'+id); if(inp)inp.value='';
+  lmFlag(id,'','');
+}
+// Repaint one header count from its data-v, which is the raw number behind the
+// formatted figure. Never goes below zero.
+function lmBumpCard(cardId,delta,fmt){
+  var c=document.getElementById(cardId); if(!c)return;
+  var v=(Number(c.getAttribute('data-v'))||0)+delta;
+  if(v<0)v=0;
+  c.setAttribute('data-v',String(v));
+  var n=c.querySelector('.n'); if(n)n.innerHTML=fmt(v);
+}
+// Mirrors mixLine() on the server: "3 starter · 2 pro", or the empty-state sentence.
+function lmMixLine(){
+  var parts=[],k;
+  for(k in LM_PLANS){ if(LM_PLANS[k].price>0&&LM_MIX[k])parts.push(LM_MIX[k]+' '+k) }
+  for(k in LM_MIX){ if(!LM_PLANS[k]&&LM_MIX[k])parts.push(LM_MIX[k]+' '+k) }
+  return parts.length?parts.join(' \\u00b7 '):'No paying accounts yet';
+}
+// The row is gone, so take what it was contributing out of the cards above it. A reload
+// would recompute all of this from Supabase; this just saves the operator the reload.
+function lmDropFromCounts(row){
+  var price=Number(row.getAttribute('data-price'))||0;
+  var tier=String(row.getAttribute('data-tier')||'');
+  lmBumpCard('cdUsers',-1,lmNum);
+  lmBumpCard('cdLeads',-(Number(row.getAttribute('data-leads'))||0),lmNum);
+  lmBumpCard('cdTokens',-(Number(row.getAttribute('data-tokens'))||0),lmNum);
+  if(price>0){
+    lmBumpCard('cdMrr',-price,function(v){return '$'+lmNum(v)+'<span class="per">/mo<\\/span>'});
+    if(LM_MIX[tier]){
+      LM_MIX[tier]--;
+      if(!LM_MIX[tier])delete LM_MIX[tier];
+    }
+    var mrr=document.getElementById('cdMrr'),s=mrr?mrr.querySelector('.s'):null;
+    if(s)s.textContent=lmMixLine();
+  }
+}
+var lmDeleting={}; // id -> true while its request is in flight
+async function lmDeleteUser(id,btn){
+  if(lmDeleting[id])return;
+  var row=lmRow(id); if(!row)return;
+  var inp=document.getElementById('deli-'+id);
+  var typed=inp?String(inp.value||'').trim():'';
+  if(!typed){lmFlag(id,'err','Type the address to confirm.',true);if(inp)inp.focus();return}
+  lmDeleting[id]=true;
+  btn.disabled=true; lmFlag(id,'','');
+  try{
+    var j=await lmPost('/admin/api/user/'+encodeURIComponent(id)+'/delete',{confirmEmail:typed});
+    if(j&&j.ok){
+      lmDropFromCounts(row);
+      row.parentNode.removeChild(row);
+      return; // the row and its flag are gone; nothing left to re-enable
+    }
+    lmFlag(id,'err',(j&&j.error)?j.error:'Delete failed',true);
+  }catch(e){lmFlag(id,'err','Delete failed. The server did not answer.',true)}
+  delete lmDeleting[id];
   btn.disabled=false;
 }
 </script>`;
@@ -1928,6 +2032,82 @@ adminRouter.post(
       res.json({ ok: true, deleted: (data || []).length, since });
     } catch (e) {
       res.status(500).json({ ok: false, error: e && e.message ? e.message : "Reset failed." });
+    }
+  }
+);
+
+// Delete an account outright: the auth user goes, and every table references auth.users
+// ON DELETE CASCADE, so their companies, wins and usage go with it. There is no undo, so
+// the route re-checks everything rather than trusting the page:
+//
+//   1. the typed address must match the row this id actually points at (a stale table, or
+//      a hand-made request, must not be able to delete the wrong person)
+//   2. an operator address (ADMIN_EMAILS) is refused: deleting your own login mid-session
+//      is not a mistake anyone recovers from through this panel
+//   3. the staged demo workspace is refused, because the Demo page presents from it
+//
+// The in-flight set makes a double submit call deleteUser exactly once: the second request
+// is turned away before it reads the profile, so it cannot race the first one's read.
+const deleting = new Set();
+
+adminRouter.post(
+  "/admin/api/user/:id/delete",
+  requireUser,
+  requireAdmin,
+  express.json(),
+  async (req, res) => {
+    const id = mutableId(req, res);
+    if (!id) return;
+
+    const typed = String((req.body || {}).confirmEmail ?? "").trim().toLowerCase();
+
+    if (deleting.has(id)) {
+      return res.status(409).json({ ok: false, error: "That account is already being deleted." });
+    }
+    deleting.add(id);
+    try {
+      const sb = await getSupabase();
+      const cur = await sb.from("profiles").select("id,email").eq("id", id).maybeSingle();
+      if (cur.error) return res.status(500).json({ ok: false, error: cur.error.message });
+      if (!cur.data) return res.status(404).json({ ok: false, error: "User not found." });
+
+      const email = String(cur.data.email || "").trim().toLowerCase();
+      if (!email) {
+        return res.status(400).json({
+          ok: false,
+          error: "That account has no email on file, so there is nothing to type back. Remove it in Supabase by hand.",
+        });
+      }
+      if (typed !== email) {
+        return res.status(400).json({
+          ok: false,
+          error: "That is not this account's email address. Nothing was deleted.",
+        });
+      }
+      if (isAdminEmail(email)) {
+        return res.status(403).json({
+          ok: false,
+          error: "That is an operator account, listed in ADMIN_EMAILS, and cannot be deleted from here. Take it off that list first if you really mean to remove it.",
+        });
+      }
+      if (email === demoEmailAddress()) {
+        return res.status(403).json({
+          ok: false,
+          error: "That is the staged demo workspace the Demo page presents from, so it cannot be deleted from here.",
+        });
+      }
+
+      const { error } = await sb.auth.admin.deleteUser(id);
+      if (error) {
+        return res
+          .status(500)
+          .json({ ok: false, error: error.message || "Supabase would not delete that account." });
+      }
+      res.json({ ok: true, id, email });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: e && e.message ? e.message : "Delete failed." });
+    } finally {
+      deleting.delete(id);
     }
   }
 );

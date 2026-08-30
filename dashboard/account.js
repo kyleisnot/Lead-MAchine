@@ -10,6 +10,7 @@
 //   GET  /account/tokens              balance, what a search costs, request + history
 //   GET  /account/help                how it works, message the operator, history
 //   GET  /api/account/me              who is signed in (the shell's account menu reads this)
+//   GET  /api/account/replies         answered support messages (the shell's reply dot reads this)
 //   POST /api/account/profile         partial patch of the settings fields
 //   POST /api/account/tokens/request  {tokens, note}
 //   POST /api/account/support         {subject, body}
@@ -68,6 +69,26 @@ function fmtDate(v) {
   const d = new Date(s.includes("T") ? s : s.replace(" ", "T") + "Z");
   if (Number.isNaN(d.getTime())) return s;
   return d.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
+}
+
+// One comparable timestamp for a reply, or "" when there isn't one. SQLite stores
+// "2026-08-27 14:03:11" (UTC, no marker) and Supabase stores ISO, and the browser holds
+// the newest reply it has seen as a single string, so both formats have to land on the
+// same shape or a plain string compare would read the wrong way round. The API and the
+// help page both go through here, so the value the page stores is the value the API
+// compares against.
+function repliedIso(v) {
+  if (!v) return "";
+  const s = String(v).trim();
+  if (!s) return "";
+  const d = new Date(s.includes("T") ? s : s.replace(" ", "T") + "Z");
+  return Number.isNaN(d.getTime()) ? "" : d.toISOString();
+}
+
+// An answered message with a reply timestamp: what the shell counts, and the same set
+// the help page treats as seen once it has rendered them.
+function isAnsweredReply(m) {
+  return String(m?.status || "").toLowerCase() === "answered" && !!repliedIso(m?.repliedAt);
 }
 
 function planLabel(profile) {
@@ -186,6 +207,10 @@ const ACCOUNT_CSS = `
   .reply{margin-top:10px;border-left:2px solid var(--accent);background:var(--accent-weak);border-radius:0 8px 8px 0;padding:9px 12px}
   .reply .rk{font-size:10px;font-weight:800;text-transform:uppercase;letter-spacing:.5px;color:var(--accent-ink)}
   .reply .rb{font-size:13.5px;color:var(--text);margin-top:3px;line-height:1.55;white-space:pre-wrap}
+  /* An answer that arrived since the last visit. Added on load by the script below, so a
+     page with nothing new renders exactly as it always did. */
+  .reply.new{border-left-width:4px;padding-left:14px}
+  .reply .rtag{display:inline-block;margin-left:8px;font-size:9.5px;font-weight:800;text-transform:uppercase;letter-spacing:.5px;border-radius:5px;padding:2px 6px;background:var(--accent);color:var(--on-accent);vertical-align:1px}
   .empty{color:var(--muted);font-size:14px;padding:18px 2px}
   @media(max-width:620px){.fields.two,.fields.where,.costs{grid-template-columns:1fr}}
 `;
@@ -414,7 +439,9 @@ function messageRow(m) {
       <div class="msgbody">${esc(m.body)}</div>
       ${
         m.adminReply
-          ? `<div class="reply"><div class="rk">Our reply${
+          ? `<div class="reply"${
+              isAnsweredReply(m) ? ` data-replied="${esc(repliedIso(m.repliedAt))}"` : ""
+            }><div class="rk">Our reply${
               m.repliedAt ? `, ${esc(fmtDate(m.repliedAt))}` : ""
             }</div><div class="rb">${esc(m.adminReply)}</div></div>`
           : ""
@@ -489,9 +516,31 @@ async function sendMessage(){
   document.getElementById('msgEmpty').style.display='none';
   var n=tb.children.length;document.getElementById('msgCount').textContent=n+' message'+(n===1?'':'s');
   document.getElementById('mSubject').value='';document.getElementById('mBody').value='';
-  msg.className='msg ok';msg.textContent='Sent. We will answer on this page.';
+  msg.className='msg ok';msg.textContent='We got it. Replies show up right here, and a dot on your avatar will let you know.';
 }
 document.getElementById('msgBtn').addEventListener('click',sendMessage);
+// Reading the page is what counts as reading the answers. Each answered reply carries the
+// timestamp the API compares against, so this marks the ones that were new since the last
+// visit and then stores the newest of them, which clears the avatar dot everywhere. The
+// mark only ever moves forward, so a deleted message cannot rewind it and make old answers
+// look new again. The shell's own check runs after this and reads what it wrote, so the
+// dot never lingers on the page that just cleared it.
+(function(){
+  try{
+    var seen='';try{seen=String(localStorage.getItem('lm_replies_seen')||'');}catch(e){}
+    var blocks=document.querySelectorAll('.reply[data-replied]'),max='';
+    for(var i=0;i<blocks.length;i++){
+      var t=blocks[i].getAttribute('data-replied')||'';
+      if(!t)continue;
+      if(t>max)max=t;
+      if(seen&&t<=seen)continue;
+      blocks[i].className='reply new';
+      var k=blocks[i].querySelector('.rk');
+      if(k){var tag=document.createElement('span');tag.className='rtag';tag.textContent='new';k.appendChild(tag);}
+    }
+    if(max&&(!seen||max>seen)){try{localStorage.setItem('lm_replies_seen',max);}catch(e){}}
+  }catch(e){}
+})();
 </script>`;
 
   return page({
@@ -548,6 +597,26 @@ accountRouter.get("/api/account/me", requireUser, async (req, res) => {
       planLabel: planLabel(p),
       isDemo: !!req.isDemo,
     });
+  } catch (e) {
+    fail(res, e);
+  }
+});
+
+// The answers waiting for this customer, for the shell's account menu. Ids and reply
+// timestamps only: the menu needs a count and a high-water mark, never the message text,
+// and this is read on every page load. Newest first, capped, because a menu that says
+// "50 answers waiting" and one that says "300" mean the same thing to a reader.
+const REPLIES_MAX = 50;
+
+accountRouter.get("/api/account/replies", requireUser, async (req, res) => {
+  try {
+    const messages = await store.listSupportMessages(req.userId);
+    const replies = messages
+      .filter(isAnsweredReply)
+      .map((m) => ({ id: Number(m.id), repliedAt: repliedIso(m.repliedAt) }))
+      .sort((a, b) => (a.repliedAt < b.repliedAt ? 1 : a.repliedAt > b.repliedAt ? -1 : 0))
+      .slice(0, REPLIES_MAX);
+    res.json({ ok: true, replies });
   } catch (e) {
     fail(res, e);
   }

@@ -1,4 +1,4 @@
-// server.js — the Prospector dashboard: find local businesses with no website (Search)
+// server.js: the Prospector dashboard. Find local businesses with no website (Search)
 // and work them on one Leads page (three buckets, each with a working + follow-up list).
 //
 // Multi-user: ./auth.js resolves WHO is asking (req.userId / req.userEmail / req.isAdmin)
@@ -110,7 +110,7 @@ app.use(express.static(join(__dirname, "public"))); // serves /logo.png, /mark.p
 // 3. accountRouter: a normal signed-in area (/account, /account/tokens, /account/help),
 //    so it sits with the routes below, not with the operator routers.
 // (adminRouter is mounted after the routes, near app.listen.)
-// Public config health check (booleans only — never values). Lets us see whether the
+// Public config health check (booleans only, never values). Lets us see whether the
 // deployment actually received its Supabase env vars, under any of the common names.
 app.get("/healthz", (req, res) => {
   const has = (k) => !!(process.env[k] && String(process.env[k]).trim());
@@ -200,7 +200,7 @@ export function allotmentVerdict({ allotment = 0, used = 0, need = 0 }) {
 async function blockedByAllotment(req, res, { live, need = 0 }) {
   if (!live) return false;
   // An admin presenting a demo (staged or prospect) must never be stalled mid-meeting
-  // by the TARGET account's plan — the gate applies to real customers only.
+  // by the TARGET account's plan. The gate applies to real customers only.
   if (req.isDemo) return false;
   const profile = await store.getProfile(req.userId);
   const raw = Number.parseInt(profile?.monthly_token_allotment, 10);
@@ -329,7 +329,7 @@ app.post("/api/search", async (req, res) => {
     const city = cities[0];
     const limit = Number(body.limit) > 0 ? Number(body.limit) : STANDARD_DEPTH;
     // Any search that will actually hit Apify (a cold/uncached lookup OR a forced re-scan)
-    // spends credits — guard ALL of those, not just forced re-scans. Cached searches are
+    // spends credits, so guard ALL of those, not just forced re-scans. Cached searches are
     // free and stay allowed even when capped.
     const willSpend = await willSearchSpend({ userId: req.userId, niche, city, state, sources: resolvedSources, limit, forceRefresh: !!forceRefresh });
     if (await blockedBySpendCap(res, { live: willSpend })) return;
@@ -452,6 +452,8 @@ app.post("/api/leads/:id/followup", route(async (req, res) => {
 }));
 
 // Move a lead to a different bucket (e.g. a "not active" one turned out to be alive).
+// The Companies page dropped its "Move to" dropdown, so nothing in the UI calls this any
+// more; the route stays for any older client and for scripted use.
 app.post("/api/leads/:id/bucket", route(async (req, res) => {
   const { bucket } = req.body || {};
   if (!isBucket(bucket)) {
@@ -525,7 +527,7 @@ app.post("/api/followup/remove/:id", route(async (req, res) => {
   res.json({ ok: true });
 }));
 
-// Usage tracker — PER USER: the tokens they've spent this month against their plan.
+// Usage tracker, PER USER: the tokens they've spent this month against their plan.
 // (Our real operator cost, e.g. the Apify bill, lives in the admin panel instead.)
 app.get("/api/usage", route(async (req, res) => {
   const [u, profile] = await Promise.all([store.usageSummary(req.userId), store.getProfile(req.userId)]);
@@ -575,7 +577,7 @@ function slimProspect(l) {
     activeStatus: activityStatus(lj), // "active" | "stale" | "unknown"
     activeSignal: activitySignal(lj), // "FB post" | "IG post" | "Google review"
     verdict: l.activity_verdict || "", // your yes/no on the activity tag, if given
-    license: detectLicenseSignal(lj), // { status, number, evidence } — best-effort license/registration signal
+    license: detectLicenseSignal(lj), // { status, number, evidence }, best-effort license/registration signal
     licenseUrl: licenseSearchUrl(lj), // one-click official-search link to confirm
     saved: !!l.saved,
   };
@@ -606,7 +608,11 @@ app.get("/api/last-search", route(async (req, res) => {
 // is filled in from the row. Hand-typed wins still exist for deals done outside the tool:
 // those carry no lead and nothing here ever touches them. The API is user-scoped through
 // ../data/store.js exactly like every other data call in this file.
-app.get("/wins", route(async (req, res) => res.send(await renderWinsPage(req))));
+//
+// The scoreboard itself is no longer a page: it is the Won tab on the Companies page, so
+// the wins and the companies they came from are one screen. This old URL still works and
+// lands on that tab.
+app.get("/wins", (req, res) => res.redirect(302, "/leads#won"));
 
 // "$1,200" / " 1200 " / "1,200.50" → 1200 / 1200.5. A blank field, or anything that
 // isn't a usable non-negative number, is null: a win with no dollar figure on it. That is
@@ -713,7 +719,7 @@ app.use(demoRouter);
 
 // Default to loopback: this dashboard spends credits, so it should only be reachable
 // from other machines when you deliberately set BIND_HOST (e.g. 0.0.0.0 in a container).
-// On Vercel the platform owns the socket — api/index.js just exports this app, so we
+// On Vercel the platform owns the socket, and api/index.js just exports this app, so we
 // must NOT bind a port there.
 if (!process.env.VERCEL) {
   app.listen(PORT, process.env.BIND_HOST || "127.0.0.1", () => {
@@ -842,8 +848,8 @@ export function setupSteps({ profile = {}, searches = 0, wins = 0 } = {}) {
     },
     {
       key: "win", title: "Log your first win",
-      sub: "Every closed deal you log adds up on your Wins page",
-      href: "/wins", cta: "Log a win", done: (Number(wins) || 0) > 0,
+      sub: "Every closed deal you log adds up on the Won tab of your companies",
+      href: "/leads#won", cta: "Log a win", done: (Number(wins) || 0) > 0,
     },
   ];
 }
@@ -954,10 +960,15 @@ const SETUP_CSS = `
 `;
 
 // ── SEARCH / PROSPECTOR PAGE ──
+// One trade chip. The chips are a multi-select, so each one is a toggle button carrying
+// its own pressed state: filled means the trade is in the search, ghost means it is not.
+function tradeChip(key, on) {
+  return `<button type="button" class="chip trade" data-niche="${esc(key)}" aria-pressed="${
+    on ? "true" : "false"
+  }" onclick="toggleTrade(this)">${esc(key)}</button>`;
+}
+
 async function renderSearchPage(req) {
-  const nicheButtons = NICHES.map(
-    (n) => `<button type="button" class="chip" onclick="setNiche('${n.key}')">${esc(n.key)}</button>`
-  ).join("");
   // Plain-English explainer values (the tool's targeting rules, shown in the UI).
   const explainNiches = NICHES.map((n) => esc(n.key)).join(" · ");
   const fcfg = freshnessConfig();
@@ -988,6 +999,10 @@ async function renderSearchPage(req) {
   const preCity = pre(profile?.defaultCity, "Knoxville");
   const preState = pre(profile?.defaultState, "TN");
   const preNiche = pre(profile?.defaultNiche, "landscaping");
+  // The account's trade arrives as the one chip that starts selected. A trade that isn't
+  // on the built-in list still gets a chip of its own rather than being silently dropped.
+  const nicheButtons = NICHES.map((n) => tradeChip(n.key, n.key === preNiche)).join("");
+  const customChip = preNiche && !NICHES.some((n) => n.key === preNiche) ? tradeChip(preNiche, true) : "";
 
   return `<!doctype html><html><head>${THEME_INIT_SCRIPT}<meta charset="utf-8">${FAVICON}<title>Prospector · Search</title>
 <style>
@@ -1101,6 +1116,21 @@ ${TABLE_CSS}
   .fresh-badge{display:inline-flex;align-items:center;gap:5px}
   .fresh-stale{background:var(--surface2);color:var(--muted)}
 ${SHARED_CSS}
+  /* ── The trade chips: a multi-select, not a set of shortcuts ──
+     A filled chip is in the search and a ghost one is not, so what will be scanned is
+     readable at a glance without opening anything. The text box beside them adds a trade
+     the built-in list does not carry, as one more chip. Ticking "all trades" overrides the
+     lot, so the chips grey out rather than lying about what is about to run. */
+  .addrow{display:flex;gap:8px}
+  .addrow input{flex:1 1 auto;min-width:0}
+  .addtrade{flex:none;font-family:inherit;background:var(--surface2);border:1px solid var(--border-strong);color:var(--text);border-radius:8px;padding:0 15px;font-size:13.5px;font-weight:700;cursor:pointer;white-space:nowrap}
+  .addtrade:hover{border-color:var(--accent);color:var(--accent-ink)}
+  .chip.trade{font-weight:600}
+  .chip.trade[aria-pressed="true"]{background:var(--accent);border-color:var(--accent);color:var(--on-accent)}
+  .chip.trade[aria-pressed="true"]:hover{background:var(--accent);border-color:var(--accent);color:var(--on-accent);filter:brightness(.96)}
+  .chips.off{opacity:.4}
+  .chips.off .chip.trade{pointer-events:none}
+  .tradesum{margin-top:10px;font-size:12.5px;color:var(--muted)}
 ${SETUP_CSS}</style></head><body>
 ${sidebar("search", { isAdmin: req.isAdmin, demo: req.isDemo })}<div class="pagehead"><div class="titlewrap"><h1>Search</h1><div class="pagesub">Find local businesses that don't have a website yet</div></div><div class="spacer"></div>
   <div class="statbox">
@@ -1137,9 +1167,12 @@ ${setupHtml}
 
   <div class="fgroup">
     <div class="glabel">What</div>
-    <div class="f"><label for="niche">Trade</label><input id="niche" placeholder="landscaping" value="${preNiche}"></div>
-    <div class="chips">${nicheButtons}</div>
-    <label class="opt"><input type="checkbox" id="allNiches" oninput="updateEstimate()"> Search <b>all trades</b> at once</label>
+    <div class="f"><label for="niche">Trades <span class="hint">click a chip to add or drop it, or type your own</span></label>
+      <div class="addrow"><input id="niche" placeholder="Any other trade, e.g. tree service" autocomplete="off" onkeydown="tradeKey(event)"><button type="button" class="addtrade" onclick="addTrade()" title="Add this trade to the search">Add trade</button></div>
+    </div>
+    <div class="chips" id="tradechips" role="group" aria-label="Trades to search">${nicheButtons}${customChip}</div>
+    <div class="tradesum" id="tradesum"></div>
+    <label class="opt"><input type="checkbox" id="allNiches" oninput="afterTrades()"> Search <b>all trades</b> at once</label>
   </div>
 
   <div class="fgroup">
@@ -1184,7 +1217,6 @@ ${setupHtml}
 <div id="results"></div>
 
 <script>
-function setNiche(n){document.getElementById('niche').value=n;updateEstimate()}
 async function post(url,data){const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data||{})});return r.json()}
 function st(html){document.getElementById('status').innerHTML=html}
 function stErr(msg){st('<span class="statuserr">'+ICONS.warn+' '+esc(msg||'Something went wrong.')+'</span>')}
@@ -1211,8 +1243,73 @@ function stopProgress(){clearInterval(progTimer);progTimer=null;}
 // "Knoxville, Maryville" becomes ["Knoxville","Maryville"]
 function parseCities(){return document.getElementById('city').value.split(',').map(s=>s.trim()).filter(Boolean)}
 function chosenSources(){const s=document.getElementById('source').value;return s==='all'?['google','facebook','instagram']:[s]}
-function chosenNiches(){return document.getElementById('allNiches').checked?NICHE_KEYS.slice():[document.getElementById('niche').value.trim()].filter(Boolean)}
 function chosenMode(){var m=document.getElementById('mode');return m&&m.value==='guaranteed'?'guaranteed':'standard'}
+
+// ── The trades, as a multi-select ───────────────────────────────────────────
+// Every chip is a toggle and the chips ARE the selection: there is no hidden field behind
+// them, so the row of chips and what the scan will actually cover are the same thing. The
+// text box is only a way to put a trade on the row that the built-in list does not carry.
+// Ticking "all trades" overrides the chips, exactly as it did when there was one trade.
+function tradeChips(){return Array.prototype.slice.call(document.querySelectorAll('#tradechips .chip.trade'))}
+function chosenNiches(){
+  if(document.getElementById('allNiches').checked)return NICHE_KEYS.slice();
+  return tradeChips().filter(function(c){return c.getAttribute('aria-pressed')==='true'})
+    .map(function(c){return c.getAttribute('data-niche')});
+}
+function setTrade(chip,on){if(chip)chip.setAttribute('aria-pressed',on?'true':'false')}
+function toggleTrade(chip){setTrade(chip,chip.getAttribute('aria-pressed')!=='true');afterTrades()}
+function findChip(key){
+  var k=String(key||'').trim().toLowerCase(),all=tradeChips();
+  for(var i=0;i<all.length;i++){if((all[i].getAttribute('data-niche')||'').toLowerCase()===k)return all[i]}
+  return null;
+}
+// The chip for a trade, made if it isn't on the row yet. Matching is case-insensitive, so
+// typing one that is already there switches that chip on instead of doubling it up.
+function ensureChip(key){
+  var v=String(key||'').trim();
+  if(!v)return null;
+  var chip=findChip(v);
+  if(chip)return chip;
+  chip=document.createElement('button');
+  chip.type='button';
+  chip.className='chip trade';
+  chip.setAttribute('data-niche',v);
+  chip.setAttribute('aria-pressed','false');
+  chip.textContent=v;
+  chip.addEventListener('click',function(){toggleTrade(chip)});
+  document.getElementById('tradechips').appendChild(chip);
+  return chip;
+}
+function addTrade(){
+  var box=document.getElementById('niche'),chip=ensureChip(box.value);
+  if(!chip){box.focus();return}
+  setTrade(chip,true);
+  box.value='';
+  afterTrades();
+}
+function tradeKey(e){if(e.key==='Enter'){e.preventDefault();addTrade()}}
+// Select exactly this set of trades (the account default on first paint, or whatever a
+// restored search ran on), making a chip for any of them the built-in list has no room for.
+function selectTrades(keys){
+  tradeChips().forEach(function(c){setTrade(c,false)});
+  (keys||[]).forEach(function(k){setTrade(ensureChip(k),true)});
+  afterTrades();
+}
+// Everything that has to follow a change to the selection: the "all trades" override greys
+// the chips out, the count says what is picked, and the estimate re-prices the run.
+function afterTrades(){
+  var all=document.getElementById('allNiches').checked;
+  var box=document.getElementById('tradechips');
+  if(box)box.classList.toggle('off',all);
+  var sum=document.getElementById('tradesum');
+  if(sum){
+    var n=chosenNiches().length;
+    sum.textContent=all
+      ? 'All '+NICHE_KEYS.length+' trades selected.'
+      : (n?n+' trade'+(n===1?'':'s')+' selected.':'No trades picked. Click a chip above, or type one in.');
+  }
+  updateEstimate();
+}
 
 // Live estimate. The two modes promise different things, so they read differently: the
 // standard one prices the looking, the guaranteed one prices the result.
@@ -1241,7 +1338,7 @@ async function runSearch(force){
   const cities=parseCities();
   if(!cities.length){stErr('Enter at least one city.');return}
   const niches=chosenNiches();
-  if(!niches.length){stErr('Enter a niche, or tick All trades.');return}
+  if(!niches.length){stErr('Pick at least one trade, or tick All trades.');return}
   const sources=chosenSources();
   const mode=chosenMode();
   const state=document.getElementById('state').value;
@@ -1329,7 +1426,9 @@ function searchSummary(){
   var cities=parseCities().join(', ')||'anywhere';
   var stv=(document.getElementById('state').value||'').trim();
   var all=document.getElementById('allNiches').checked;
-  var trade=all?'All trades':((document.getElementById('niche').value||'').trim()||'any trade');
+  var picked=chosenNiches();
+  // Two trades read better spelled out than counted; past that the count is the summary.
+  var trade=all?'All trades':(!picked.length?'any trade':picked.length>2?picked.length+' trades':picked.join(' and '));
   var msel=document.getElementById('mode');
   var modeTxt=msel?msel.options[msel.selectedIndex].text:'';
   var src=document.getElementById('source');
@@ -1569,7 +1668,9 @@ async function restoreLast(){
   const q=r.query||{};
   if(q.city)document.getElementById('city').value=q.city;
   if(q.state)document.getElementById('state').value=q.state;
-  if(q.niche)document.getElementById('niche').value=q.niche;
+  // A remembered search stores its trades as one field, so a batch run comes back as a
+  // comma-separated list. Either way they arrive as the selected chips.
+  if(q.niche)selectTrades(String(q.niche).split(',').map(function(s){return s.trim()}).filter(Boolean));
   if(q.sources){const v=q.sources.length>1?'all':q.sources[0];document.getElementById('source').value=v;}
   const ms=document.getElementById('mode');
   if(ms)ms.value=q.mode==='guaranteed'?'guaranteed':'standard';
@@ -1577,9 +1678,10 @@ async function restoreLast(){
   render(r.stats,r.prospects,'restored',r);
 }
 restoreLast();
-// Keep the cost estimate live as the user changes city/niche/source/depth.
-['city','niche','source'].forEach(function(id){var el=document.getElementById(id);if(el){el.addEventListener('input',updateEstimate);el.addEventListener('change',updateEstimate);}});
-updateEstimate();
+// Keep the cost estimate live as the user changes city or source. The trade box is not in
+// here: typing in it changes nothing until the trade is actually added as a chip.
+['city','source'].forEach(function(id){var el=document.getElementById(id);if(el){el.addEventListener('input',updateEstimate);el.addEventListener('change',updateEstimate);}});
+afterTrades();
 async function hideLead(id){
   await post('/api/dismiss/'+id,{});
   const el=document.getElementById('lead-'+id);
@@ -1598,7 +1700,7 @@ function esc(s){return (s||'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>'
 const CRM_STAGES = ["New", "Contacted", "Interested", "Won", "Lost"];
 
 // Human "how long ago" from either a SQLite UTC datetime ("2026-06-09 14:03:00") or a
-// Postgres timestamptz ("2026-06-09T14:03:00+00:00") — the two providers differ.
+// Postgres timestamptz ("2026-06-09T14:03:00+00:00"); the two providers differ.
 function daysAgo(dt) {
   const then = parseStamp(dt);
   if (then == null) return "";
@@ -1759,9 +1861,6 @@ function renderCrmRow(l, winByLead) {
   const fuCell = fu.label
     ? `<span class="fudate ${fu.cls}">${icon("clock", 13)}${esc(fu.label)}</span>`
     : '<span class="c-mut">not scheduled</span>';
-  const moveOpts = CRM_BUCKETS.filter((b) => b !== bucket)
-    .map((b) => `<option value="${b}">${esc(BUCKET_META[b].title)}</option>`)
-    .join("");
   const place = [l.city, l.state].filter(Boolean).join(", ");
   const notes = l.notes || "";
   const stage = l.crm_stage || "";
@@ -1780,14 +1879,18 @@ function renderCrmRow(l, winByLead) {
   ]
     .filter(Boolean)
     .join(' <span class="ndot">·</span> ');
-  return `<tr class="crmrow" id="crm-${l.id}" data-bucket="${bucket}" data-fu="${fu.ts || 0}" data-base="${esc(base)}" data-stage="${esc(stage)}" data-notes="${esc(notes)}" data-k="${esc(`${base} ${stage} ${notes}`.toLowerCase())}">
+  // data-new is when this company was filed, as epoch ms: the date the toolbar's newest
+  // and oldest sorts read, and the tie-break inside every stage sort.
+  return `<tr class="crmrow" id="crm-${l.id}" data-bucket="${bucket}" data-fu="${fu.ts || 0}" data-new="${
+    parseStamp(l.saved_at) || 0
+  }" data-base="${esc(base)}" data-stage="${esc(stage)}" data-notes="${esc(notes)}" data-k="${esc(`${base} ${stage} ${notes}`.toLowerCase())}">
     <td class="c-name"><span class="c-nm">${esc(l.name)}</span>${tags}</td>
     <td>${mutedCell(place)}</td>
     <td>${phoneCell(l.phone)}</td>
     <td class="c-stage"><select class="stage" title="Where this company stands" onchange="setStage(${l.id},this.value)">${opts}</select>${winChipHtml(l.id, win, stage)}</td>
     <td class="fucell">${fuCell}</td>
     <td class="c-note"><button type="button" class="notebtn${notes ? " on" : ""}" id="nb-${l.id}" aria-expanded="false" aria-controls="note-${l.id}" title="${notes ? "Notes on this company" : "Add notes"}" onclick="toggleNote(${l.id})">${icon("note", 14)}</button></td>
-    <td class="c-act"><div class="actwrap">${followMenu(l.id)}<select class="movebucket" title="Move this company to another list" onchange="moveBucket(${l.id},this.value,this)"><option value="">Move to</option>${moveOpts}</select><button class="rm" onclick="removeCrm(${l.id})">Remove</button></div></td>
+    <td class="c-act"><div class="actwrap">${followMenu(l.id)}<button class="rm" onclick="removeCrm(${l.id})">Remove</button></div></td>
   </tr>
   <tr class="noterow" id="note-${l.id}" hidden><td class="notecell" colspan="${CRM_COLS}">
     <div class="notepanel">
@@ -1814,6 +1917,30 @@ function crmTable(bucket, list, rows, winByLead) {
 
 function sumText(working, followups) {
   return `${working} working, ${followups} follow-up${followups === 1 ? "" : "s"}`;
+}
+
+// ── Sorting one list ──
+// The orders the toolbar offers, listed in the order they appear in the menu. "soonest"
+// belongs to the follow-ups only: it is what that list is for, and on a working list every
+// row would sort the same because none of them has a date. A "stage:X" order puts that one
+// stage at the top and then runs through the rest in the order a deal actually travels,
+// newest first inside every group, so it reads as a shortlist rather than a reshuffle.
+const SORT_OPTS = [
+  { key: "soon", label: "Soonest first", seg: "followups" },
+  { key: "new", label: "Newest first" },
+  { key: "old", label: "Oldest first" },
+  { key: "stage:Interested", label: "Interested first" },
+  { key: "stage:Contacted", label: "Contacted first" },
+  { key: "stage:New", label: "New first" },
+];
+// What each list opens on. Working is newest first, which is the order the store already
+// hands it over in; the follow-ups open soonest first, which is the whole point of them.
+const SORT_DEFAULT = { working: "new", followups: "soon" };
+
+function sortOptionsHtml(seg, chosen) {
+  return SORT_OPTS.filter((o) => !o.seg || o.seg === seg)
+    .map((o) => `<option value="${o.key}"${o.key === chosen ? " selected" : ""}>${o.label}</option>`)
+    .join("");
 }
 
 // How many of a bucket's follow-ups have come due: anything dated today or earlier.
@@ -1872,12 +1999,16 @@ function bucketPane(key, data, active, winByLead) {
     <div class="cotools">
       ${segBar(key, working.length, followups.length, dueCount(followups), seg)}
       <div class="cofind"><span class="cf-i">${icon("search", 14)}</span><input id="find-${key}" type="text" autocomplete="off" placeholder="Search these companies" oninput="filterRows('${key}')"></div>
+      <label class="csort"><span class="cs-k">Sort</span><select class="csel" id="sort-${key}" title="Order the list that is showing" onchange="pickSort('${key}',this.value)">${sortOptionsHtml(
+        seg,
+        SORT_DEFAULT[seg]
+      )}</select></label>
       <div class="cosum" id="sum-${key}">${sumText(working.length, followups.length)}</div>
     </div>
     ${pane("working", crmTable(key, "working", working, winByLead))}
     ${pane(
       "followups",
-      `<div class="lnote">Soonest first, so anything due sits at the top.</div>${crmTable(key, "followups", followups, winByLead)}`
+      `<div class="lnote">Soonest first by default, so anything due sits at the top. Sort reorders it.</div>${crmTable(key, "followups", followups, winByLead)}`
     )}
   </div>
   <div class="co-empty" id="none-${key}"${all ? " hidden" : ""}>Nothing in this list yet. Move companies over from a search.</div>
@@ -1885,15 +2016,26 @@ function bucketPane(key, data, active, winByLead) {
 }
 
 // The bucket tab bar, same idiom as the Search page's: live counts, a dark underline on
-// the selected one, faint when a bucket is empty.
-function bucketTabs(crm, active) {
-  return `<div class="btabs" role="tablist">${CRM_BUCKETS.map((k) => {
+// the selected one, faint when a bucket is empty. Won rides on the end of the same bar:
+// it is not a fourth bucket (no company is ever filed there) but it IS the fourth thing
+// you come to this page to look at, so it swaps the content area for the scoreboard.
+function bucketTabs(crm, active, winCount) {
+  const buckets = CRM_BUCKETS.map((k) => {
     const meta = BUCKET_META[k];
     const n = crm[k].working.length + crm[k].followups.length;
     return `<button type="button" class="btab${k === active ? " on" : ""}${n ? "" : " zero"}" id="bt-${k}" role="tab" aria-selected="${
       k === active ? "true" : "false"
     }" aria-controls="pane-${k}" title="${esc(meta.sub)}" onclick="pickTab('${k}')">${esc(meta.title)}<span class="bt-n">${n}</span><span class="bt-u"></span></button>`;
-  }).join("")}</div>`;
+  }).join("");
+  const won = `<button type="button" class="btab wontab${active === "won" ? " on" : ""}${
+    winCount ? "" : " zero"
+  }" id="bt-won" role="tab" aria-selected="${
+    active === "won" ? "true" : "false"
+  }" aria-controls="pane-won" title="Every deal you have closed, and what it came to" onclick="pickTab('won')">${icon(
+    "wins",
+    14
+  )}Won<span class="bt-n">${winCount}</span><span class="bt-u"></span></button>`;
+  return `<div class="btabs" role="tablist">${buckets}${won}</div>`;
 }
 
 // Your own reminders (people you called off your own bat), separate from the lead rows.
@@ -1932,13 +2074,19 @@ function normalizeCrm(raw) {
 }
 
 async function renderLeadsPage(req) {
-  const [crmRaw, reminders, wins] = await Promise.all([
+  // The scoreboard is part of this page now, so its four data calls come along with the
+  // company lists. Every wins call keeps the deploy-order safety net the linked-win amounts
+  // already had: if that migration has not reached this project yet, the Companies page
+  // still renders its lists (with an empty Won tab) rather than 500ing. There is no longer
+  // a separate page that could fail loudly instead, and the lists are the working surface.
+  const [crmRaw, reminders, wins, winStats, winRate, profile, checked] = await Promise.all([
     store.listCrm(req.userId),
     store.listFollowups(req.userId),
-    // Same deploy-order safety net getProfile() carries: if the linked-win migration has
-    // not reached this project yet, the Companies page renders without the amounts rather
-    // than 500ing. The Wins page still fails loudly, which is where that belongs.
     store.listWins(req.userId).catch(() => []),
+    store.winStats(req.userId).catch(() => ({})),
+    store.winRate(req.userId).catch(() => ({})),
+    store.getProfile(req.userId),
+    store.checkedStats(req.userId).catch(() => ({})),
   ]);
   const crm = normalizeCrm(crmRaw);
   // A win belongs to the company it came from, so every Won row can show its own amount
@@ -1961,6 +2109,20 @@ async function renderLeadsPage(req) {
     dueNow += dueCount(crm[b].followups);
     segs[b] = defaultSeg(crm[b]);
   }
+  // Where each company's row is sitting, so a win on the Won tab can jump to it. A win
+  // whose company is not in here has been removed from the lists since it closed, and its
+  // row renders as plain text.
+  const leadAt = new Map();
+  for (const b of CRM_BUCKETS) {
+    for (const l of crm[b].working) leadAt.set(String(l.id), b);
+    for (const l of crm[b].followups) leadAt.set(String(l.id), b);
+  }
+  // What the Won tab counts, and the two halves the page script keeps it right with: the
+  // wins typed in by hand never move, and every other win is one company currently marked
+  // Won, so a stage change is an entry added to or taken out of that set.
+  const wonLeadIds = [...winByLead.keys()];
+  const winTotal = (wins || []).length;
+  const manualWins = Math.max(0, winTotal - wonLeadIds.length);
   const openReminders = reminders.filter((f) => !f.done).length;
   // The header carries the total, so this line covers only what's scheduled.
   const stats = total
@@ -1972,8 +2134,10 @@ async function renderLeadsPage(req) {
   // Open on the first bucket that actually has something in it.
   const activeTab =
     CRM_BUCKETS.find((b) => crm[b].working.length + crm[b].followups.length) || CRM_BUCKETS[0];
-  const tabs = bucketTabs(crm, activeTab);
-  const panes = CRM_BUCKETS.map((b) => bucketPane(b, crm[b], b === activeTab, winByLead)).join("");
+  const tabs = bucketTabs(crm, activeTab, winTotal);
+  const panes =
+    CRM_BUCKETS.map((b) => bucketPane(b, crm[b], b === activeTab, winByLead)).join("") +
+    wonPane({ stats: winStats, rate: winRate, wins, profile, checked, at: leadAt, active: false });
 
   return `<!doctype html><html><head>${THEME_INIT_SCRIPT}<meta charset="utf-8">${FAVICON}<title>Prospector · Companies</title>
 <style>
@@ -2012,23 +2176,34 @@ ${TABLE_CSS}
   /* The one-line note above the follow-ups table. */
   .lnote{margin:14px 0 0;font-size:12.5px;color:var(--faint)}
   .lnote+.cotwrap{margin-top:9px}
-  /* Wider than the Search table: these rows carry three live controls, and the action
-     column is budgeted for all three of them side by side. */
-  table.cotable{min-width:1040px}
-  table.cotable th:nth-child(1),table.cotable td:nth-child(1){width:22%}
-  table.cotable th:nth-child(2),table.cotable td:nth-child(2){width:10%}
-  table.cotable th:nth-child(3),table.cotable td:nth-child(3){width:11%}
-  table.cotable th:nth-child(4),table.cotable td:nth-child(4){width:10%}
-  table.cotable th:nth-child(5),table.cotable td:nth-child(5){width:12%;white-space:nowrap}
+  /* ── The sort control ──
+     It orders whichever of the bucket's two lists is showing, so it lives on the same
+     toolbar as the switch between them and is deliberately the quietest thing on it: a
+     label and a small select, no fill, no border weight competing with the segments. */
+  .csort{display:inline-flex;align-items:center;gap:7px;flex:none}
+  .csort .cs-k{font-size:12px;font-weight:600;color:var(--muted)}
+  select.csel{height:32px;background:var(--surface);border:1px solid var(--border-strong);border-radius:8px;padding:0 8px;color:var(--text);font-size:12.5px;font-family:inherit;cursor:pointer}
+  select.csel:hover{border-color:var(--accent)}
+  /* The Won tab's mark, at the size the tab bar's labels sit at. */
+  .btab.wontab svg{flex:none}
+  /* Wider than the Search table: these rows carry live controls, and the action column is
+     budgeted for the follow-up menu and Remove side by side. Losing the bucket dropdown
+     took a control out of that column, so the whole table needs less room and the width it
+     gave back goes to the company name and the phone. */
+  table.cotable{min-width:940px}
+  table.cotable th:nth-child(1),table.cotable td:nth-child(1){width:25%}
+  table.cotable th:nth-child(2),table.cotable td:nth-child(2){width:12%}
+  table.cotable th:nth-child(3),table.cotable td:nth-child(3){width:12%}
+  table.cotable th:nth-child(4),table.cotable td:nth-child(4){width:11%}
+  table.cotable th:nth-child(5),table.cotable td:nth-child(5){width:13%;white-space:nowrap}
   table.cotable th:nth-child(6),table.cotable td:nth-child(6){width:5%}
-  table.cotable th:nth-child(7),table.cotable td:nth-child(7){width:30%}
+  table.cotable th:nth-child(7),table.cotable td:nth-child(7){width:22%}
   .cotable tr.emptyrow td,.cotable tr.norow td{height:auto;padding:16px 0;color:var(--muted);font-size:13px;border-bottom:0}
   .cotable tbody tr.emptyrow:hover{background:transparent}
   .cotable tbody tr.justmoved{animation:pop 1.2s ease-out}
   @keyframes pop{0%{background:var(--accent-weak)}100%{background:transparent}}
   /* ── Row controls, sized to sit inside a 52px row ── */
   select.stage{width:100%;height:34px;background:var(--surface);border:1px solid var(--border-strong);border-radius:8px;padding:4px 7px;color:var(--text);font-size:13px;font-family:inherit}
-  select.movebucket{height:34px;max-width:112px;background:var(--surface);border:1px solid var(--border-strong);border-radius:8px;padding:4px 7px;color:var(--muted);font-size:12.5px;font-family:inherit}
   .actwrap{display:flex;align-items:center;justify-content:flex-end;gap:7px}
   .rm{height:34px;background:transparent;border:1px solid var(--border);color:var(--muted);border-radius:8px;padding:0 11px;cursor:pointer;font-size:12.5px;font-family:inherit}
   .rm:hover{color:var(--danger);border-color:var(--danger)}
@@ -2118,6 +2293,7 @@ ${TABLE_CSS}
   .fu-btn{display:inline-flex;align-items:center;gap:5px;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.14);color:var(--text);border-radius:7px;padding:6px 11px;cursor:pointer;font-size:13px;font-weight:600;font-family:inherit}
   .fu-del{color:var(--muted)}.fu-del:hover{color:#e05b5b;border-color:#e05b5b}
   @media(max-width:820px){.fu-add{grid-template-columns:1fr}}
+${WON_CSS}
 ${SHARED_CSS}</style></head><body>
 ${sidebar("leads", { isAdmin: req.isAdmin, demo: req.isDemo })}<div class="pagehead"><div class="titlewrap"><h1>Companies</h1><div class="pagesub">The businesses you're working, and when to call them back</div></div><div class="spacer"></div></div>
 
@@ -2152,18 +2328,37 @@ function esc(s){return (s||'').replace(/[&<>"]/g,function(c){return {'&':'&amp;'
 async function post(url,data){var r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data||{})});return r.json()}
 var BUCKET_KEYS=${JSON.stringify(CRM_BUCKETS)};
 var BUCKETS=${JSON.stringify(BUCKET_META)};
+// Won is a tab, not a bucket: no company is ever filed there, but it is the fourth thing
+// on this page, so it rides in the tab list and nowhere else.
+var TAB_KEYS=BUCKET_KEYS.concat(['won']);
 var TAB=${JSON.stringify(activeTab)};
+var STAGE_ORDER=${JSON.stringify(CRM_STAGES)};
 // Which list each bucket is showing. Seeded server-side (working, unless that bucket has
 // a follow-up that has come due) and then kept per bucket for the rest of the visit, so
 // leaving a bucket and coming back lands on the list you left it on.
 var SEG=${JSON.stringify(segs)};
+var SORT_OPTS=${JSON.stringify(SORT_OPTS)};
+var SORT_DEFAULT=${JSON.stringify(SORT_DEFAULT)};
+// The order each list is in, kept per bucket AND per list for the rest of the visit for
+// the same reason SEG is: flipping to the follow-ups and back lands on the order you left
+// each of them in.
+var SORT={};
+BUCKET_KEYS.forEach(function(b){SORT[b]={working:SORT_DEFAULT.working,followups:SORT_DEFAULT.followups}});
+// The Won tab's count, in the two halves that make it up. WON_LEADS starts as the
+// companies the server rendered a win against; RENDERED_WINS is what the figures inside
+// the tab were worked out from, so the tab can tell when the two have drifted apart.
+var MANUAL_WINS=${manualWins};
+var RENDERED_WINS=${winTotal};
+var WON_LEADS={};
+${JSON.stringify(wonLeadIds)}.forEach(function(id){WON_LEADS[id]=true});
 
-// ── bucket tabs ──
-// Every bucket's tables stay in the page, hidden, so a row can be sent to another
-// bucket's list without a reload and every count still adds up.
+// ── tabs ──
+// Every bucket's tables stay in the page, hidden, so a row can move between lists without
+// a reload and every count still adds up. Won swaps the same content area for the
+// scoreboard.
 function pickTab(key){
   TAB=key;
-  BUCKET_KEYS.forEach(function(b){
+  TAB_KEYS.forEach(function(b){
     var p=document.getElementById('pane-'+b);
     if(p)p.hidden=b!==key;
     var t=document.getElementById('bt-'+b);
@@ -2184,8 +2379,63 @@ function pickSeg(key,list){
     var b=document.getElementById('sg-'+key+'-'+l);
     if(b){b.classList.toggle('on',l===list);b.setAttribute('aria-selected',l===list?'true':'false')}
   });
+  paintSort(key);
   closeMenus();
   filterRows(key);
+}
+
+// ── sorting one list ──
+// The control on the toolbar orders whichever list is showing, so its menu is rebuilt as
+// the segments flip: soonest first is only offered on the follow-ups, where every row has
+// a date to sort on.
+function paintSort(key){
+  var sel=document.getElementById('sort-'+key);
+  if(!sel)return;
+  var seg=SEG[key]||'working',cur=(SORT[key]||{})[seg]||SORT_DEFAULT[seg],html='';
+  for(var i=0;i<SORT_OPTS.length;i++){
+    var o=SORT_OPTS[i];
+    if(o.seg&&o.seg!==seg)continue;
+    html+='<option value="'+esc(o.key)+'"'+(o.key===cur?' selected':'')+'>'+esc(o.label)+'</option>';
+  }
+  sel.innerHTML=html;
+  sel.value=cur;
+}
+function pickSort(key,val){
+  var seg=SEG[key]||'working';
+  SORT[key][seg]=val;
+  applySort(key,seg);
+}
+// Where a stage sits under a "stage:X" order: X first, then every other stage in the order
+// a deal actually travels, and anything with no stage at all after those.
+function stageRank(stage,first){
+  var s=String(stage||'');
+  if(s===first)return -1;
+  var i=STAGE_ORDER.indexOf(s);
+  return i<0?STAGE_ORDER.length:i;
+}
+function numAttr(row,name){return Number(row.getAttribute(name))||0}
+// Rows filed in the same second would otherwise shuffle about between sorts, so every
+// comparison falls back to the row's own id, which only ever goes up.
+function rowNum(row){return Number(String(row.id||'').slice(4))||0}
+function sortCmp(mode){
+  if(mode==='soon')return function(a,b){return (numAttr(a,'data-fu')-numAttr(b,'data-fu'))||(rowNum(a)-rowNum(b))};
+  if(mode==='old')return function(a,b){return (numAttr(a,'data-new')-numAttr(b,'data-new'))||(rowNum(a)-rowNum(b))};
+  if(String(mode).indexOf('stage:')===0){
+    var first=String(mode).slice(6);
+    return function(a,b){
+      return (stageRank(a.getAttribute('data-stage'),first)-stageRank(b.getAttribute('data-stage'),first))||
+        (numAttr(b,'data-new')-numAttr(a,'data-new'))||(rowNum(b)-rowNum(a));
+    };
+  }
+  return function(a,b){return (numAttr(b,'data-new')-numAttr(a,'data-new'))||(rowNum(b)-rowNum(a))};
+}
+// Re-order one list in place. place() re-appends a lead row together with the rows that
+// expand under it, so a company's notes and win prompt never come adrift of it.
+function applySort(key,list){
+  var tb=document.getElementById('tb-'+key+'-'+list);
+  if(!tb)return;
+  dataRows(tb).sort(sortCmp((SORT[key]||{})[list]||SORT_DEFAULT[list])).forEach(function(r){place(tb,r)});
+  keepTail(tb);
 }
 
 // ── stage / notes / remove ──
@@ -2197,9 +2447,35 @@ async function setStage(id,stage){
   var row=document.getElementById('crm-'+id);
   if(row){row.setAttribute('data-stage',stage);refreshKey(row)}
   if(!r||!r.ok)return;
+  // The server logged or took back the win inside that same call, so the Won tab's count
+  // follows the stage straight away rather than waiting for a reload.
+  markWon(id,stage==='Won'&&!!r.win);
   paintWin(id,r.win,stage);
   if(stage==='Won'&&r.win)openWin(id);else closeWin(id);
 }
+
+// ── what the Won tab counts ──
+// The same thing the scoreboard counts: every win on the board. The hand-typed ones never
+// move, and each of the rest is one company currently marked Won, so a stage change is one
+// entry added to or taken out of this set and the tab can stay right without a reload.
+// The figures inside the tab are the server's arithmetic over the whole list, so those do
+// wait for a reload, and the tab says so when the two have drifted apart.
+function winCount(){return MANUAL_WINS+Object.keys(WON_LEADS).length}
+function markWon(id,on){
+  if(on)WON_LEADS[String(id)]=true;else delete WON_LEADS[String(id)];
+  paintWonCount();
+}
+function paintWonCount(){
+  var n=winCount(),t=document.getElementById('bt-won');
+  if(t){
+    var c=t.querySelector('.bt-n');
+    if(c)c.textContent=n;
+    t.classList.toggle('zero',!n);
+  }
+  var stale=document.getElementById('wonStale');
+  if(stale)stale.hidden=n===RENDERED_WINS;
+}
+function reloadWon(){location.hash='#won';location.reload()}
 
 // ── the win on a row ──
 function fmtMoney(n){var v=Number(n)||0,c=v%1?2:0;return '$'+v.toLocaleString('en-US',{minimumFractionDigits:c,maximumFractionDigits:c})}
@@ -2242,6 +2518,9 @@ async function saveWin(id){
   var a=document.getElementById('wa-'+id),n=document.getElementById('wn-'+id),h=document.getElementById('wh-'+id);
   var r=await post('/api/leads/'+id+'/win',{amount:a?a.value:'',note:n?n.value:''});
   if(!r||!r.ok){if(h){h.classList.add('bad');h.textContent=(r&&r.error)||'Could not save that.'}return}
+  // A save can only land on a company the server already agrees is Won, so this is the
+  // other place the Won tab's count is settled from.
+  markWon(id,true);
   paintWin(id,r.win,'Won');
   closeWin(id);
 }
@@ -2332,35 +2611,14 @@ async function setFollowUp(id,when){
     : '<span class="c-mut">not scheduled</span>';
   moveRowTo(row,row.getAttribute('data-bucket')||'qualified',r.followUpAt?'followups':'working');
 }
-async function moveBucket(id,bucket,sel){
-  if(sel)sel.selectedIndex=0;
-  if(!bucket)return;
-  var r=await post('/api/leads/'+id+'/bucket',{bucket:bucket});
-  if(!r||!r.ok)return;
-  var row=document.getElementById('crm-'+id);
-  if(!row)return;
-  row.setAttribute('data-bucket',bucket);
-  paintTag(row,bucket);
-  moveRowTo(row,bucket,Number(row.getAttribute('data-fu'))>0?'followups':'working');
-  rebuildMoveMenu(row,bucket,id);
-  pickTab(bucket);
-}
-function rebuildMoveMenu(row,bucket,id){
-  var sel=row.querySelector('.movebucket');
-  if(!sel)return;
-  var html='<option value="">Move to</option>';
-  for(var i=0;i<BUCKET_KEYS.length;i++){
-    var b=BUCKET_KEYS[i];
-    if(b!==bucket)html+='<option value="'+b+'">'+esc(BUCKETS[b].title)+'</option>';
-  }
-  sel.innerHTML=html;
-}
-// Move a row between lists without reloading, then re-sort and re-count.
+// Move a row between a bucket's two lists without reloading, then re-sort and re-count.
+// (There is no moving between BUCKETS any more: the row's dropdown for that is gone, and
+// which bucket a company belongs to is a fact about the business, not a filing decision.)
 function moveRowTo(row,bucket,list){
   var tb=document.getElementById('tb-'+bucket+'-'+list);
   if(!tb)return;
   place(tb,row);
-  if(list==='followups')sortFollowups(tb);
+  applySort(bucket,list);
   paintCounts();
   row.classList.remove('justmoved');
   void row.offsetWidth;
@@ -2384,11 +2642,6 @@ function keepTail(tb){
 }
 function dataRows(tb){
   return Array.prototype.filter.call(tb.children,function(r){return r.classList.contains('crmrow')});
-}
-function sortFollowups(tb){
-  dataRows(tb).sort(function(a,b){return (Number(a.getAttribute('data-fu'))||0)-(Number(b.getAttribute('data-fu'))||0)})
-    .forEach(function(r){tb.appendChild(r);var nr=noteRow(r);if(nr)tb.appendChild(nr);var wr=winRowOf(r);if(wr)tb.appendChild(wr)});
-  keepTail(tb);
 }
 function sumText(w,f){return w+' working, '+f+' follow-up'+(f===1?'':'s')}
 // How many of a bucket's follow-ups have come due, read straight off the rows' data-fu
@@ -2434,25 +2687,6 @@ function paintCounts(){
   var tot=document.getElementById('leadTotal');
   if(tot)tot.textContent=grand.toLocaleString()+' compan'+(grand===1?'y':'ies');
 }
-// The "no website" tag is true of every bucket except "has a website", so it has to
-// follow a row that is moved between them.
-function paintTag(row,bucket){
-  var cell=row.querySelector('.c-name');
-  if(!cell)return;
-  var tags=cell.querySelector('.c-tags');
-  var badge=tags?tags.querySelector('.badge'):null;
-  if(bucket==='has_website'){
-    if(badge)badge.remove();
-    if(tags&&!tags.children.length)tags.remove();
-    return;
-  }
-  if(badge)return;
-  if(!tags){tags=document.createElement('span');tags.className='c-tags';cell.appendChild(tags)}
-  var b=document.createElement('span');
-  b.className='badge';
-  b.textContent='no website';
-  tags.insertBefore(b,tags.firstChild);
-}
 // The tables sit in a horizontal scroll box, so the follow-up panel is fixed-positioned
 // and placed against its button rather than flowing inside the row, where it would be
 // clipped. It flips above the button when there isn't room below.
@@ -2490,11 +2724,13 @@ async function fuDel(id){await post('/api/followup/remove/'+id,{});var r=documen
 
 // ── filter ──
 // Live filter over one bucket, across both of its lists: a plain case-insensitive
-// substring against the row's data-k (name, city, phone, stage, notes).
+// substring against the row's data-k (name, city, phone, stage, notes). The Won tab has a
+// box of its own over the wins table, matching the same way on the same attribute.
 function filterRows(key){
   key=key||TAB;
   var box=document.getElementById('find-'+key);
   var q=box?box.value.trim().toLowerCase():'';
+  if(key==='won')return filterWins(q);
   ['working','followups'].forEach(function(list){
     var tb=document.getElementById('tb-'+key+'-'+list);
     if(!tb)return;
@@ -2511,12 +2747,75 @@ function filterRows(key){
     if(nom)nom.classList.toggle('gone',!(q&&rows.length&&!shown));
   });
 }
+// The wins table has no expansion rows to keep in step, so this is the plain half of the
+// same filter: hide what does not match, show the no-match line when nothing is left.
+function filterWins(q){
+  var tb=document.getElementById('winRows');
+  if(!tb)return;
+  var rows=Array.prototype.filter.call(tb.children,function(r){return r.hasAttribute('data-k')}),shown=0;
+  rows.forEach(function(r){
+    var hit=!q||(r.getAttribute('data-k')||'').indexOf(q)>-1;
+    r.classList.toggle('gone',!hit);
+    if(hit)shown++;
+  });
+  var nom=tb.querySelector('tr.norow');
+  if(nom)nom.classList.toggle('gone',!(q&&rows.length&&!shown));
+}
+
+// ── a win, back to the company it came from ──
+// The company is on this page, so the link on a win is a jump rather than a navigation:
+// switch to its bucket, switch to whichever of that bucket's lists is holding it, clear a
+// filter that would be hiding it, and flash the row so it is obvious which one was meant.
+function gotoCompany(id){
+  var row=document.getElementById('crm-'+id);
+  if(!row)return;
+  var m=/^tb-(.+)-(working|followups)$/.exec((row.parentNode&&row.parentNode.id)||'');
+  if(!m)return;
+  pickTab(m[1]);
+  pickSeg(m[1],m[2]);
+  var find=document.getElementById('find-'+m[1]);
+  if(find&&find.value){find.value='';filterRows(m[1])}
+  row.scrollIntoView({behavior:'smooth',block:'center'});
+  row.classList.remove('justmoved');
+  void row.offsetWidth;
+  row.classList.add('justmoved');
+}
+
+// ── the wins list itself ──
+// Every number on the Won tab is the server's arithmetic over the whole list (the month,
+// the average of the valued wins, the win rate against the stages). Recomputing that in
+// the browser is how a scoreboard starts disagreeing with itself, so an add or a remove
+// simply asks the server for the page again, landing back on this tab.
+async function addWin(){
+  var c=document.getElementById('wClient'),a=document.getElementById('wAmount'),n=document.getElementById('wNote'),msg=document.getElementById('winMsg');
+  msg.textContent='';
+  if(!c.value.trim()){msg.textContent='Add a client name.';c.focus();return}
+  var r=await post('/api/wins',{clientName:c.value.trim(),amount:a.value.trim(),note:n.value.trim()});
+  if(!r||!r.ok){msg.textContent=(r&&r.error)||'Could not add that win.';return}
+  reloadWon();
+}
+async function removeWin(id){
+  var r=await post('/api/wins/remove/'+id,{});
+  if(!r||!r.ok)return;
+  reloadWon();
+}
+
+paintWonCount();
 paintCounts();
 // /crm?view=followup and /leads?view=followup both land here. Open the first bucket that
 // actually has follow-ups and flip it to its follow-ups segment. The panel itself carries
 // the #followups id, so the browser's own jump already puts the toggle and the table on
 // screen and nothing else needs scrolling.
-if(location.hash==='#followups'){
+// #followups opens the first bucket that actually has follow-ups on its follow-ups list.
+// #won opens the scoreboard: /wins redirects to it, the setup checklist's last step points
+// at it, and a reload after adding or removing a win comes back to it.
+//
+// Both run on load AND on hashchange, because a link to /leads#won followed from this very
+// page changes nothing but the hash: the browser does not reload, so nothing else would
+// ever act on it.
+function openFromHash(){
+  if(location.hash==='#won'){pickTab('won');return}
+  if(location.hash!=='#followups')return;
   var fuTab='';
   for(var fi=0;fi<BUCKET_KEYS.length;fi++){
     var fuTb=document.getElementById('tb-'+BUCKET_KEYS[fi]+'-followups');
@@ -2527,6 +2826,8 @@ if(location.hash==='#followups'){
     pickSeg(fuTab,'followups');
   }
 }
+openFromHash();
+window.addEventListener('hashchange',openFromHash);
 </script>${SHELL_TAIL_SCRIPT}</main></div></body></html>`;
 }
 
@@ -2540,7 +2841,7 @@ function fmtMoney(n) {
 }
 
 // A win's date, from either a SQLite UTC datetime ("2026-08-26 14:03:00") or a
-// Postgres timestamptz — mirrors daysAgo()'s two-provider parsing.
+// Postgres timestamptz. Mirrors daysAgo()'s two-provider parsing.
 function winDate(dt) {
   if (!dt) return "";
   const s = String(dt);
@@ -2549,27 +2850,36 @@ function winDate(dt) {
   if (isNaN(d.getTime())) return esc(s);
   return d.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
 }
-// One row of the wins list. A win that came off a Won company links back to it and says
-// so; a hand-typed one says that instead, so the two are never confusable.
-function winRow(w) {
+// One row of the wins list. A win that came off a company is not linked out to another
+// page any more, because the company is on THIS one: the name is a jump that switches to
+// its bucket, switches to whichever of that bucket's lists holds it, and puts the row on
+// screen. `at` is the map of which lead sits where, so a win whose company has since been
+// removed from the lists renders as plain text rather than a link to nowhere. A hand-typed
+// win says so instead, and the two are never confusable.
+function winRow(w, at) {
   const linked = w.leadId !== null && w.leadId !== undefined;
+  const spot = linked && at ? at.get(String(w.leadId)) : null;
   // The list row keeps the store's column names alongside the camelCase ones, so read
   // either: the company's live name when the win is linked, the name typed on the win
   // itself when it is not.
   const typed = w.clientName ?? w.client_name;
   const name = String(w.name || typed || "").trim() || "This company";
   const place = [w.city, w.state].filter(Boolean).join(", ");
-  const amt =
-    w.amount === null || w.amount === undefined || w.amount === ""
-      ? '<span class="c-mut">no amount</span>'
-      : esc(fmtMoney(w.amount));
-  const nameCell = linked
-    ? `<a class="c-nm winlink" href="/leads" title="Open this company on the Companies page">${esc(name)}</a>`
+  const hasAmt = !(w.amount === null || w.amount === undefined || w.amount === "");
+  const amt = hasAmt ? esc(fmtMoney(w.amount)) : '<span class="c-mut">no amount</span>';
+  const nameCell = spot
+    ? `<a class="c-nm winlink" href="#crm-${w.leadId}" title="Show this company in your ${esc(
+        BUCKET_META[spot].title
+      )} list" onclick="gotoCompany(${w.leadId});return false">${esc(name)}</a>`
     : `<span class="c-nm">${esc(name)}</span>`;
   const tag = linked
-    ? `<span class="badge">from your companies</span>${place ? `<span class="c-mut">${esc(place)}</span>` : ""}`
+    ? `<span class="badge">${
+        spot ? "from your companies" : "no longer in your lists"
+      }</span>${place ? `<span class="c-mut">${esc(place)}</span>` : ""}`
     : '<span class="tag">added by hand</span>';
-  return `<tr id="win-${w.id}">
+  // What the toolbar filter matches on, the same idea as a company row's data-k.
+  const key = [name, place, w.note || "", hasAmt ? fmtMoney(w.amount) : ""].filter(Boolean).join(" ").toLowerCase();
+  return `<tr id="win-${w.id}" data-k="${esc(key)}">
     <td class="c-name">${nameCell}<span class="c-tags">${tag}</span></td>
     <td class="w-amt">${amt}</td>
     <td>${w.note ? esc(w.note) : '<span class="c-mut">no note</span>'}</td>
@@ -2610,7 +2920,9 @@ function returnLine(monthTotal, tier, checkedCount) {
   const plan = PLANS[String(tier || "").toLowerCase()] || null;
   const price = plan ? Number(plan.price) || 0 : 0;
   const revenue = Number(monthTotal) || 0;
-  const nudge = 'Mark a company Won on the <a href="/leads">Companies page</a> and the deal shows up here.';
+  // The scoreboard sits on the Companies page now, so the nudge points at the lists a tab
+  // away rather than at a page the reader is already on.
+  const nudge = "Mark a company Won in one of the lists on this page and the deal shows up here.";
   let main;
   let sub;
   if (revenue > 0 && price > 0) {
@@ -2643,14 +2955,17 @@ function returnLine(monthTotal, tier, checkedCount) {
 </section>`;
 }
 
-async function renderWinsPage(req) {
-  const [stats, rate, wins, profile, checked] = await Promise.all([
-    store.winStats(req.userId),
-    store.winRate(req.userId),
-    store.listWins(req.userId),
-    store.getProfile(req.userId),
-    store.checkedStats(req.userId),
-  ]);
+
+// ── THE WON TAB: the closed-deal scoreboard, folded into the Companies page ──
+// This was a page of its own (/wins). It is a pane behind the fourth tab now, because the
+// wins and the companies they came from are the same list of businesses seen twice: the
+// scoreboard has to sit next to the rows that feed it, not one navigation away.
+//
+// Everything the old page rendered is here, unchanged in what it claims: the five hero
+// figures, the return line, the list, the collapsed hand-typed-win form, and the empty
+// state. `at` maps a lead id to the bucket its row is sitting in, so each win can point at
+// its own company a tab away instead of at a page the reader is already on.
+function wonPane({ stats, rate, wins, profile, checked, at, active }) {
   const count = Number(stats?.count) || 0;
   const total = Number(stats?.total) || 0;
   const monthCount = Number(stats?.monthCount) || 0;
@@ -2664,7 +2979,7 @@ async function renderWinsPage(req) {
   // Every business this account has ever had checked, which is the whole point of the
   // fifth hero stat: that count is hours of googling somebody did not have to do.
   const checkedCount = Math.max(0, Number(checked?.total) || 0);
-  const rows = (wins || []).map(winRow).join("");
+  const rows = (wins || []).map((w) => winRow(w, at)).join("");
 
   const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
   const heroes = [
@@ -2695,39 +3010,86 @@ async function renderWinsPage(req) {
     ),
   ].join("");
 
-  return `<!doctype html><html><head>${THEME_INIT_SCRIPT}<meta charset="utf-8">${FAVICON}<title>Prospector · Wins</title>
-<style>
-  *{box-sizing:border-box;margin:0;padding:0}
-  body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
-${TABLE_CSS}
+  // The list, or the line that explains how one gets here. Both carry the same promise:
+  // wins arrive on their own, from the lists a tab away.
+  const list = count
+    ? `<div class="cotools">
+      <div class="cofind"><span class="cf-i">${icon("search", 14)}</span><input id="find-won" type="text" autocomplete="off" placeholder="Search these wins" oninput="filterRows('won')"></div>
+    </div>
+    <div class="cotwrap"><table class="cotable wintbl">
+      <thead><tr><th>Company</th><th>Amount</th><th>Note</th><th>Date</th><th class="c-act"></th></tr></thead>
+      <tbody id="winRows">${rows}<tr class="norow gone"><td colspan="5" class="co-empty">No wins here match that search.</td></tr></tbody>
+    </table></div>
+    <div class="winnote">Removing a win here does not change the company's stage. If it is still marked Won in one of the lists above, its row will offer to log the deal again.</div>`
+    : `<div class="co-empty">Wins land here on their own: mark a company Won in one of the lists above and the deal shows up in this list. Anything you closed outside Prospector goes in by hand below.</div>`;
+
+  return `<div class="lpane" id="pane-won" role="tabpanel" aria-labelledby="bt-won"${active ? "" : " hidden"}>
+  <div class="wonstale" id="wonStale" hidden>The figures below were worked out when this page loaded, and a deal has been marked Won since. <button type="button" class="wonreload" onclick="reloadWon()">Bring them up to date</button></div>
+  <div class="wstats">${heroes}</div>
+  ${returnLine(monthTotal, profile?.tier, checkedCount)}
+  <div class="wonlist">
+    <div class="cohead"><span class="co-ic">${icon("wins")}</span>
+      <span class="co-ttl">Closed deals</span>
+      <span class="co-n">${count.toLocaleString()} win${count === 1 ? "" : "s"}</span></div>
+    ${list}
+  </div>
+  <details class="explain addwin">
+    <summary><span class="ex-ttl">Add a deal from outside Prospector</span><span class="ex-sub">For work that never came through a search</span></summary>
+    <div class="ex-body">
+      <div class="wrow">
+        <div class="f"><label for="wClient">Client or trade</label><input id="wClient" placeholder="Acme Roofing" autocomplete="off"></div>
+        <div class="f"><label for="wAmount">Amount <span class="muted" style="font-weight:400">optional</span></label><input id="wAmount" type="number" min="0" step="any" placeholder="2400"></div>
+        <div class="f"><label for="wNote">Note <span class="muted" style="font-weight:400">optional</span></label><input id="wNote" placeholder="What closed it" autocomplete="off"></div>
+        <button class="go" onclick="addWin()">Add win</button>
+      </div>
+      <div id="winMsg"></div>
+    </div>
+  </details>
+</div>`;
+}
+
+// The styling the scoreboard brings with it. Spliced into the Companies page's own rules,
+// so the hero cards and the wins table read as part of that page rather than as a
+// transplant: the cards sit on --surface2 because they are inside a panel now, and the
+// wins table's column widths are pinned to .wintbl so they cannot fight the company
+// table's seven-column layout.
+const WON_CSS = `
   /* ── The hero row: the five numbers that answer "is this working" ── */
-  .wstats{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:12px;margin-bottom:16px}
-  .wstat{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:15px 17px}
+  .wstats{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:12px;margin:18px 0 16px}
+  .wstat{background:var(--surface2);border:1px solid var(--border);border-radius:12px;padding:15px 17px}
   .wk{font-size:12px;font-weight:600;color:var(--muted)}
   .wv{font-size:26px;font-weight:800;color:var(--text);margin-top:8px;line-height:1.15;font-variant-numeric:tabular-nums}
   .ws{font-size:12.5px;color:var(--faint);margin-top:6px;line-height:1.5}
   /* ── The return line: this month's closed revenue against what the plan costs ── */
-  .retline{background:var(--panel);border:1px solid var(--border);border-left:3px solid var(--accent);border-radius:12px;padding:18px 20px;margin-bottom:18px}
+  .retline{background:var(--surface2);border:1px solid var(--border);border-left:3px solid var(--accent);border-radius:12px;padding:18px 20px;margin-bottom:18px}
   .ret-k{font-size:12px;font-weight:600;color:var(--muted)}
   .ret-main{font-size:19px;font-weight:700;color:var(--text);line-height:1.45;margin-top:8px;letter-spacing:-.1px}
   .ret-main b{color:var(--accent-ink)}
   .ret-sub{font-size:14px;color:var(--muted);margin-top:8px;line-height:1.5}
   .ret-sub b{color:var(--text);font-weight:700}
-  /* ── The list, in the Companies page's table ── */
-  table.cotable{min-width:720px}
-  table.cotable th:nth-child(1),table.cotable td:nth-child(1){width:30%}
-  table.cotable th:nth-child(2),table.cotable td:nth-child(2){width:14%}
-  table.cotable th:nth-child(3),table.cotable td:nth-child(3){width:30%}
-  table.cotable th:nth-child(4),table.cotable td:nth-child(4){width:14%}
-  table.cotable th:nth-child(5),table.cotable td:nth-child(5){width:12%}
+  /* The scoreboard is server-arithmetic over the whole list, so a stage changed since the
+     page loaded moves the tab's count but not these figures. This says so, and offers the
+     one thing that fixes it. */
+  .wonstale{display:flex;align-items:center;flex-wrap:wrap;gap:10px;background:var(--warn-weak);border:1px solid var(--warn);border-radius:10px;padding:11px 14px;margin-top:18px;font-size:13px;color:var(--text)}
+  .wonstale[hidden]{display:none}
+  .wonreload{font-family:inherit;background:transparent;border:1px solid var(--warn);color:var(--warn);border-radius:8px;padding:5px 12px;font-size:12.5px;font-weight:700;cursor:pointer}
+  .wonreload:hover{background:var(--surface)}
+  /* ── The list, in the same table the companies use ── */
+  .wonlist{border-top:1px solid var(--border);padding-top:16px}
+  .wonlist .cohead .co-ttl{font-size:15px}
+  table.cotable.wintbl{min-width:720px}
+  table.cotable.wintbl th:nth-child(1),table.cotable.wintbl td:nth-child(1){width:30%}
+  table.cotable.wintbl th:nth-child(2),table.cotable.wintbl td:nth-child(2){width:14%}
+  table.cotable.wintbl th:nth-child(3),table.cotable.wintbl td:nth-child(3){width:30%}
+  table.cotable.wintbl th:nth-child(4),table.cotable.wintbl td:nth-child(4){width:14%}
+  table.cotable.wintbl th:nth-child(5),table.cotable.wintbl td:nth-child(5){width:12%}
   .cotable td.w-amt{font-variant-numeric:tabular-nums;font-weight:700;color:var(--text);white-space:nowrap}
   .cotable td.w-date{color:var(--muted);white-space:nowrap}
-  .cotable a.winlink{color:var(--text);text-decoration:none;border-bottom:1px solid transparent}
+  /* A win's company name is a jump to its own row on this page, not a link off it. */
+  .cotable a.winlink{color:var(--text);text-decoration:none;border-bottom:1px solid transparent;cursor:pointer}
   .cotable a.winlink:hover{color:var(--accent-ink);border-bottom-color:var(--accent-ink)}
   .cotable .c-tags .badge,.cotable .c-tags .tag{font-size:10.5px;padding:2px 7px;border-radius:6px;font-weight:600}
   .cotable .c-tags .c-mut{font-size:11.5px}
-  .rm{font-family:inherit;background:transparent;border:1px solid var(--border);color:var(--muted);border-radius:8px;padding:6px 11px;cursor:pointer;font-size:12.5px}
-  .rm:hover{color:var(--danger);border-color:var(--danger)}
   .winnote{margin-top:14px;font-size:12.5px;color:var(--faint);line-height:1.55}
   /* ── The escape hatch: a deal that never went through the tool ── */
   .addwin{margin-top:18px}
@@ -2741,59 +3103,4 @@ ${TABLE_CSS}
   @media(max-width:1200px){.wstats{grid-template-columns:repeat(3,minmax(0,1fr))}}
   @media(max-width:900px){.wstats{grid-template-columns:repeat(2,minmax(0,1fr))}}
   @media(max-width:640px){.wstats{grid-template-columns:1fr}.wrow{grid-template-columns:1fr}.wrow .go{width:100%}}
-${SHARED_CSS}</style></head><body>
-${sidebar("wins", { isAdmin: req.isAdmin, demo: req.isDemo })}<div class="pagehead"><div class="titlewrap"><h1>Wins</h1><div class="pagesub">Every deal you have closed, and what it came to</div></div><div class="spacer"></div></div>
-
-<div class="wstats">${heroes}</div>
-
-${returnLine(monthTotal, profile?.tier, checkedCount)}
-
-<section class="copanel">
-  <div class="cohead"><span class="co-ic">${icon("wins")}</span>
-    <span class="co-ttl">Closed deals</span>
-    <span class="co-n">${count.toLocaleString()} win${count === 1 ? "" : "s"}</span></div>
-  ${
-    count
-      ? `<div class="cotwrap"><table class="cotable">
-    <thead><tr><th>Company</th><th>Amount</th><th>Note</th><th>Date</th><th class="c-act"></th></tr></thead>
-    <tbody id="winRows">${rows}</tbody>
-  </table></div>
-  <div class="winnote">Removing a win here does not change the company's stage. If it is still marked Won on the <a href="/leads">Companies page</a>, its row will offer to log the deal again.</div>`
-      : `<div class="co-empty">Wins land here on their own: mark a company Won on the <a href="/leads">Companies page</a> and the deal shows up in this list. Anything you closed outside Prospector goes in by hand below.</div>`
-  }
-</section>
-
-<details class="explain addwin">
-  <summary><span class="ex-ttl">Add a deal from outside Prospector</span><span class="ex-sub">For work that never came through a search</span></summary>
-  <div class="ex-body">
-    <div class="wrow">
-      <div class="f"><label for="wClient">Client or trade</label><input id="wClient" placeholder="Acme Roofing" autocomplete="off"></div>
-      <div class="f"><label for="wAmount">Amount <span class="muted" style="font-weight:400">optional</span></label><input id="wAmount" type="number" min="0" step="any" placeholder="2400"></div>
-      <div class="f"><label for="wNote">Note <span class="muted" style="font-weight:400">optional</span></label><input id="wNote" placeholder="What closed it" autocomplete="off"></div>
-      <button class="go" onclick="addWin()">Add win</button>
-    </div>
-    <div id="winMsg"></div>
-  </div>
-</details>
-
-<script>
-async function post(url,data){var r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data||{})});return r.json()}
-// Every number on this page is the server's arithmetic over the whole list (the month,
-// the average of the valued wins, the win rate against the stages). Recomputing that in
-// the browser is how a scoreboard starts disagreeing with itself, so an add or a remove
-// simply asks the server for the page again.
-async function addWin(){
-  var c=document.getElementById('wClient'),a=document.getElementById('wAmount'),n=document.getElementById('wNote'),msg=document.getElementById('winMsg');
-  msg.textContent='';
-  if(!c.value.trim()){msg.textContent='Add a client name.';c.focus();return}
-  var r=await post('/api/wins',{clientName:c.value.trim(),amount:a.value.trim(),note:n.value.trim()});
-  if(!r||!r.ok){msg.textContent=(r&&r.error)||'Could not add that win.';return}
-  location.reload();
-}
-async function removeWin(id){
-  var r=await post('/api/wins/remove/'+id,{});
-  if(!r||!r.ok)return;
-  location.reload();
-}
-</script>${SHELL_TAIL_SCRIPT}</main></div></body></html>`;
-}
+`;

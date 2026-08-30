@@ -1,14 +1,20 @@
 // demo.js — the live-meeting demo screen (Agent D).
 //
 // One page, projected in a sales meeting: the operator types the prospect's city
-// and trade, hits "Find leads", and the room watches the machine scan, filter and
+// and trade, hits "Find 5 companies", and the room watches the machine scan, filter and
 // surface businesses with no website. Big type, no chrome, nothing to explain.
 //
+// ONE STORY, and only one: it finds five companies with no website, guaranteed. There is
+// no depth to pick and no mode to pick: the page exposes a single action, and every line
+// of copy on it says the same thing. A live scan asks /api/search for `mode: "guaranteed"`,
+// which keeps scanning until it has five; a saved demo replays its cached result and is
+// presented as that same five.
+//
 // The pitch order on this page is deliberate and load-bearing. TIME first: checking one
-// business by hand is roughly five minutes of googling, and the scan does the whole city
-// in about two. The leads are the SECOND beat, not the opening line. Third: every list it
+// business by hand is roughly five minutes of googling, and the machine does its five in
+// about two. The companies are the SECOND beat, not the opening line. Third: every list it
 // hands back is workable (no site = call first, has a site = sell them something else,
-// gone quiet = still worth a call). Do not put the lead count back on top.
+// gone quiet = still worth a call). Do not put a raw lead count back on top.
 //
 // It runs on the EXISTING search stack — the page just posts to /api/search with
 // the session cookie, so results, caching, metering and dedup are identical to the
@@ -16,8 +22,10 @@
 // land one by one) is all client-side.
 //
 // Zero-cost replay: GET /demo/api/saved lists this user's cached searches. Clicking
-// a chip fills the inputs and re-runs it; the search cache answers for free, so a
-// demo never depends on live Apify credits (and there is no APIFY_TOKEN in dev).
+// a chip fills the inputs and re-runs it at the depth it was cached at; the search cache
+// answers for free, so a demo never depends on live Apify credits (and there is no
+// APIFY_TOKEN in dev). A typed search whose city and trade are already cached takes that
+// same free path. Only a genuinely new search goes live, and that one goes guaranteed.
 //
 // ── The demo WORKSPACE (the second half of this file) ────────────────────────
 // The page above sells the *search*. The workspace sells the *product*: one click
@@ -56,17 +64,28 @@ import {
 } from "./auth.js";
 import * as store from "../data/store.js";
 import { dataProvider, getSupabase } from "../lib/supabase.js";
-import { RATE_PER_1K } from "../lib/spend.js";
 import { THEME_INIT_SCRIPT, SHELL_TAIL_SCRIPT, SHARED_CSS, sidebar, FAVICON, icon } from "./shell.js";
 
 export const demoRouter = express.Router();
 
-// The demo always scans all three sources at "Quick" depth: fast enough to hold a
-// room's attention, and the same shape the saved Chattanooga demos were cached with.
+// The demo always scans all three sources: it is the shape the saved Chattanooga demos
+// were cached with, and the one a guaranteed run should widen across. There is no depth
+// here on purpose: a guaranteed run decides its own depth, and a saved demo replays at
+// whatever depth it was cached at.
 const DEMO_SOURCES = ["google", "facebook", "instagram"];
-const DEMO_LIMIT = 20;
 const MAX_CHIPS = 18;
 
+// What the demo promises, and the flat price of promising it. Both mirror the app (
+// GUARANTEE_TARGET in lib/pipeline.js, GUARANTEED_FIVE_TOKENS in server.js) and are
+// re-read from the env here rather than imported, the way admin.js does it, so the demo
+// page keeps rendering whatever those modules do with their exports.
+const GUARANTEE_TARGET = 5;
+function guaranteedFiveTokens() {
+  const n = parseInt(process.env.GUARANTEED_FIVE_TOKENS || "60", 10);
+  return Number.isFinite(n) && n > 0 ? n : 60;
+}
+
+// USD to tokens, the app's rate. Used by the reseed report ("1,240 tokens used").
 function tokensPerUsd() {
   const n = parseFloat(process.env.TOKENS_PER_USD || "75");
   return Number.isFinite(n) && n > 0 ? n : 75;
@@ -929,15 +948,15 @@ ${SHARED_CSS}</style></head><body>
 ${sidebar("demo", { isAdmin: true, demo: !!req.isDemo })}
 <div class="demo">
   <div class="dhead">
-    <h1>Five minutes a business by hand. The whole city in two.</h1>
-    <p>By hand, each one is: google them, real site or just a Facebook page, find the socials, check if they still post, dig out a phone and an email. Five minutes a business, and there are dozens. This does the lot in about two minutes.</p>
+    <h1>Five minutes a business by hand. Five companies in about two.</h1>
+    <p>By hand, each one is: google them, real site or just a Facebook page, find the socials, check if they still post, dig out a phone and an email. Five minutes a business, and there are dozens. This keeps scanning until it has five companies with no website of their own, and that takes about two minutes.</p>
   </div>
 
   <div class="dform">
     <div class="f"><label for="city">City</label><input id="city" value="Chattanooga" autocomplete="off" spellcheck="false"></div>
     <div class="f"><label for="state">State</label><input id="state" value="TN" autocomplete="off" spellcheck="false" maxlength="2"></div>
     <div class="f"><label for="niche">Trade</label><input id="niche" value="landscaping" autocomplete="off" spellcheck="false"></div>
-    <button class="dgo" id="goBtn" onclick="runDemo()">Find leads</button>
+    <button class="dgo" id="goBtn" onclick="runDemo()">Find ${GUARANTEE_TARGET} companies</button>
   </div>
   <div class="dest" id="estimate"></div>
 
@@ -955,10 +974,9 @@ ${workspacePanel(req, target)}
   <div class="dleads" id="leads"></div>
 </div>
 <script>
-var RATE_PER_1K = ${JSON.stringify(RATE_PER_1K)};
-var TOKENS_PER_USD = ${JSON.stringify(tokensPerUsd())};
 var SOURCES = ${JSON.stringify(DEMO_SOURCES)};
-var DEPTH = ${JSON.stringify(DEMO_LIMIT)};
+var TARGET = ${JSON.stringify(GUARANTEE_TARGET)};
+var GUARANTEE_TOKENS = ${JSON.stringify(guaranteedFiveTokens())};
 </script>
 <script>
 var STAGES = [
@@ -966,9 +984,13 @@ var STAGES = [
   'Checking Facebook pages\\u2026',
   'Checking Instagram profiles\\u2026',
   'Sorting real websites from Facebook-only pages\\u2026',
-  'Checking who is still active\\u2026'
+  'Checking who is still active\\u2026',
+  'Going deeper until it has ' + TARGET + '\\u2026'
 ];
-var CACHED = {};       // cache key -> true (a search we can replay for free)
+// city|trade|state (no depth) -> the cached {sources, limit} that replays it for free.
+// The demo has no depth control, so the page finds a free replay at WHATEVER depth the
+// search happens to be cached at, rather than only at one blessed number.
+var FREE = {};
 var busy = false;
 var stageTimer = null, stageIdx = 0;
 
@@ -979,31 +1001,31 @@ function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){return
 function nfmt(n){return Number(n||0).toLocaleString()}
 function tc(s){return String(s==null?'':s).replace(/\\b[a-z]/g,function(c){return c.toUpperCase()})}
 
-// Mirrors cacheKey() in lib/pipeline.js so the page knows, before firing, whether a
-// search comes back free from the cache or spends credits.
-function keyFor(niche, city, state, sources, limit){
-  return [niche, city, state, sources.slice().sort().join(','), limit]
-    .map(function(x){return String(x==null?'':x).trim().toLowerCase()}).join('|');
+// The depth-free half of cacheKey() in lib/pipeline.js: what was searched, not how hard.
+function placeKey(niche, city, state){
+  return [niche, city, state].map(function(x){return String(x==null?'':x).trim().toLowerCase()}).join('|');
 }
-// Typed searches always run at the default depth; clicking a saved demo adopts that
-// demo's depth, so hitting "Find leads" straight after replays it free.
-var DEPTH_ACTIVE = DEPTH;
 function currentQuery(){
-  return {niche: val('niche'), city: val('city'), state: val('state'), sources: SOURCES.slice(), limit: DEPTH_ACTIVE};
+  return {niche: val('niche'), city: val('city'), state: val('state')};
+}
+// The free replay for this city and trade, if there is one: {sources, limit}, else null.
+function freeReplay(q){
+  var hit = FREE[placeKey(q.niche, q.city, q.state)];
+  return hit || null;
 }
 
-// Same maths as the Prospector's estimate: cities x niches x sources x depth places.
+// One promise, priced two ways: a saved demo replays for nothing, a live one is the flat
+// guaranteed price. Neither line offers a depth or a mode, because the page no longer has one.
 function updateEstimate(){
   var q = currentQuery();
   var el = $('estimate');
   if(!q.niche || !q.city){ el.innerHTML=''; return }
-  if(CACHED[keyFor(q.niche,q.city,q.state,q.sources,q.limit)]){
-    el.innerHTML = 'Saved search, <b>replays free</b>';
+  if(freeReplay(q)){
+    el.innerHTML = 'Keeps scanning until it has <b>' + TARGET + ' companies</b> with no website \\u00b7 saved demo, <b>replays free</b>';
     return;
   }
-  var places = q.sources.length * q.limit;
-  var tokens = Math.round((places/1000) * RATE_PER_1K * TOKENS_PER_USD);
-  el.innerHTML = 'live scan \\u2248 <b>' + nfmt(tokens) + ' tokens</b>';
+  el.innerHTML = 'Keeps scanning until it has <b>' + TARGET + ' companies</b> with no website \\u00b7 <b>' +
+    nfmt(GUARANTEE_TOKENS) + ' tokens</b>';
 }
 
 // ── staged progress ────────────────────────────────────────────────────────
@@ -1063,14 +1085,25 @@ function leadCard(p){
   return '<div class="dlead"><h3>'+esc(p.name)+'<span class="dbadge">no website</span></h3>'+
     '<div class="dmeta">'+bits.join('<span class="dot">\\u00b7</span>')+'</div>'+act+'</div>';
 }
+// The five the demo promises: no website of their own AND still active. Same rule the app
+// buckets by (bucketOfSlim in server.js) and the same one the guarantee counts, so the
+// cards on screen are exactly the companies the guarantee is about. The businesses that
+// already had a site ride along on r.prospects and are counted, not carded.
+function isPromised(p){ return !p.hasWebsite && p.activeStatus === 'active' }
+
 async function reveal(r){
   var s = r.stats || {};
   var prospects = r.prospects || [];
   var scanned = Number(s.scanned||0);
   var hadSite = Number(s.hasWebsite||0);
-  var leads = prospects.length;
+  // A saved demo can hold more than five; it is still presented as the five, so the story
+  // does not change depending on which chip the operator clicked.
+  var promised = prospects.filter(isPromised);
+  var shown = promised.slice(0, TARGET);
+  var leads = shown.length;
+  var short = leads < TARGET;
 
-  $('stats').innerHTML = statBox('Businesses scanned') + statBox('Already had a site') + statBox('No-website leads','win');
+  $('stats').innerHTML = statBox('Businesses scanned') + statBox('Already had a site') + statBox('Companies with no website','win');
   $('stats').style.display='';
   var boxes = $('stats').querySelectorAll('.dstat');
   var nums = [scanned, hadSite, leads];
@@ -1082,16 +1115,17 @@ async function reveal(r){
   await sleep(boxes.length*180 + 500);
 
   var note = $('note');
-  // Beat two and beat three, in that order: the count, then the reminder that the
+  // Beat two and beat three, in that order: the five, then the reminder that the
   // businesses the scan set aside are lists of their own, not offcuts.
   note.innerHTML = leads
-    ? '<b>'+nfmt(leads)+'</b> business'+(leads===1?'':'es')+' in '+esc(tc(val('city'))||'this city')+' with no website of their own'+
+    ? '<b>'+nfmt(leads)+'</b> compan'+(leads===1?'y':'ies')+' in '+esc(tc(val('city'))||'this city')+' with no website of their own'+
       (r.cached ? ' &nbsp;\\u00b7&nbsp; saved demo, no credits used' : '')+
+      (short ? ' &nbsp;\\u00b7&nbsp; this market ran out before '+TARGET+', so it bills at the standard rate' : '')+
       '<br>Call them first. The ones that already had a site are a services pitch, and the quiet ones are still worth a call.'
-    : 'No no-website leads this time. Try another trade or a nearby city.';
+    : 'Nothing with no website came back this time. Try another trade or a nearby city.';
   note.style.display='';
 
-  $('leads').innerHTML = prospects.map(leadCard).join('');
+  $('leads').innerHTML = shown.map(leadCard).join('');
   var cards = $('leads').querySelectorAll('.dlead');
   for(var j=0;j<cards.length;j++){
     (function(card,idx){ setTimeout(function(){ card.classList.add('in') }, idx*150) })(cards[j], j);
@@ -1107,18 +1141,29 @@ function clearScreen(){
 }
 
 // ── run ────────────────────────────────────────────────────────────────────
+// THE request body, in one place, so what the page sends is readable in one glance:
+//   a saved demo  -> the standard search at the depth it is cached at, which the cache
+//                    answers for free (a demo must never depend on live credits)
+//   anything else -> guaranteed mode, which keeps scanning until it has five and is
+//                    billed one flat price
+function requestFor(q, replay){
+  if(replay) return {niche:q.niche, city:q.city, state:q.state, sources:replay.sources.slice(), limit:replay.limit};
+  return {mode:'guaranteed', niches:[q.niche], cities:[q.city], state:q.state, sources:SOURCES.slice()};
+}
+
 async function runDemo(preset){
   if(busy) return;
-  var q = preset || currentQuery();
   if(preset){
     $('city').value = tc(preset.city);
     $('state').value = (preset.state||'').toUpperCase();
     $('niche').value = tc(preset.niche);
-    DEPTH_ACTIVE = preset.limit || DEPTH;
   }
+  var q = currentQuery();
   if(!q.niche || !q.city){ clearScreen(); showMsg('Enter a city and a trade first.'); return }
 
-  var cached = !!CACHED[keyFor(q.niche,q.city,q.state,q.sources,q.limit)];
+  // A chip carries its own cached depth and sources; a typed search looks its up.
+  var replay = preset && preset.limit ? {sources: preset.sources || SOURCES.slice(), limit: preset.limit} : freeReplay(q);
+  var cached = !!replay;
   busy = true;
   $('goBtn').disabled = true;
   var chips = document.querySelectorAll('.dchip');
@@ -1134,7 +1179,7 @@ async function runDemo(preset){
     var resp = await fetch('/api/search', {
       method:'POST',
       headers:{'Content-Type':'application/json','Accept':'application/json'},
-      body: JSON.stringify({niche:q.niche, city:q.city, state:q.state, sources:q.sources, limit:q.limit})
+      body: JSON.stringify(requestFor(q, replay))
     });
     r = await resp.json().catch(function(){return null});
     if(!resp.ok && !r) failed = true;
@@ -1160,7 +1205,10 @@ async function runDemo(preset){
       : esc(err));
     return;
   }
-  if(r.cached) CACHED[keyFor(q.niche,q.city,q.state,q.sources,q.limit)] = true;
+  // A live run has just written its own cache rows (a guaranteed one, several), so re-read
+  // the list rather than guessing which keys it left behind: the search the room just
+  // watched becomes a free chip for the next meeting.
+  if(!cached) await loadSaved();
   updateEstimate();
   await reveal(r);
 }
@@ -1168,11 +1216,26 @@ async function runDemo(preset){
 // ── saved demos ────────────────────────────────────────────────────────────
 var SAVED = [];
 function chipClick(i){ var s = SAVED[i]; if(s) runDemo(s) }
+// Every cached key this user owns, parsed back into "what was searched" plus the depth and
+// sources that replay it. Newest first, so the first entry for a city and trade wins and the
+// freshest cached copy is the one a typed search replays.
+function indexFree(keys){
+  FREE = {};
+  (keys||[]).forEach(function(raw){
+    var parts = String(raw||'').trim().toLowerCase().split('|');
+    if(parts.length !== 5) return; // an older key format cannot be replayed
+    var sources = parts[3].split(',').map(function(s){return s.trim()}).filter(Boolean);
+    var limit = parseInt(parts[4], 10);
+    if(!parts[0] || !parts[1] || !sources.length || !(limit > 0)) return;
+    var k = placeKey(parts[0], parts[1], parts[2]);
+    if(!FREE[k]) FREE[k] = {sources: sources, limit: limit};
+  });
+}
 async function loadSaved(){
   try{
     var r = await (await fetch('/demo/api/saved',{headers:{'Accept':'application/json'}})).json();
     if(!r || !r.ok) return;
-    (r.keys||[]).forEach(function(k){ CACHED[String(k).trim().toLowerCase()] = true });
+    indexFree(r.keys);
     SAVED = r.saved || [];
     if(SAVED.length){
       $('savedChips').innerHTML = SAVED.map(function(s,i){
@@ -1260,7 +1323,7 @@ function copyClaimLink(btn){
 
 ['city','state','niche'].forEach(function(id){
   var el = $(id);
-  el.addEventListener('input', function(){ DEPTH_ACTIVE = DEPTH; updateEstimate() });
+  el.addEventListener('input', function(){ updateEstimate() });
   el.addEventListener('keydown', function(e){ if(e.key==='Enter') runDemo() });
 });
 updateEstimate();
